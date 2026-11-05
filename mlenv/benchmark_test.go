@@ -156,7 +156,7 @@ func BenchmarkBatchHeuristic(b *testing.B) {
 								effectiveProcessors,
 							)
 						}
-						benchmarkBatchHeuristic(b, players, phase, size, workers)
+						benchmarkBatchHeuristic(b, heuristicFactory(b), players, phase, size, workers)
 					})
 				}
 			}
@@ -164,15 +164,62 @@ func BenchmarkBatchHeuristic(b *testing.B) {
 	}
 }
 
+// BenchmarkBatchHeuristicV2 runs the same cases as BenchmarkBatchHeuristic with
+// the pinned heuristic-v2 opponent in every opponent seat. heuristic-v2
+// predicts every fleet's landing each turn from its own view, which heuristic-v1
+// does not, so comparing the two shows what those predictions add to a step.
+// It is a separate benchmark so the heuristic-v1 case names stay comparable
+// with earlier results.
+func BenchmarkBatchHeuristicV2(b *testing.B) {
+	effectiveProcessors := runtime.GOMAXPROCS(0)
+	for _, players := range benchmarkPlayerCounts {
+		for _, phase := range benchmarkPhases {
+			for _, size := range benchmarkEnvironmentCounts {
+				for _, workers := range benchmarkWorkerCounts {
+					name := fmt.Sprintf("players=%d/phase=%s/envs=%d/workers=%d", players, phase.name, size, workers)
+					b.Run(name, func(b *testing.B) {
+						if workers > effectiveProcessors {
+							b.Skipf(
+								"workers=%d exceeds effective GOMAXPROCS=%d",
+								workers,
+								effectiveProcessors,
+							)
+						}
+						benchmarkBatchHeuristic(b, heuristicV2Factory(b), players, phase, size, workers)
+					})
+				}
+			}
+		}
+	}
+}
+
+// heuristicV2Factory builds the pinned heuristic-v2 opponent, the same
+// specification the opponent check and later training use.
+func heuristicV2Factory(b *testing.B) agent.Factory {
+	b.Helper()
+	factory, err := agent.ParseFactory(agent.HeuristicV2Default)
+	if err != nil {
+		b.Fatalf("ParseFactory(%q) error = %v", agent.HeuristicV2Default, err)
+	}
+	return factory
+}
+
 // benchmarkBatchHeuristic runs one API benchmark case after preparing every
 // slot at the same minimum game age. Action generation, resets, and warm-up are
-// excluded so the result isolates Batch.Step.
-func benchmarkBatchHeuristic(b *testing.B, players int, phase benchmarkPhase, size, workers int) {
+// excluded so the result isolates Batch.Step. opponents builds the bot in every
+// opponent seat.
+func benchmarkBatchHeuristic(
+	b *testing.B,
+	opponents agent.Factory,
+	players int,
+	phase benchmarkPhase,
+	size, workers int,
+) {
 	ctx := context.Background()
 	batch := newTestBatch(
 		b,
 		benchmarkScenario(players),
-		heuristicFactory(b),
+		opponents,
 		size,
 		scenario.SeedRange{Start: 0, End: 1 << 60},
 		ScheduleTrainV2,
