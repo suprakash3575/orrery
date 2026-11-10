@@ -1,0 +1,23 @@
+python/.venv/
+.build/
+__pycache__/
+*.py[cod]
+runs/
+
+# Terraform keeps local provider downloads, state, and machine-specific input
+# values here. State records the rented Vast.ai instance, so it must stay local
+# and must not be committed. The example tfvars file remains tracked.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+*.auto.tfvars
+*.auto.tfvars.json
+crash.log
+crash.*.log
+infra/vastai/.terraform-build/
+
+# Machine-local files: macOS Finder metadata and Claude Code's scheduler lock.
+.DS_Store
+.claude/scheduled_tasks.lock

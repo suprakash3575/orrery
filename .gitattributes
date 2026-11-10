@@ -1,0 +1,4 @@
+# git archive fills the version placeholders in this file with the archived
+# commit and nearest tag, so a bundle built without a .git folder still reports
+# which code it is. See cmd/env/release.go.
+cmd/env/release.go export-subst
