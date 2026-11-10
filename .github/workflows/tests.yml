@@ -1,0 +1,41 @@
+# Run the full verification block from AGENTS.md on every push to any branch:
+# Go formatting, build, vet, and tests, then the Python tests. `make check` is
+# the single definition of that block, so CI and a local run cannot drift
+# apart. A pull request shows the result of its branch's latest push, so a
+# separate pull_request trigger would only run the same checks twice.
+name: tests
+
+on:
+  push:
+
+# A newer push to the same branch makes an older run's result moot, so cancel
+# it instead of waiting for both.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Go version comes from go.mod, so CI always builds with the same
+      # toolchain the module declares.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # uv installs the Python version and the exact packages recorded in
+      # python/uv.lock. Caching keyed on that lock file avoids re-downloading
+      # PyTorch on every run.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: python/uv.lock
+
+      # Tests marked `acceptance` are long-running baselines that pyproject.toml
+      # excludes by default; they still run only when requested explicitly.
+      - name: Run make check
+        run: make check
