@@ -222,5 +222,4 @@ make race              # Go tests with the race detector
 
 ## License
 
-No licence has been chosen yet. Until one is added, the code can be viewed but
-is not licensed for reuse.
+Orrery is released under the [MIT License](LICENSE).
