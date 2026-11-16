@@ -914,8 +914,9 @@ def _encode_step_array_payload(
     # target rows keeps each row with its own game. ``kind="stable"`` keeps
     # equal IDs in input order, so the result never depends on the sorting
     # algorithm.
-    order = np.argsort(np.asarray(checked_ids, dtype=UINT32_DTYPE), kind="stable")
-    sorted_ids = np.asarray(checked_ids, dtype=UINT32_DTYPE)[order]
+    checked_array = np.asarray(checked_ids, dtype=UINT32_DTYPE)
+    order = np.argsort(checked_array, kind="stable")
+    sorted_ids = checked_array[order]
 
     # Sorting places equal environment IDs next to each other. Comparing every
     # ID except the first with every ID except the last therefore produces True
