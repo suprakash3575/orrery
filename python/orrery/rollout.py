@@ -237,11 +237,19 @@ class RolloutBatch:
     def time_major(self, tensor: Tensor) -> Tensor:
         """Restore this rollout's leading ``[turn, environment]`` axes.
 
-        Collection stores transitions in time-major order but flattens the
-        first two axes to ``[T * B, ...]``. For example, with three turns and
-        two environments, rows 0 and 1 belong to turn 0, rows 2 and 3 belong
-        to turn 1, and rows 4 and 5 belong to turn 2. This method reshapes
-        those rows to ``[T, B, ...]`` without reordering or recalculating them.
+        Shapes below use ``T`` for the number of turns stored in the rollout
+        (``time_steps``) and ``B`` for the number of game slots played in
+        parallel (``environment_count``). ``...`` stands for the tensor's
+        remaining dimensions, which stay unchanged and differ per tensor: a
+        reward has none, while body features add ``44, 27``.
+
+        Collection stores transitions in time-major order, meaning all ``B``
+        games for one turn come before any game's next turn. It flattens the
+        first two axes to ``[T * B, ...]``, so turn ``t`` of game ``b`` is row
+        ``t * B + b``. For example, with three turns and two environments,
+        rows 0 and 1 belong to turn 0, rows 2 and 3 belong to turn 1, and rows
+        4 and 5 belong to turn 2. This method reshapes those rows to
+        ``[T, B, ...]`` without reordering or recalculating them.
 
         The flat form is convenient when PPO shuffles individual transitions
         into minibatches. The restored form is easier when code or tests need
