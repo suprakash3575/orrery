@@ -490,6 +490,19 @@ def test_encode_step_payload_fast_array_path_rejects_invalid_values(
         ({0: [1.0, *([-1] * (BODIES - 1))]}, TypeError, "want an integer"),
         ({0: [-2, *([-1] * (BODIES - 1))]}, ValueError, "invalid packed target"),
         ({0: [44, *([-1] * (BODIES - 1))]}, ValueError, "invalid packed target 44"),
+        # Too large for any NumPy integer dtype. It is still an integer, so it
+        # is reported as out of range rather than as a type error.
+        (
+            {0: [1 << 70, *([-1] * (BODIES - 1))]},
+            ValueError,
+            "source slot 0 has invalid packed target 1180591620717411303424",
+        ),
+        # The first invalid value in a row is reported, whichever check it fails.
+        (
+            {0: [-1, 99, True, *([-1] * (BODIES - 3))]},
+            ValueError,
+            "source slot 1 has invalid packed target 99",
+        ),
     ],
 )
 def test_encode_step_payload_rejects_invalid_values(
@@ -501,6 +514,64 @@ def test_encode_step_payload_rejects_invalid_values(
 
     with pytest.raises(error_type, match=message):
         protocol.encode_step_payload(actions)  # type: ignore[arg-type]
+
+
+def test_encode_step_payload_accepts_numpy_integer_rows_in_a_mapping() -> None:
+    """NumPy rows and scalars inside a mapping encode like plain Python ints."""
+
+    signed_row = [-1] * BODIES
+    signed_row[3] = 43
+    # Unsigned dtypes cannot hold -1, so this row launches from every slot.
+    unsigned_row = [0] * BODIES
+    unsigned_row[3] = 43
+
+    for dtype, row in (("i1", signed_row), ("<i8", signed_row), ("u1", unsigned_row)):
+        expected = protocol.encode_step_payload({0: row})
+        numpy_row = np.asarray(row, dtype=dtype)
+        numpy_scalars = [np.dtype(dtype).type(target) for target in row]
+        assert protocol.encode_step_payload({0: numpy_row}) == expected
+        assert protocol.encode_step_payload({0: numpy_scalars}) == expected
+
+
+class _RowThatChangesAfterFirstRead:
+    """A target row that returns valid targets once and invalid ones after.
+
+    It imitates a caller-supplied Sequence whose contents change between
+    reads. The encoder must read each row once, so the bytes it sends are
+    exactly the values it checked.
+    """
+
+    def __init__(self) -> None:
+        """Start with no reads recorded."""
+
+        self.reads = 0
+
+    def __len__(self) -> int:
+        """Report one target per body slot."""
+
+        return BODIES
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        """Yield "no launch" on the first read and slot 44 afterwards."""
+
+        self.reads += 1
+        value = -1 if self.reads == 1 else 44
+        return iter([value] * BODIES)
+
+    def __getitem__(self, index: int) -> int:
+        """Return the out-of-range value, as a later read would."""
+
+        return 44
+
+
+def test_encode_step_payload_reads_each_row_once() -> None:
+    """The encoder sends the values it validated, not a second read of them."""
+
+    row = _RowThatChangesAfterFirstRead()
+    encoded = protocol.encode_step_payload({7: row})  # type: ignore[dict-item]
+
+    assert row.reads == 1
+    assert encoded == _u32(1) + _u32(7) + b"\xff" * BODIES
 
 
 def test_encode_empty_step_and_close_payloads() -> None:
