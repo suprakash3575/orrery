@@ -551,15 +551,58 @@ def encode_reset_payload(
     env_ids: Sequence[int] | NDArray[np.integer[Any]],
     overrides: Sequence[ResetOverride] = (),
 ) -> bytes:
-    """Encode a deterministic reset request in ascending environment-ID order.
+    """Build the bytes for a reset request, which starts new games in slots.
 
-    Overrides are sorted independently by environment ID. The encoder rejects
-    duplicate IDs because they cannot have one canonical row order. Go decides
-    whether each override belongs to this reset and whether its seat is valid,
-    and reports a structured validation response when it is not.
+    The Go process holds a batch of reusable game slots, each named by an
+    integer environment ID. Resetting a slot throws away the game it was
+    playing and starts a fresh episode there. Go normally picks each new
+    game's seed and learner seat from its own deterministic schedule. An
+    override replaces that choice for one slot so that a known game can be
+    replayed exactly, for example during evaluation.
+
+    Args:
+        env_ids: The slots to reset, in any order. Each ID must fit in an
+            unsigned 32-bit integer and may appear only once.
+        overrides: Optional fixed seed-and-seat assignments, at most one per
+            slot. Each one should name a slot that is also in ``env_ids``.
+
+    Returns:
+        The request payload only. ``encode_frame`` adds the 12-byte header
+        before the bytes are written to Go.
+
+    Raises:
+        TypeError: An ID, seed, or seat is not an integer, or an override is
+            not a ``ResetOverride``.
+        ValueError: A value does not fit its wire field, or an ID is
+            repeated.
+
+    Wire layout, little-endian with no padding between fields::
+
+        u32              N, the number of environment IDs
+        N x u32          environment IDs, ascending
+        u32              M, the number of overrides
+        M x 13 bytes     one override each, ascending by environment ID:
+                         u32 env_id, i64 seed, u8 seat
+
+    Both lists are sorted so that the same request always produces the same
+    bytes, whatever order the caller used, which keeps runs replayable. A
+    repeated ID is rejected because it would leave two rows with no single
+    correct order.
+
+    This function checks only that each value fits its wire field. It does
+    not check game rules: Go decides whether each override names a slot in
+    this reset and whether its seat exists, and rejects the request with a
+    structured error, raised here as ``RemoteProtocolError``, when not.
     """
 
+    # Stage 1: validate the slot IDs and put them in ascending order. The
+    # helper rejects non-integers, negative or oversized IDs, and repeats.
     sorted_ids = _checked_sorted_env_ids(env_ids, "reset")
+
+    # Stage 2: validate each override and turn it into a plain
+    # (env_id, seed, seat) tuple that ``_RESET_OVERRIDE.pack`` can write.
+    # ``seen_overrides`` records each ID already used, so a second override
+    # for the same slot is caught here.
     checked_overrides: list[tuple[int, int, int]] = []
     seen_overrides: set[int] = set()
     for index, override in enumerate(overrides):
@@ -580,18 +623,36 @@ def encode_reset_payload(
         # reaches its semantic validator and produces a structured rejection.
         seat = _checked_uint8(override.seat, f"reset override {env_id} seat")
         checked_overrides.append((env_id, seed, seat))
+    # Sort overrides by environment ID (item[0]) for the same reason the IDs
+    # are sorted: identical requests must produce identical bytes.
     checked_overrides.sort(key=lambda item: item[0])
 
+    # Stage 3: write the payload in the order shown in the docstring. A
+    # bytearray can grow in place, which avoids copying the whole payload
+    # each time a section is appended.
     payload = bytearray()
+
+    # The ID count comes first so Go knows how many IDs to read next.
     payload.extend(_UINT32.pack(len(sorted_ids)))
     if sorted_ids:
+        # Convert the whole list to little-endian u32 values in one NumPy
+        # call rather than packing each ID separately. An empty list is
+        # skipped because it contributes no bytes.
         payload.extend(np.asarray(sorted_ids, dtype=UINT32_DTYPE).tobytes())
+
+    # The override count is written the same way and must also fit in a u32.
     override_count = _checked_uint32(
         len(checked_overrides), "reset override count"
     )
     payload.extend(_UINT32.pack(override_count))
     for env_id, seed, seat in checked_overrides:
+        # ``_RESET_OVERRIDE`` is the struct format "<IqB": u32 env_id, i64
+        # seed, u8 seat, 13 bytes with no alignment padding.
         payload.extend(_RESET_OVERRIDE.pack(env_id, seed, seat))
+
+    # Stage 4: refuse a payload too large for one frame before anything is
+    # sent, so the caller gets a clear Python error instead of a broken
+    # stream.
     return _checked_payload_size(bytes(payload), "reset request")
 
 
@@ -600,25 +661,68 @@ def encode_step_payload(
     *,
     env_ids: Sequence[int] | NDArray[np.integer[Any]] | None = None,
 ) -> bytes:
-    """Encode packed launch targets without building per-slot dictionaries.
+    """Build the bytes for a step request: every named game's move this turn.
 
-    Mapping input retains the defensive per-element checks needed for Python
-    values, where ``True`` would otherwise be silently converted to target 1.
-    A two-dimensional integer NumPy array can use the faster ``env_ids`` path:
-    its dtype already proves that no Python Boolean is hidden in a row, so the
-    complete matrix is range-checked without visiting every element in Python.
-    ``-1`` becomes the signed byte ``0xff`` and slots 0 through 43 retain their
-    numeric byte values.
+    Each game's move is one row of ``BODY_SLOTS`` (44) integers, one for
+    every body slot: 40 planets followed by 4 comets. The number at position
+    ``i`` says what the body in slot ``i`` does this turn:
+
+    * ``-1`` means it does not launch.
+    * ``0`` through ``43`` means it launches toward the body in that slot.
+
+    For example, a row with ``5`` at position 2 and ``-1`` everywhere else
+    sends ships from the body in slot 2 to the body in slot 5.
+
+    Two input forms are accepted:
+
+    1. A mapping ``{env_id: row}``, as ``EnvClient.step`` and
+       ``EnvClient.step_packed`` pass. Every number is checked one at a time
+       because in Python ``True == 1``. Without that check, a ``True`` that
+       slipped into a row would silently become "launch at slot 1".
+    2. A two-dimensional integer NumPy array of shape ``(N, 44)`` together
+       with ``env_ids``, a list of N IDs where row ``i`` belongs to
+       ``env_ids[i]``. An integer array cannot hold Booleans, so the whole
+       array is range-checked in one NumPy operation. That is much faster
+       for large batches. ``_encode_step_array_payload`` handles this form.
+
+    Raises:
+        TypeError: The input form is wrong, ``env_ids`` is given with a
+            mapping, or a value is not an integer.
+        ValueError: A row has the wrong length, a target is outside
+            ``-1`` through ``43``, or an environment ID is repeated.
+
+    Wire layout, little-endian with no padding::
+
+        u32              N, the number of games
+        N x u32          environment IDs, ascending
+        N x 44 x i8      target rows, one per ID in the same order
+
+    Each target is a signed byte, so ``-1`` is stored as ``0xff`` and slots 0
+    through 43 keep their plain values. Rows are sent in ascending ID order
+    so that the same moves always produce the same bytes.
+
+    This function checks only that each target is a possible slot number.
+    Go decides whether the launch is legal in the current game, for example
+    whether the learner owns the source body and whether the target mask
+    allows that pair.
     """
 
+    # Route a NumPy array to the vectorized encoder. Everything below this
+    # point handles the mapping form.
     if isinstance(action_targets, np.ndarray):
         return _encode_step_array_payload(action_targets, env_ids)
+    # A mapping already pairs each row with its ID, so a separate ``env_ids``
+    # list could only conflict with it.
     if env_ids is not None:
         raise TypeError("env-v3 step env_ids are only used with a NumPy target array")
     if not isinstance(action_targets, Mapping):
         raise TypeError(
             "env-v3 step actions must be a mapping or an integer NumPy array"
         )
+
+    # Stage 1: validate each environment ID and keep it paired with its row.
+    # A plain dict cannot hold the same key twice, but a custom Mapping can
+    # yield repeated keys, so ``seen_ids`` catches any ID seen a second time.
     checked_rows: list[tuple[int, Sequence[int]]] = []
     seen_ids: set[int] = set()
     for raw_env_id, row in action_targets.items():
@@ -627,12 +731,20 @@ def encode_step_payload(
             raise ValueError(f"env-v3 step repeats environment ID {env_id}")
         seen_ids.add(env_id)
         checked_rows.append((env_id, row))
+    # Sort the (ID, row) pairs together by ID so each row stays attached to
+    # its own game.
     checked_rows.sort(key=lambda item: item[0])
 
+    # From here on ``env_ids`` is the sorted ID list taken from the mapping.
+    # The parameter of the same name was None on this path, so nothing is
+    # lost by reusing it.
     env_ids = [item[0] for item in checked_rows]
     environment_count = _checked_uint32(
         len(env_ids), "step environment count"
     )
+
+    # Stage 2: check the target rows and convert them to one int8 array.
+    # An empty request is still valid and simply has no rows.
     if checked_rows:
         # NumPy would coerce a mixed row such as [True, 2, ...] to integers and
         # erase the fact that a Boolean crossed the API boundary. Check element
@@ -651,11 +763,17 @@ def encode_step_payload(
                     f"packed targets, want {BODY_SLOTS}"
                 )
             for source_slot, target in enumerate(row):
+                # Only the type is checked here: reject Booleans and
+                # non-integers. The range check happens once, below, on the
+                # whole array.
                 _checked_integer(
                     target,
                     f"environment {env_ids[row_index]} "
                     f"source slot {source_slot} target",
                 )
+        # Stack all rows into one 2-D array, shape (games, 44). The shape and
+        # dtype checks below catch rows NumPy could not combine into one
+        # integer array.
         try:
             targets = np.asarray([item[1] for item in checked_rows])
         except (TypeError, ValueError, OverflowError) as error:
@@ -668,30 +786,48 @@ def encode_step_payload(
                 f"env-v3 step targets have shape {targets.shape}, "
                 f"want {expected_shape}"
             )
+        # dtype.kind is "i" for signed and "u" for unsigned integers.
         if targets.dtype.kind not in {"i", "u"}:
             raise TypeError(
                 f"env-v3 step targets have dtype {targets.dtype}, want integers"
             )
+        # Build a True/False array marking which targets are in range. An
+        # unsigned array cannot hold -1 or any negative value, so only the
+        # upper limit needs checking. A signed array checks both ends.
         if targets.dtype.kind == "u":
             valid_targets = targets < BODY_SLOTS
         else:
             valid_targets = (targets >= -1) & (targets < BODY_SLOTS)
         if not bool(np.all(valid_targets)):
+            # ``~`` flips True and False, and ``argwhere`` lists the
+            # (row, column) positions that are True, which here are the
+            # invalid targets. Report the first one so the error names a
+            # specific game and source slot.
             row_index, source_slot = np.argwhere(~valid_targets)[0]
             bad_target = targets[row_index, source_slot]
             raise ValueError(
                 f"env-v3 environment {env_ids[int(row_index)]} source slot "
                 f"{int(source_slot)} has invalid packed target {bad_target!r}"
             )
+        # Every value is now in -1..43, so narrowing to one signed byte each
+        # cannot change any value. copy=False skips the copy when the array
+        # is already int8.
         packed_targets = targets.astype(INT8_DTYPE, copy=False)
     else:
         packed_targets = np.empty((0, BODY_SLOTS), dtype=INT8_DTYPE)
 
+    # Stage 3: write the payload in the order shown in the docstring.
     payload = bytearray()
     payload.extend(_UINT32.pack(environment_count))
     if env_ids:
         payload.extend(np.asarray(env_ids, dtype=UINT32_DTYPE).tobytes())
+    # order="C" writes the array row by row, so all 44 targets for the first
+    # ID come first, then all 44 for the second ID, and so on.
     payload.extend(packed_targets.tobytes(order="C"))
+
+    # Stage 4: confirm the payload has exactly the size the layout predicts.
+    # A mismatch means this encoder has a bug, not that the caller passed bad
+    # input, which is why it raises RuntimeError rather than ValueError.
     expected_size = (
         STEP_REQUEST_PREFIX_BYTES
         + len(env_ids) * STEP_REQUEST_BYTES_PER_ENVIRONMENT
