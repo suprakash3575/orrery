@@ -743,78 +743,49 @@ def encode_step_payload(
         len(env_ids), "step environment count"
     )
 
-    # Stage 2: check the target rows and convert them to one int8 array.
-    # An empty request is still valid and simply has no rows.
-    if checked_rows:
-        # NumPy would coerce a mixed row such as [True, 2, ...] to integers and
-        # erase the fact that a Boolean crossed the API boundary. Check element
-        # types first, then let one array conversion handle shapes and values.
-        for row_index, (_, row) in enumerate(checked_rows):
-            try:
-                row_length = len(row)
-            except TypeError as error:
-                raise TypeError(
-                    f"env-v3 environment {env_ids[row_index]} target row "
-                    "has no length"
-                ) from error
-            if row_length != BODY_SLOTS:
-                raise ValueError(
-                    f"env-v3 environment {env_ids[row_index]} has {row_length} "
-                    f"packed targets, want {BODY_SLOTS}"
-                )
-            for source_slot, target in enumerate(row):
-                # Only the type is checked here: reject Booleans and
-                # non-integers. The range check happens once, below, on the
-                # whole array.
-                _checked_integer(
-                    target,
-                    f"environment {env_ids[row_index]} "
-                    f"source slot {source_slot} target",
-                )
-        # Stack all rows into one 2-D array, shape (games, 44). The shape and
-        # dtype checks below catch rows NumPy could not combine into one
-        # integer array.
+    # Stage 2: check every target and keep the checked values. Each row is
+    # read exactly once, so the values sent to Go are the same values that
+    # passed the checks. Reading a row twice could see different values if
+    # the caller passed an unusual Sequence that changes between reads.
+    #
+    # The checks run here, one value at a time, rather than on a NumPy array
+    # built from the raw rows. NumPy would quietly turn a mixed row such as
+    # [True, 2, ...] into integers and hide the fact that a Boolean was
+    # passed in.
+    checked_targets: list[list[int]] = []
+    for env_id, row in checked_rows:
         try:
-            targets = np.asarray([item[1] for item in checked_rows])
-        except (TypeError, ValueError, OverflowError) as error:
-            raise ValueError(
-                "env-v3 step target rows must form one rectangular integer array"
-            ) from error
-        expected_shape = (len(checked_rows), BODY_SLOTS)
-        if targets.shape != expected_shape:
-            raise ValueError(
-                f"env-v3 step targets have shape {targets.shape}, "
-                f"want {expected_shape}"
-            )
-        # dtype.kind is "i" for signed and "u" for unsigned integers.
-        if targets.dtype.kind not in {"i", "u"}:
+            row_length = len(row)
+        except TypeError as error:
             raise TypeError(
-                f"env-v3 step targets have dtype {targets.dtype}, want integers"
-            )
-        # Build a True/False array marking which targets are in range. An
-        # unsigned array cannot hold -1 or any negative value, so only the
-        # upper limit needs checking. A signed array checks both ends.
-        if targets.dtype.kind == "u":
-            valid_targets = targets < BODY_SLOTS
-        else:
-            valid_targets = (targets >= -1) & (targets < BODY_SLOTS)
-        if not bool(np.all(valid_targets)):
-            # ``~`` flips True and False, and ``argwhere`` lists the
-            # (row, column) positions that are True, which here are the
-            # invalid targets. Report the first one so the error names a
-            # specific game and source slot.
-            row_index, source_slot = np.argwhere(~valid_targets)[0]
-            bad_target = targets[row_index, source_slot]
+                f"env-v3 environment {env_id} target row has no length"
+            ) from error
+        if row_length != BODY_SLOTS:
             raise ValueError(
-                f"env-v3 environment {env_ids[int(row_index)]} source slot "
-                f"{int(source_slot)} has invalid packed target {bad_target!r}"
+                f"env-v3 environment {env_id} has {row_length} "
+                f"packed targets, want {BODY_SLOTS}"
             )
-        # Every value is now in -1..43, so narrowing to one signed byte each
-        # cannot change any value. copy=False skips the copy when the array
-        # is already int8.
-        packed_targets = targets.astype(INT8_DTYPE, copy=False)
-    else:
-        packed_targets = np.empty((0, BODY_SLOTS), dtype=INT8_DTYPE)
+        checked_row: list[int] = []
+        for source_slot, target in enumerate(row):
+            # ``_checked_integer`` rejects Booleans and non-integers, and
+            # returns a plain Python int, so NumPy integers are accepted too.
+            value = _checked_integer(
+                target,
+                f"environment {env_id} source slot {source_slot} target",
+            )
+            # -1 means "no launch". 0 through 43 name a target slot.
+            if not -1 <= value < BODY_SLOTS:
+                raise ValueError(
+                    f"env-v3 environment {env_id} source slot "
+                    f"{source_slot} has invalid packed target {value!r}"
+                )
+            checked_row.append(value)
+        checked_targets.append(checked_row)
+
+    # Every row now has exactly 44 integers in -1..43, so the conversion
+    # below cannot fail and narrowing to one signed byte each cannot change
+    # any value. An empty request gives an empty array, which adds no bytes.
+    packed_targets = np.array(checked_targets, dtype=INT8_DTYPE)
 
     # Stage 3: write the payload in the order shown in the docstring.
     payload = bytearray()
