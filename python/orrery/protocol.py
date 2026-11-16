@@ -816,10 +816,44 @@ def _encode_step_array_payload(
     action_targets: NDArray[np.integer[Any]],
     env_ids: Sequence[int] | NDArray[np.integer[Any]] | None,
 ) -> bytes:
-    """Encode an already columnar action batch without a per-target Python loop."""
+    """Build step-request bytes from a NumPy array of moves, the fast path.
 
+    ``encode_step_payload`` calls this when its input is a NumPy array rather
+    than a mapping. The bytes produced are exactly the same as the mapping
+    path's; only the way the input is checked differs.
+
+    The input is two parallel pieces:
+
+    * ``action_targets``: a 2-D integer array with one row per game and one
+      column per body slot, shape ``(N, 44)``. Each value is ``-1`` for "no
+      launch" or ``0`` through ``43`` for "launch at that target slot".
+    * ``env_ids``: N environment IDs. Row ``i`` of ``action_targets`` is the
+      move for the game in slot ``env_ids[i]``.
+
+    For example, ``env_ids=[10, 2]`` means row 0 is game 10's move and row 1
+    is game 2's move.
+
+    Why this path is faster: the mapping path must look at each of the 44
+    values per game in Python to reject Booleans. An integer NumPy array
+    cannot contain Booleans, so here every target is range-checked with a
+    single NumPy expression over the whole array. With 512 games that is one
+    operation instead of 22,528 Python checks.
+
+    Raises:
+        TypeError: ``env_ids`` is missing, or either input is not integers.
+        ValueError: The array has the wrong shape, a target is outside
+            ``-1`` through ``43``, or an environment ID is repeated.
+
+    The wire layout is the one described in ``encode_step_payload``: the
+    count, the IDs in ascending order, then one row of 44 signed bytes per
+    ID in the same order.
+    """
+
+    # Stage 1: check the array's form before looking at any values. A step
+    # cannot be encoded without knowing which game each row belongs to.
     if env_ids is None:
         raise TypeError("env-v3 step NumPy targets require env_ids")
+    # ``ndim`` is the number of dimensions. It must be 2 (games x slots).
     if action_targets.ndim != 2:
         raise ValueError(
             f"env-v3 step targets have shape {action_targets.shape}, "
@@ -830,15 +864,19 @@ def _encode_step_array_payload(
             f"env-v3 step targets have shape {action_targets.shape}, "
             f"want ({action_targets.shape[0]}, {BODY_SLOTS})"
         )
+    # ``dtype.kind`` is "i" for signed and "u" for unsigned integers. This
+    # check is what rules out Booleans (kind "b") and floats (kind "f").
     if action_targets.dtype.kind not in {"i", "u"}:
         raise TypeError(
             f"env-v3 step targets have dtype {action_targets.dtype}, want integers"
         )
 
+    # Stage 2: validate the IDs and match them to the rows.
     # Keep IDs in their input order until the same permutation can be applied
     # to both arrays. Sorting IDs alone would attach action rows to the wrong
     # game whenever a caller supplies IDs such as [10, 2].
     checked_ids = _checked_env_ids_in_input_order(env_ids, "step")
+    # One row per ID: N IDs need exactly N rows.
     expected_shape = (len(checked_ids), BODY_SLOTS)
     if action_targets.shape != expected_shape:
         raise ValueError(
@@ -849,11 +887,19 @@ def _encode_step_array_payload(
         len(checked_ids), "step environment count"
     )
 
+    # Stage 3: range-check every target at once. Comparing a NumPy array
+    # with a number gives a same-shaped array of True/False, one per target,
+    # and ``&`` combines two of those element by element. An unsigned array
+    # cannot hold -1 or any negative value, so only the upper limit needs
+    # checking. A signed array checks both ends.
     if action_targets.dtype.kind == "u":
         valid_targets = action_targets < BODY_SLOTS
     else:
         valid_targets = (action_targets >= -1) & (action_targets < BODY_SLOTS)
     if not bool(np.all(valid_targets)):
+        # ``~`` flips True and False, so ``~valid_targets`` marks the bad
+        # targets. ``argwhere`` lists their (row, column) positions, and the
+        # first one is reported so the error names one game and source slot.
         row_index, source_slot = np.argwhere(~valid_targets)[0]
         bad_target = action_targets[row_index, source_slot]
         raise ValueError(
@@ -861,6 +907,13 @@ def _encode_step_array_payload(
             f"{int(source_slot)} has invalid packed target {bad_target!r}"
         )
 
+    # Stage 4: put the IDs and rows in ascending ID order together.
+    # ``argsort`` does not sort the IDs. It returns the row positions that
+    # would sort them. For IDs [10, 2] it returns [1, 0], meaning "row 1
+    # first, then row 0". Applying that same ``order`` to the IDs and to the
+    # target rows keeps each row with its own game. ``kind="stable"`` keeps
+    # equal IDs in input order, so the result never depends on the sorting
+    # algorithm.
     order = np.argsort(np.asarray(checked_ids, dtype=UINT32_DTYPE), kind="stable")
     sorted_ids = np.asarray(checked_ids, dtype=UINT32_DTYPE)[order]
 
@@ -876,13 +929,23 @@ def _encode_step_array_payload(
         raise ValueError(
             f"env-v3 step repeats environment ID {int(sorted_ids[duplicate_index])}"
         )
+    # ``action_targets[order]`` reorders the rows to match ``sorted_ids``. It
+    # always makes a new array, so the caller's array is never changed. Every
+    # value is already known to be in -1..43, so narrowing to one signed byte
+    # each cannot change any value. ``copy=False`` skips a second copy when
+    # the array is already int8.
     packed_targets = action_targets[order].astype(INT8_DTYPE, copy=False)
 
+    # Stage 5: join the three sections in wire order. ``order="C"`` writes
+    # the targets row by row, so all 44 for the first ID come first.
     payload = (
         _UINT32.pack(environment_count)
         + sorted_ids.tobytes(order="C")
         + packed_targets.tobytes(order="C")
     )
+    # Stage 6: confirm the payload has exactly the size the layout predicts.
+    # A mismatch means this encoder has a bug, not that the caller passed bad
+    # input, which is why it raises RuntimeError rather than ValueError.
     expected_size = (
         STEP_REQUEST_PREFIX_BYTES
         + len(checked_ids) * STEP_REQUEST_BYTES_PER_ENVIRONMENT
