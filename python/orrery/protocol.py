@@ -735,14 +735,6 @@ def encode_step_payload(
     # its own game.
     checked_rows.sort(key=lambda item: item[0])
 
-    # From here on ``env_ids`` is the sorted ID list taken from the mapping.
-    # The parameter of the same name was None on this path, so nothing is
-    # lost by reusing it.
-    env_ids = [item[0] for item in checked_rows]
-    environment_count = _checked_uint32(
-        len(env_ids), "step environment count"
-    )
-
     # Stage 2: check every target and keep the checked values. Each row is
     # read exactly once, so the values sent to Go are the same values that
     # passed the checks. Reading a row twice could see different values if
@@ -752,8 +744,14 @@ def encode_step_payload(
     # built from the raw rows. NumPy would quietly turn a mixed row such as
     # [True, 2, ...] into integers and hide the fact that a Boolean was
     # passed in.
+    #
+    # The same loop also collects the sorted IDs. From here on ``env_ids`` is
+    # that list. The parameter of the same name was None on this path, so
+    # nothing is lost by reusing it.
+    env_ids: list[int] = []
     checked_targets: list[list[int]] = []
     for env_id, row in checked_rows:
+        env_ids.append(env_id)
         try:
             row_length = len(row)
         except TypeError as error:
@@ -781,6 +779,9 @@ def encode_step_payload(
                 )
             checked_row.append(value)
         checked_targets.append(checked_row)
+    environment_count = _checked_uint32(
+        len(env_ids), "step environment count"
+    )
 
     # Every row now has exactly 44 integers in -1..43, so the conversion
     # below cannot fail and narrowing to one signed byte each cannot change
