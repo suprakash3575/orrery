@@ -551,14 +551,21 @@ def collect_rollout(
     if not 0.0 <= lam <= 1.0:
         raise ValueError(f"lam must be in [0, 1], got {lam}")
     ordered_episodes = _ordered_episodes(episodes, "initial episodes")
-    environment_ids = tuple(episode.env_id for episode in ordered_episodes)
-    active = {episode.env_id: episode for episode in ordered_episodes}
-    # Tensor rows use positions 0 through B-1, whereas protocol messages name
-    # reusable environments by ID. This lookup tells reset handling which tensor
-    # row belongs to each finished environment without searching every turn.
-    environment_positions = {
-        env_id: position for position, env_id in enumerate(environment_ids)
-    }
+    # Build both lookups in one pass over the ordered episodes.
+    # ``active`` maps each environment ID to the episode currently playing in
+    # it. Tensor rows use positions 0 through B-1, whereas protocol messages
+    # name reusable environments by ID, so ``environment_positions`` tells
+    # reset handling which tensor row belongs to each finished environment
+    # without searching every turn.
+    active: dict[int, Episode] = {}
+    environment_positions: dict[int, int] = {}
+    for position, episode in enumerate(ordered_episodes):
+        active[episode.env_id] = episode
+        environment_positions[episode.env_id] = position
+    # A dict keeps insertion order, so these keys are the ascending IDs from
+    # ``ordered_episodes``. No ID is lost to a repeated key because
+    # ``_ordered_episodes`` has already rejected duplicates.
+    environment_ids = tuple(active)
 
     # These invariants remain fixed for the complete rollout. Check them once,
     # then retain the first tensor batch as the learner's current state.
