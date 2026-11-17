@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Protocol
 
@@ -581,31 +581,18 @@ def collect_rollout(
     # once at the start of every collect_rollout() call and is grouped with the
     # later observation transfers performed during that same PPO update.
 
-    observation_rows: list[ObservationBatch] = []
-    next_observation_rows: list[ObservationBatch] = []
-    action_rows: list[SampledActionBatch] = []
-    log_probability_rows: list[Tensor] = []
-    value_rows: list[Tensor] = []
-    # These values originate as Python scalars in protocol results and episode
-    # identities. Retain plain rows during collection, then create one tensor
-    # per field after all requested turns. In the standard 512-turn rollout,
-    # constructing seven tiny CUDA tensors every turn caused thousands of
-    # host-to-device operations.
-    reward_rows: list[list[float]] = []
-    terminated_rows: list[list[bool]] = []
-    truncated_rows: list[list[bool]] = []
-    seed_rows: list[list[int]] = []
-    seat_rows: list[list[int]] = []
-    explicit_rows: list[list[bool]] = []
-    turn_rows: list[list[int]] = []
+    rows = _RolloutRows()
 
-    # The policy device is fixed for the rollout. _collect_transition converts
-    # every returned Go observation back onto this same device, so the loop does
-    # not need to rediscover or overwrite the value on every turn.
+    # Each turn has three stages: play one step, store it, then start new
+    # games in any finished slots. The policy device is fixed for the
+    # rollout, and _collect_transition converts every returned Go observation
+    # back onto it, so the loop does not rediscover the device each turn.
     for _ in range(steps):
         # Rebuild only the lightweight identity tuple in the fixed B-axis order.
         # current_observation already contains the matching model tensors, either
         # returned by Go on the prior turn or installed by reset handling below.
+        # Reading ``active`` by ID matters: after a reset, its insertion order no
+        # longer matches the B axis.
         current_episodes = tuple(active[env_id] for env_id in environment_ids)
         transition = _collect_transition(
             environment,
@@ -615,86 +602,18 @@ def collect_rollout(
             generator=generator,
             profiler=profiler,
         )
-        observation = transition.observation
-        output = transition.policy_output
-        actions = transition.actions
-        old_log_probability = transition.old_log_probabilities
-        results = transition.results
-        next_observation = transition.next_observation
-
-        # Keep one row group per rollout turn. Tensor-valued policy data remains
-        # on the policy device; protocol scalars remain in the plain lists below.
-        # All groups are joined only after the final collection turn.
-        observation_rows.append(observation)
-        next_observation_rows.append(next_observation)
-        action_rows.append(actions)
-        log_probability_rows.append(old_log_probability)
-        value_rows.append(output.values)
-        reward_rows.append([result.reward for result in results])
-        terminated_rows.append([result.terminated for result in results])
-        truncated_rows.append([result.truncated for result in results])
-        seed_rows.append([episode.seed for episode in current_episodes])
-        seat_rows.append([episode.seat for episode in current_episodes])
-        explicit_rows.append([episode.explicit for episode in current_episodes])
-        turn_rows.append([result.turn for result in results])
-
-        # A boundary result belongs to the transition just stored. Reset only
-        # after retaining it, so a truncation bootstraps from its actual final
-        # observation rather than from the unrelated next episode.
-        finished_ids = tuple(
-            result.env_id
-            for result in results
-            if result.terminated or result.truncated
+        # Store the turn before any reset. A finished game's final observation
+        # and boundary flags belong to this transition, not to the next game.
+        rows.record(transition)
+        # Replace both values together so the identities and observations used
+        # on the next turn always describe the same games.
+        active, current_observation = _advance_finished_slots(
+            environment,
+            transition,
+            environment_positions,
+            device=device,
+            profiler=profiler,
         )
-        next_active: dict[int, Episode] = {
-            result.env_id: result
-            for result in results
-            if not (result.terminated or result.truncated)
-        }
-        if finished_ids:
-            # Ask Go to assign a new game only to finished slots. Continuing
-            # slots must retain both their episode identity and the observation
-            # Go returned for them on this turn.
-            reset_episodes = _ordered_reset_episodes(
-                environment.reset(finished_ids),
-                finished_ids,
-            )
-            next_active.update(
-                {episode.env_id: episode for episode in reset_episodes}
-            )
-            # Only reset results are still NumPy values here. Convert that small
-            # subset rather than rebuilding tensors for all environments.
-            with profile_phase(profiler, "tensor_transfer"):
-                reset_observation = ObservationBatch.from_observations(
-                    [episode.observation for episode in reset_episodes],
-                    device=device,
-                )
-                # index_copy_ works with tensor row positions, so translate each
-                # stable environment ID into its position on the fixed batch axis.
-                reset_positions = torch.tensor(
-                    [
-                        environment_positions[episode.env_id]
-                        for episode in reset_episodes
-                    ],
-                    dtype=torch.long,
-                    device=device,
-                )
-                # Start from the complete post-step tensor and replace only the rows
-                # whose games ended. The resulting batch therefore combines reset
-                # starting states with untouched continuing states in B-axis order.
-                current_observation = _replace_observation_rows(
-                    next_observation,
-                    reset_observation,
-                    reset_positions,
-                )
-        else:
-            # For a continuing game, Go's observation after turn t is exactly
-            # the policy input for turn t+1. Reusing this tensor avoids stacking
-            # the same NumPy observations and copying them to CUDA again.
-            current_observation = next_observation
-        # Publish the identities for the next turn only after reset episodes
-        # have replaced every finished result in this temporary mapping.
-        active = next_active
 
     # Everything below turns the per-turn row groups (512 in the standard
     # rollout) into the fixed tensors consumed by bootstrap, GAE, and PPO. Profiling uses two build intervals so
@@ -702,7 +621,7 @@ def collect_rollout(
     with profile_phase(profiler, "rollout_build"):
         # Critic values were already produced as one device tensor per policy
         # call, so torch.stack joins them without another host-to-device transfer.
-        values = torch.stack(value_rows)
+        values = torch.stack(rows.values)
 
         # Protocol rewards and boundary flags are still Python scalars. Construct
         # each complete [T, B] tensor once with torch.tensor, which accepts the
@@ -711,17 +630,17 @@ def collect_rollout(
         # 3,584 tensor constructions. Creating one complete tensor per field
         # reduces that work to seven constructions for the standard rollout.
         rewards = torch.tensor(
-            reward_rows,
+            rows.rewards,
             dtype=values.dtype,
             device=device,
         )
-        terminated = torch.tensor(terminated_rows, dtype=torch.bool, device=device)
-        truncated = torch.tensor(truncated_rows, dtype=torch.bool, device=device)
+        terminated = torch.tensor(rows.terminated, dtype=torch.bool, device=device)
+        truncated = torch.tensor(rows.truncated, dtype=torch.bool, device=device)
 
         # GAE needs a critic estimate for the state following each stored action.
         # Most values can be reused from the following turn; the bootstrap helper
         # evaluates only truncations and the final rollout boundary that lack one.
-        next_observations = _concatenate_observations(next_observation_rows)
+        next_observations = _concatenate_observations(rows.next_observations)
 
     with profile_phase(profiler, "bootstrap"):
         next_values = calculate_bootstrap_values(
@@ -752,13 +671,13 @@ def collect_rollout(
         # seed, seat, explicit-assignment flag, and turn lists are also converted
         # here once rather than once per collection turn.
         batch = RolloutBatch(
-            observations=_concatenate_observations(observation_rows),
+            observations=_concatenate_observations(rows.observations),
             next_observations=next_observations,
             actions=SampledActionBatch(
-                launches=torch.cat([row.launches for row in action_rows]),
-                targets=torch.cat([row.targets for row in action_rows]),
+                launches=torch.cat([row.launches for row in rows.actions]),
+                targets=torch.cat([row.targets for row in rows.actions]),
             ),
-            old_log_probabilities=torch.cat(log_probability_rows),
+            old_log_probabilities=torch.cat(rows.log_probabilities),
             values=values.reshape(-1),
             next_values=next_values.reshape(-1),
             rewards=rewards.reshape(-1),
@@ -766,14 +685,14 @@ def collect_rollout(
             truncated=truncated.reshape(-1),
             advantages=advantages.reshape(-1),
             return_targets=return_targets.reshape(-1),
-            seeds=torch.tensor(seed_rows, dtype=torch.long, device=device).reshape(-1),
-            seats=torch.tensor(seat_rows, dtype=torch.long, device=device).reshape(-1),
+            seeds=torch.tensor(rows.seeds, dtype=torch.long, device=device).reshape(-1),
+            seats=torch.tensor(rows.seats, dtype=torch.long, device=device).reshape(-1),
             explicit=torch.tensor(
-                explicit_rows,
+                rows.explicit,
                 dtype=torch.bool,
                 device=device,
             ).reshape(-1),
-            turns=torch.tensor(turn_rows, dtype=torch.long, device=device).reshape(-1),
+            turns=torch.tensor(rows.turns, dtype=torch.long, device=device).reshape(-1),
             environment_ids=environment_ids,
             time_steps=steps,
             replay_metadata=environment.metadata,
@@ -785,6 +704,143 @@ def collect_rollout(
         batch=batch,
         next_episodes=tuple(active[env_id] for env_id in environment_ids),
     )
+
+
+@dataclass
+class _RolloutRows:
+    """Per-turn values gathered during collection and joined after the last turn.
+
+    ``record`` appends exactly one entry to every list per collection turn, so
+    after ``T`` turns each list has length ``T``. Entry ``t`` holds turn
+    ``t``'s values for all ``B`` game slots in B-axis order. ``collect_rollout``
+    owns one instance per call and turns these lists into the fixed
+    ``RolloutBatch`` tensors once collection ends.
+    """
+
+    # Policy inputs and outputs. These are already tensors on the policy
+    # device, one B-row batch per turn, so joining them later needs no
+    # host-to-device copy.
+    observations: list[ObservationBatch] = field(default_factory=list)
+    # Go's observation after each turn, before any finished slot is reset.
+    # Bootstrap values for truncated games are computed from these rows.
+    next_observations: list[ObservationBatch] = field(default_factory=list)
+    actions: list[SampledActionBatch] = field(default_factory=list)
+    log_probabilities: list[Tensor] = field(default_factory=list)
+    # Critic estimates for each turn's starting state.
+    values: list[Tensor] = field(default_factory=list)
+
+    # These values originate as Python scalars in protocol results and episode
+    # identities. Retain plain rows during collection, then create one tensor
+    # per field after all requested turns. In the standard 512-turn rollout,
+    # constructing seven tiny CUDA tensors every turn caused thousands of
+    # host-to-device operations.
+    rewards: list[list[float]] = field(default_factory=list)
+    terminated: list[list[bool]] = field(default_factory=list)
+    truncated: list[list[bool]] = field(default_factory=list)
+    # Replay identity of the episode that chose each action. These come from
+    # the episodes the turn started with, not from the step results.
+    seeds: list[list[int]] = field(default_factory=list)
+    seats: list[list[int]] = field(default_factory=list)
+    explicit: list[list[bool]] = field(default_factory=list)
+    # The game turn reported by Go after each step.
+    turns: list[list[int]] = field(default_factory=list)
+
+    def record(self, transition: CollectedTransition) -> None:
+        """Append one turn's values for every slot to each list.
+
+        Each line builds one column with its own comprehension. Merging them
+        into a single loop was measured and was slightly slower, because
+        CPython runs a comprehension faster than repeated ``append`` calls.
+        """
+
+        results = transition.results
+        episodes = transition.episodes
+        self.observations.append(transition.observation)
+        self.next_observations.append(transition.next_observation)
+        self.actions.append(transition.actions)
+        self.log_probabilities.append(transition.old_log_probabilities)
+        self.values.append(transition.policy_output.values)
+        self.rewards.append([result.reward for result in results])
+        self.terminated.append([result.terminated for result in results])
+        self.truncated.append([result.truncated for result in results])
+        self.seeds.append([episode.seed for episode in episodes])
+        self.seats.append([episode.seat for episode in episodes])
+        self.explicit.append([episode.explicit for episode in episodes])
+        self.turns.append([result.turn for result in results])
+
+
+def _advance_finished_slots(
+    environment: RolloutEnvironment,
+    transition: CollectedTransition,
+    environment_positions: Mapping[int, int],
+    *,
+    device: torch.device,
+    profiler: PhaseProfiler | None,
+) -> tuple[dict[int, Episode], ObservationBatch]:
+    """Prepare every slot's episode and observation for the next turn.
+
+    Slots whose game is still running keep the step result Go just returned.
+    Slots whose game terminated or was truncated are reset, so Go starts a
+    new game there. Returns the next ``active`` map, keyed by environment ID,
+    and the matching policy-input observation in B-axis order.
+
+    Call this only after the transition has been recorded. A finished game's
+    final observation belongs to the stored transition, so a truncation
+    bootstraps from its real last state rather than from the next game's
+    starting state.
+    """
+
+    results = transition.results
+    next_observation = transition.next_observation
+    finished_ids = tuple(
+        result.env_id
+        for result in results
+        if result.terminated or result.truncated
+    )
+    next_active: dict[int, Episode] = {
+        result.env_id: result
+        for result in results
+        if not (result.terminated or result.truncated)
+    }
+    if not finished_ids:
+        # For a continuing game, Go's observation after turn t is exactly
+        # the policy input for turn t+1. Reusing this tensor avoids stacking
+        # the same NumPy observations and copying them to CUDA again.
+        return next_active, next_observation
+
+    # Ask Go to assign a new game only to finished slots. Continuing slots
+    # must retain both their episode identity and the observation Go returned
+    # for them on this turn. Reset episodes are added at the end of the dict,
+    # so its insertion order no longer matches the B axis. Callers must read
+    # it by environment ID.
+    reset_episodes = _ordered_reset_episodes(
+        environment.reset(finished_ids),
+        finished_ids,
+    )
+    next_active.update({episode.env_id: episode for episode in reset_episodes})
+    # Only reset results are still NumPy values here. Convert that small
+    # subset rather than rebuilding tensors for all environments.
+    with profile_phase(profiler, "tensor_transfer"):
+        reset_observation = ObservationBatch.from_observations(
+            [episode.observation for episode in reset_episodes],
+            device=device,
+        )
+        # index_copy_ works with tensor row positions, so translate each
+        # stable environment ID into its position on the fixed batch axis.
+        reset_positions = torch.tensor(
+            [environment_positions[episode.env_id] for episode in reset_episodes],
+            dtype=torch.long,
+            device=device,
+        )
+        # Start from the complete post-step tensor and replace only the rows
+        # whose games ended. The resulting batch therefore combines reset
+        # starting states with untouched continuing states in B-axis order.
+        current_observation = _replace_observation_rows(
+            next_observation,
+            reset_observation,
+            reset_positions,
+        )
+    return next_active, current_observation
 
 
 def _replace_observation_rows(
