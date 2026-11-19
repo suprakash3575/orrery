@@ -45,7 +45,7 @@ through that process's standard input and output.
 
 ## Requirements
 
-- Go 1.27.3, as declared in [`go.mod`](go.mod).
+- Go 1.27.4, as declared in [`go.mod`](go.mod).
 - `make` for the convenience commands below.
 - Python 3.11 or newer for the RL client and trainer.
 - [`uv`](https://docs.astral.sh/uv/) to create the isolated Python environment
