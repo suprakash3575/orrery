@@ -530,6 +530,50 @@ def test_packed_step_writes_the_same_bytes_as_slot_actions(
     ]
 
 
+def test_packed_array_step_keeps_each_row_with_its_unsorted_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollout's array form must send each game its own row and accept Go's reply.
+
+    The IDs arrive as [10, 2], the reverse of wire order. Matching the mapping
+    form's bytes proves the encoder moved each row with its ID. Returning a
+    valid response in sorted order proves the response check accepts the
+    unsorted request IDs.
+    """
+
+    responses = (
+        _create_response_frame("train-v2", 0)
+        + _step_response_frame((2, 10))
+        + _close_response_frame()
+    )
+    mapping_process = FakeProcess(responses)
+    array_process = FakeProcess(responses)
+    processes = iter((mapping_process, array_process))
+    monkeypatch.setattr(
+        env_client.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: next(processes),
+    )
+
+    # Distinct rows: if the encoder swapped them, game 10 would launch from
+    # slot 0 instead of slot 43 and the bytes below would differ.
+    game_10_row = [-1] * 43 + [1]
+    game_2_row = [43] + [-1] * 43
+
+    with env_client.EnvClient(("fake-env",), players=2) as client:
+        client.create(2, (0, 10), "idle-v1")
+        client.step_packed({10: game_10_row, 2: game_2_row})
+    with env_client.EnvClient(("fake-env",), players=2) as client:
+        client.create(2, (0, 10), "idle-v1")
+        results = client.step_packed(
+            np.array([game_10_row, game_2_row], dtype=np.int64),
+            env_ids=(10, 2),
+        )
+
+    assert bytes(array_process.stdin.data) == bytes(mapping_process.stdin.data)
+    assert [result.env_id for result in results] == [2, 10]
+
+
 @pytest.mark.parametrize(
     ("targets", "error", "message"),
     [

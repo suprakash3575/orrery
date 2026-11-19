@@ -83,9 +83,17 @@ class _OneMoveEnvironment:
 
     def step_packed(
         self,
-        action_targets: Mapping[int, Sequence[int]],
+        action_targets: Mapping[int, Sequence[int]] | np.ndarray,
+        *,
+        env_ids: Sequence[int] | None = None,
     ) -> list[StepResult]:
         """Delay the opening move's outcome until the second, terminal turn."""
+
+        # Training collection passes an array with row i belonging to
+        # env_ids[i]; evaluation passes a mapping. Pair the rows with their
+        # IDs so both forms share the logic below.
+        if env_ids is not None:
+            action_targets = dict(zip(env_ids, action_targets, strict=True))
 
         if tuple(sorted(action_targets)) != tuple(sorted(self._active)):
             raise ValueError("actions must name every active environment")

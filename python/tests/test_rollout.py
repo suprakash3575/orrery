@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 
 import numpy as np
@@ -74,8 +74,14 @@ def test_collection_payload_transfers_actions_and_flags_together(
         torch.tensor(flags, dtype=torch.bool),
     )
 
-    assert packed[0] == (5, *([-1] * (BODY_SLOTS - 1)))
-    assert packed[1] == (-1, -1, -1, 7, *([-1] * (BODY_SLOTS - 4)))
+    # NumPy ``==`` compares element by element, so whole rows are compared
+    # with array_equal. Read-only matters because the array is stored in a
+    # frozen transition as the exact record of what was sent to Go.
+    assert packed.shape == (2, BODY_SLOTS)
+    assert packed.dtype == np.int64
+    assert not packed.flags.writeable
+    assert np.array_equal(packed[0], [5, *([-1] * (BODY_SLOTS - 1))])
+    assert np.array_equal(packed[1], [-1, -1, -1, 7, *([-1] * (BODY_SLOTS - 4))])
     assert passed is expected_passed
 
 
@@ -148,7 +154,9 @@ class _BoundaryEnvironment:
 
     def step_packed(
         self,
-        action_targets: Mapping[int, Sequence[int]],
+        action_targets: np.ndarray,
+        *,
+        env_ids: Sequence[int] | None = None,
     ) -> list[StepResult]:
         """Return the next scripted result for both environment slots.
 
@@ -157,10 +165,11 @@ class _BoundaryEnvironment:
         episode boundaries, not whether an Orrery action wins a game.
         """
 
-        # The collector should send exactly one action list for each active
+        # The collector should send exactly one action row for each active
         # environment ID, regardless of the order in which episodes arrived.
-        assert tuple(sorted(action_targets)) == (0, 1)
-        assert all(len(row) == BODY_SLOTS for row in action_targets.values())
+        assert env_ids is not None
+        assert tuple(sorted(env_ids)) == (0, 1)
+        assert action_targets.shape == (2, BODY_SLOTS)
         transitions = (
             # At turn zero, environment 1 truncates. Its returned marker 11
             # must supply the bootstrap before that slot resets to marker 20.
@@ -366,9 +375,13 @@ class _EliminationEnvironment:
 
     def step_packed(
         self,
-        action_targets: Mapping[int, Sequence[int]],
+        action_targets: np.ndarray,
+        *,
+        env_ids: Sequence[int] | None = None,
     ) -> list[StepResult]:
-        assert tuple(sorted(action_targets)) == (0, 1)
+        assert env_ids is not None
+        assert tuple(sorted(env_ids)) == (0, 1)
+        assert action_targets.shape == (2, BODY_SLOTS)
         results: list[StepResult] = []
         for env_id in (0, 1):
             episode = self.active[env_id]
