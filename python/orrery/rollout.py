@@ -6,8 +6,10 @@ from collections.abc import Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Protocol
+from typing import Any, Protocol
 
+import numpy as np
+from numpy.typing import NDArray
 import torch
 from torch import Tensor, nn
 
@@ -43,9 +45,16 @@ class RolloutEnvironment(Protocol):
 
     def step_packed(
         self,
-        action_targets: Mapping[int, Sequence[int]],
+        action_targets: Mapping[int, Sequence[int]] | NDArray[np.integer[Any]],
+        *,
+        env_ids: Sequence[int] | None = None,
     ) -> list[StepResult]:
-        """Advance games from target slots, using -1 to mean no launch."""
+        """Advance games from target slots, using -1 to mean no launch.
+
+        Collection always passes an ``(N, 44)`` integer array whose row ``i``
+        belongs to ``env_ids[i]``. The mapping form remains part of the
+        interface because evaluation passes ``{env_id: row}``.
+        """
 
 
 @dataclass(frozen=True)
@@ -325,12 +334,13 @@ class CollectedTransition:
     observation: ObservationBatch
     policy_output: PolicyOutput
     # The tensor action and its probability are retained for PPO. The packed
-    # form is the CPU representation used to build the Go request: one row per
-    # environment in B-axis order, with -1 meaning no launch and 0 through 15
-    # naming the selected target slot.
+    # form is the CPU representation used to build the Go request: a read-only
+    # int64 array of shape (B, 44), one row per environment in B-axis order,
+    # with -1 meaning no launch and 0 through 43 naming the selected target
+    # slot.
     actions: SampledActionBatch
     old_log_probabilities: Tensor
-    packed_action_targets: tuple[tuple[int, ...], ...]
+    packed_action_targets: NDArray[np.int64]
     # Results and their converted observation describe the state after Go
     # completed the turn, before any finished slot is reset by collect_rollout.
     results: tuple[StepResult, ...]
@@ -426,9 +436,9 @@ def _collect_transition(
         old_log_probabilities = probability.values
 
     # Combine launch flags and target slots before crossing from CUDA to Python.
-    # Append every validation flag to that same integer payload so one tolist()
-    # is the turn's only explicit GPU-to-CPU transfer. The action rows use -1
-    # as the internal no-launch sentinel expanded by EnvClient.
+    # Append every validation flag to that same integer payload so one copy to
+    # the CPU is the turn's only explicit GPU-to-CPU transfer. The action rows
+    # use -1 as the internal no-launch sentinel expanded by EnvClient.
     with profile_phase(profiler, "action_encode"):
         packed_action_targets, validation_passed = _transfer_collection_payload(
             actions,
@@ -450,10 +460,10 @@ def _collect_transition(
         # Every transferred flag has a corresponding validator above. Reaching
         # here would mean those two definitions drifted and must fail closed.
         raise RuntimeError("deferred collection validation flags disagreed")
+    # Row i of the packed array belongs to environment_ids[i]. The encoder
+    # sorts IDs and rows together, so no per-game dictionary is built here.
     results = _ordered_results(
-        environment.step_packed(
-            dict(zip(environment_ids, packed_action_targets, strict=True))
-        ),
+        environment.step_packed(packed_action_targets, env_ids=environment_ids),
         environment_ids,
     )
     _validate_episode_identity(ordered_episodes, results)
@@ -483,12 +493,12 @@ def _collect_transition(
 def _transfer_collection_payload(
     actions: SampledActionBatch,
     validation_flags: Tensor,
-) -> tuple[tuple[tuple[int, ...], ...], bool]:
+) -> tuple[NDArray[np.int64], bool]:
     """Transfer packed actions and validation results in one CPU operation.
 
     Action targets occupy the first ``games * 44`` values. The remaining
     values are one for a passing check and zero for a failed check. Splitting
-    the ordinary Python list after ``tolist`` does not touch CUDA again.
+    the NumPy array after the transfer does not touch CUDA again.
     """
 
     if validation_flags.ndim != 1 or validation_flags.dtype != torch.bool:
@@ -504,19 +514,27 @@ def _transfer_collection_payload(
         torch.full_like(actions.targets, -1),
     )
     action_value_count = packed_tensor.numel()
+    # ``.numpy()`` shares memory with the CPU tensor instead of creating one
+    # Python int per value. That sharing is safe: ``torch.cat`` builds a new
+    # tensor every turn and nothing else holds it, even on CPU where ``.cpu()``
+    # does not copy. The targets are ``torch.long``, which SampledActionBatch
+    # enforces, so the array is int64 and cannot carry a Boolean that the
+    # encoder's integer check would miss.
     payload = torch.cat(
         (
             packed_tensor.reshape(-1),
             validation_flags.to(dtype=packed_tensor.dtype),
         )
-    ).detach().cpu().tolist()
+    ).detach().cpu().numpy()
 
-    action_values = payload[:action_value_count]
-    packed_action_targets = tuple(
-        tuple(action_values[offset : offset + actions.targets.shape[1]])
-        for offset in range(0, action_value_count, actions.targets.shape[1])
+    # Slicing and reshaping make views, not copies. The views are marked
+    # read-only because CollectedTransition is frozen and the array records
+    # exactly what was sent to Go.
+    packed_action_targets = payload[:action_value_count].reshape(
+        actions.targets.shape
     )
-    validation_passed = all(value == 1 for value in payload[action_value_count:])
+    packed_action_targets.flags.writeable = False
+    validation_passed = bool(np.all(payload[action_value_count:] == 1))
     return packed_action_targets, validation_passed
 
 
