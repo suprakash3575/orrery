@@ -411,21 +411,38 @@ class EnvClient:
 
     def step_packed(
         self,
-        action_targets: Mapping[int, Sequence[int]],
+        action_targets: Mapping[int, Sequence[int]] | NDArray[np.integer[Any]],
+        *,
+        env_ids: Sequence[int] | None = None,
     ) -> list[StepResult]:
         """Advance games from compact target rows produced by collection.
 
         Every row contains one integer for each body slot. ``-1`` means the
         body does not launch; values from 0 through 43 mean launch at that
-        target slot. This representation arrives from Torch in one CPU transfer
-        and avoids constructing 22,528 temporary ``SlotAction`` objects per
-        turn in the standard 512-environment batch. The same values become the
-        fixed 44 signed target bytes defined by the binary protocol.
+        target slot. This representation avoids constructing 22,528 temporary
+        ``SlotAction`` objects per turn in the standard 512-environment batch.
+        The same values become the fixed 44 signed target bytes defined by the
+        binary protocol.
+
+        Two input forms are accepted, matching ``encode_step_payload``:
+
+        1. A mapping ``{env_id: row}``, as the evaluator passes. Every value
+           is checked in Python, which rejects a stray ``True``.
+        2. An integer NumPy array of shape ``(N, 44)`` with ``env_ids``, where
+           row ``i`` belongs to ``env_ids[i]``. Rollout collection passes the
+           array it received from Torch, so the targets are range-checked in
+           one NumPy operation instead of being converted to Python numbers.
+           ``env_ids`` may be in any order; the encoder sorts IDs and rows
+           together.
         """
 
         with _profile_phase(self._profiler, "action_encode"):
-            payload = protocol.encode_step_payload(action_targets)
-        return self._step_binary(payload, tuple(action_targets))
+            payload = protocol.encode_step_payload(action_targets, env_ids=env_ids)
+        # The encoder has already rejected a mapping given with env_ids and an
+        # array given without them, so exactly one source of IDs is valid here.
+        # The response check sorts these IDs itself, so input order is fine.
+        expected_env_ids = tuple(action_targets) if env_ids is None else env_ids
+        return self._step_binary(payload, expected_env_ids)
 
     def _step_binary(
         self,
