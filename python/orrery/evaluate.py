@@ -238,10 +238,12 @@ def _run_claimed_matches(
     )
     # Describe the Go contract expected for this attempt. The runner compares
     # these values with Go's create response before accepting any score.
+    # Final evaluation plays the fixed release opponent, the same one release
+    # readiness used, whatever the archived run trained against.
     expected_metadata = evaluation_metadata(
         candidate.config,
         claim.seeds,
-        candidate.config.training_opponent,
+        candidate.config.release_opponent,
     )
     # This is the Python-to-Go game boundary. The reusable runner repeatedly
     # chooses deterministic actions, sends them to Go, and receives the next
@@ -250,7 +252,7 @@ def _run_claimed_matches(
         prepared,
         command=command,
         seeds=claim.seeds,
-        opponent=candidate.config.training_opponent,
+        opponent=candidate.config.release_opponent,
         batch_size=batch_size,
         evaluation_policy=prepared.evaluation_policy,
         device=prepared.device,
@@ -465,7 +467,7 @@ def _evaluation_evidence(
             "rl": candidate.config.contract,
             "checkpoint": candidate.config.checkpoint_format,
             "policy": candidate.config.evaluation_policy,
-            "opponent": candidate.config.training_opponent,
+            "opponent": candidate.config.release_opponent,
             "schedule": SCHEDULE_ROTATE,
             "protocol": candidate.config.protocol_version,
             "observation": candidate.config.observation_schema,
