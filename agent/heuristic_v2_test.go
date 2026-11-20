@@ -323,3 +323,69 @@ func aimedByLeadAim(g *game.Game, action game.Action) bool {
 	}
 	return false
 }
+
+// TestSharedLandings covers the rules for reusing a caller's prediction: when
+// it is used, how later landings are dropped, and which mismatches are errors.
+func TestSharedLandings(t *testing.T) {
+	view := View{Fleets: []game.Fleet{{ID: 7}, {ID: 9}}}
+	planet := func(fleet, segment int) game.Landing {
+		return game.Landing{FleetID: fleet, Resolved: true, Hit: game.Hit{Kind: game.HitPlanet, BodyID: 3, T: 0.5}, Segment: segment}
+	}
+	cases := []struct {
+		name       string
+		prediction *FleetPrediction
+		horizon    int
+		want       []game.Landing
+		wantErr    bool
+	}{
+		{name: "no prediction", prediction: nil, horizon: 100},
+		{
+			name:       "horizon shorter than wanted",
+			prediction: &FleetPrediction{Horizon: 99, Landings: []game.Landing{planet(7, 1), planet(9, 2)}},
+			horizon:    100,
+		},
+		{
+			// Given in the other order: the result follows View.Fleets.
+			name:       "reordered to the view",
+			prediction: &FleetPrediction{Horizon: 142, Landings: []game.Landing{planet(9, 2), planet(7, 1)}},
+			horizon:    100,
+			want:       []game.Landing{planet(7, 1), planet(9, 2)},
+		},
+		{
+			// Segment 5 is beyond a 5-turn look-ahead, so it reads as unresolved.
+			name:       "landing at the horizon dropped",
+			prediction: &FleetPrediction{Horizon: 142, Landings: []game.Landing{planet(7, 4), planet(9, 5)}},
+			horizon:    5,
+			want:       []game.Landing{planet(7, 4), {FleetID: 9}},
+		},
+		{
+			name:       "missing fleet",
+			prediction: &FleetPrediction{Horizon: 142, Landings: []game.Landing{planet(7, 1), planet(8, 1)}},
+			horizon:    100,
+			wantErr:    true,
+		},
+		{
+			name:       "repeated fleet",
+			prediction: &FleetPrediction{Horizon: 142, Landings: []game.Landing{planet(7, 1), planet(7, 2)}},
+			horizon:    100,
+			wantErr:    true,
+		},
+		{
+			name:       "wrong count",
+			prediction: &FleetPrediction{Horizon: 142, Landings: []game.Landing{planet(7, 1)}},
+			horizon:    100,
+			wantErr:    true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := sharedLandings(view, tc.prediction, tc.horizon)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("sharedLandings() error = %v, want error %v", err, tc.wantErr)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("sharedLandings() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}

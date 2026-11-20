@@ -19,12 +19,17 @@ import (
 // reports is what AdvanceTurn will do, moving orbits and comets included. It
 // summarizes inbound fleets only: it does not predict who will own the body
 // afterwards, and it cannot see comet waves that have not spawned yet.
-func encodeIncoming(obs *Observation, g *game.Game, frame SeatFrame, slots slotTable) error {
-	// Stage 1: predict every fleet once. predictFleets fails if any fleet is
+//
+// It returns the landings it predicted, one per fleet in g.Fleets order, so
+// the environment can hand the same prediction to scripted opponents instead
+// of having each one run it again. predict supplies them: predictFleets, or
+// an environment's landingCache, which returns the same landings.
+func encodeIncoming(obs *Observation, g *game.Game, frame SeatFrame, slots slotTable, predict fleetPredictor) ([]game.Landing, error) {
+	// Stage 1: predict every fleet once. Both predictors fail if any fleet is
 	// still flying after the longest crossing the board allows.
-	landings, err := predictFleets(g)
+	landings, err := predict(g)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	horizon := float64(maxPredictionSegments(g))
 
@@ -46,7 +51,7 @@ func encodeIncoming(obs *Observation, g *game.Game, frame SeatFrame, slots slotT
 			// The slot table and the prediction come from the same game, so
 			// this can only mean the engine reported a body the board does not
 			// hold — a broken state, not one to encode around.
-			return fmt.Errorf("obs-v2: fleet %d is predicted to reach body %d, which has no slot", f.ID, landing.Hit.BodyID)
+			return nil, fmt.Errorf("obs-v2: fleet %d is predicted to reach body %d, which has no slot", f.ID, landing.Hit.BodyID)
 		}
 		// buildSlotTable has already rejected neutral fleets and fleets owned
 		// outside the roster. The check stays anyway: RoleOf's zero role is
@@ -54,7 +59,7 @@ func encodeIncoming(obs *Observation, g *game.Game, frame SeatFrame, slots slotT
 		// ships as the observer's.
 		role, ok := frame.RoleOf(f.OwnerID)
 		if !ok {
-			return fmt.Errorf("obs-v2: fleet %d belongs to player %d, who has no role", f.ID, f.OwnerID)
+			return nil, fmt.Errorf("obs-v2: fleet %d belongs to player %d, who has no role", f.ID, f.OwnerID)
 		}
 		ships[slot][role] += f.Ships
 		// ETA is the moment of physical contact, in turns from now: whole
@@ -84,5 +89,5 @@ func encodeIncoming(obs *Observation, g *game.Game, frame SeatFrame, slots slotT
 			row[FeatureArrivalMe+int(role)] = arrival
 		}
 	}
-	return nil
+	return landings, nil
 }

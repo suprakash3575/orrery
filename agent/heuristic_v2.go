@@ -177,7 +177,14 @@ func (a *HeuristicV2Agent) Decide(ctx context.Context, request TurnRequest) (Dec
 	// counting it would claim or defend against nothing. An early end by
 	// elimination can't be known in advance.
 	horizon := min(heuristicV2LookAhead, view.Config.MaxTurns-view.Turn)
-	arrivals := predictedArrivals(view, predictor.PredictFleets(horizon))
+	landings, err := sharedLandings(view, request.Prediction, horizon)
+	if err != nil {
+		return Decision{}, fmt.Errorf("%s: %w", HeuristicV2, err)
+	}
+	if landings == nil {
+		landings = predictor.PredictFleets(horizon)
+	}
+	arrivals := predictedArrivals(view, landings)
 
 	// A body this player's fleets already in flight are predicted to own once
 	// every predicted landing has fought is claimed before any new launch is
@@ -240,6 +247,49 @@ func predictedArrivals(view View, landings []game.Landing) map[int][]arrival {
 		sort.SliceStable(list, func(i, j int) bool { return list[i].segment < list[j].segment })
 	}
 	return arrivals
+}
+
+// sharedLandings turns a caller's prediction into exactly what
+// predictor.PredictFleets(horizon) would return on this view: one landing per
+// fleet, in View.Fleets order, with nothing resolved at or beyond horizon. It
+// returns nil, and no error, when there is no prediction or its horizon is
+// shorter than the one wanted; the caller then predicts for itself.
+//
+// Why dropping later landings is exact: the prediction simulates one turn at a
+// time and never looks past the turn it is on, so a fleet that lands in
+// segment s is reported the same way by every horizon above s. A fleet that
+// lands at or after horizon is one PredictFleets(horizon) reports as
+// unresolved, with every other field zero.
+//
+// A prediction that names a different set of fleets than the view is an error
+// rather than a reason to predict again: it means the caller predicted another
+// board, and silently ignoring that would hide the bug.
+func sharedLandings(view View, prediction *FleetPrediction, horizon int) ([]game.Landing, error) {
+	if prediction == nil || prediction.Horizon < horizon {
+		return nil, nil
+	}
+	if len(prediction.Landings) != len(view.Fleets) {
+		return nil, fmt.Errorf("shared prediction has %d landings for %d fleets", len(prediction.Landings), len(view.Fleets))
+	}
+	byFleet := make(map[int]game.Landing, len(prediction.Landings))
+	for _, landing := range prediction.Landings {
+		if _, repeated := byFleet[landing.FleetID]; repeated {
+			return nil, fmt.Errorf("shared prediction repeats fleet %d", landing.FleetID)
+		}
+		byFleet[landing.FleetID] = landing
+	}
+	landings := make([]game.Landing, len(view.Fleets))
+	for i, fleet := range view.Fleets {
+		landing, ok := byFleet[fleet.ID]
+		if !ok {
+			return nil, fmt.Errorf("shared prediction has no landing for fleet %d", fleet.ID)
+		}
+		if !landing.Resolved || landing.Segment >= horizon {
+			landing = game.Landing{FleetID: fleet.ID}
+		}
+		landings[i] = landing
+	}
+	return landings, nil
 }
 
 // forecast replays the landings predicted for one body, turn by turn, and

@@ -30,6 +30,26 @@ type TurnRequest struct {
 	MatchID  string
 	PlayerID int
 	View     View
+	// Prediction, when not nil, is a fleet look-ahead the caller already ran
+	// on exactly the board in View. Every seat sees the same board, so a match
+	// runner can predict once per turn and hand the result to each agent
+	// instead of having every agent repeat the same simulation. nil means the
+	// agent predicts for itself. It is shared between seats: read-only.
+	Prediction *FleetPrediction
+}
+
+// FleetPrediction is the result of game.Game.PredictFleets for the board an
+// agent's View was copied from.
+type FleetPrediction struct {
+	// Horizon is the look-ahead, in turns, the landings were predicted with.
+	// A landing in a segment below Horizon is exactly what a prediction with
+	// any longer horizon reports for that fleet, so an agent that wants a
+	// shorter look-ahead can drop the later landings instead of predicting
+	// again. An agent that wants a longer one must predict for itself.
+	Horizon int
+	// Landings holds one entry per fleet in View.Fleets, matched by
+	// Landing.FleetID, in any order. Read-only: every seat gets the same slice.
+	Landings []game.Landing
 }
 
 // Decision is one agent's complete submission for a turn. Keeping it as a

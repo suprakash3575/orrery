@@ -221,6 +221,18 @@ type environment struct {
 	opponents [PlayerSlots]agent.Agent
 	// observation caches the learner's current view used to decode its actions.
 	observation Observation
+	// prediction is the fleet look-ahead Build ran for observation, kept so
+	// the opponents deciding on this same board reuse it instead of each
+	// predicting again. It is replaced together with observation, after every
+	// reset and every completed turn, and is valid only while game.Turn equals
+	// predictionTurn. Opponents read it and must not change it.
+	prediction *agent.FleetPrediction
+	// predictionTurn is the game turn prediction was computed for.
+	predictionTurn int
+	// landings carries fleet landings from one turn to the next, so each
+	// Build predicts only newly launched fleets. It belongs to this slot's
+	// game alone and is used only by the worker advancing that game.
+	landings landingCache
 	// terminated prevents another step after the game has ended.
 	terminated bool
 	// poisoned records a stateful step failure and requires the slot to reset.
@@ -535,12 +547,13 @@ func (b *Batch) Step(ctx context.Context, decisions map[int][BodySlots]SlotActio
 			errs[index] = &EnvError{Kind: ErrorEngine, EnvID: step.id, Err: err}
 			return
 		}
-		obs, err := Build(step.env.game, step.env.frame)
+		obs, landings, err := buildWithLandings(step.env.game, step.env.frame, step.env.landings.predict)
 		if err != nil {
 			errs[index] = &EnvError{Kind: ErrorObservation, EnvID: step.id, Err: err}
 			return
 		}
 		step.env.observation = obs
+		step.env.setPrediction(landings)
 		reason, reward := episodeEnd(step.env.game, step.env.info.Seat)
 		step.env.terminated = reason != EndOngoing
 		results[index] = StepResult{
@@ -673,7 +686,10 @@ func (b *Batch) newEnvironment(ctx context.Context, plan episodeAssignment) (*en
 			return nil, &EnvError{Kind: ErrorScenario, EnvID: info.EnvID, Err: err}
 		}
 	}
-	obs, err := Build(g, frame)
+	// A new episode starts a new cache. This first Build fills it, so the
+	// first step already reuses the opening fleets' landings.
+	var cache landingCache
+	obs, landings, err := buildWithLandings(g, frame, cache.predict)
 	if err != nil {
 		return nil, &EnvError{Kind: ErrorObservation, EnvID: info.EnvID, Err: err}
 	}
@@ -697,10 +713,12 @@ func (b *Batch) newEnvironment(ctx context.Context, plan episodeAssignment) (*en
 		}
 		opponents[seat] = opponent
 	}
-	return &environment{
+	env := &environment{
 		info: info, matchID: matchID, game: g, frame: frame,
-		opponents: opponents, observation: obs,
-	}, nil
+		opponents: opponents, observation: obs, landings: cache,
+	}
+	env.setPrediction(landings)
+	return env, nil
 }
 
 // newOpponent creates the scripted agent for one seat. On failure it closes
@@ -766,9 +784,10 @@ func (env *environment) seatActions(ctx context.Context, learnerActions []game.A
 			continue
 		}
 		decision, err := opponent.Decide(ctx, agent.TurnRequest{
-			MatchID:  env.matchID,
-			PlayerID: seat,
-			View:     agent.NewView(env.game),
+			MatchID:    env.matchID,
+			PlayerID:   seat,
+			View:       agent.NewView(env.game),
+			Prediction: env.currentPrediction(),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("seat %d: %w", seat, err)
@@ -785,6 +804,29 @@ func (env *environment) seatActions(ctx context.Context, learnerActions []game.A
 		actions = append(actions, decision.Actions...)
 	}
 	return actions, nil
+}
+
+// setPrediction stores the landings Build predicted for the game's current
+// turn. Every seat decides from that same board before the next AdvanceTurn,
+// so the learner's observation and all opponents can share one prediction.
+func (env *environment) setPrediction(landings []game.Landing) {
+	env.prediction = &agent.FleetPrediction{
+		Horizon:  maxPredictionSegments(env.game),
+		Landings: landings,
+	}
+	env.predictionTurn = env.game.Turn
+}
+
+// currentPrediction returns the stored prediction only if it still describes
+// the game's current turn. Nothing advances the game between Build and the
+// opponents' decisions today, so this is a guard: a stale prediction would
+// quietly feed opponents last turn's landings, while nil just makes each one
+// predict for itself.
+func (env *environment) currentPrediction() *agent.FleetPrediction {
+	if env.prediction == nil || env.predictionTurn != env.game.Turn {
+		return nil
+	}
+	return env.prediction
 }
 
 // episodeEnd decides, after a completed engine turn, whether the learner's
