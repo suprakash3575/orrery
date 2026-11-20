@@ -161,48 +161,59 @@ type Observation struct {
 // alone, and draws no randomness — fleet prediction runs on a copy with no
 // random source.
 func Build(g *game.Game, frame SeatFrame) (Observation, error) {
+	obs, _, err := buildWithLandings(g, frame)
+	return obs, err
+}
+
+// buildWithLandings is Build that also returns the fleet landings it
+// predicted for the incoming columns: one per fleet in g.Fleets order, looked
+// ahead maxPredictionSegments(g) turns. The environment keeps them so the
+// scripted opponents deciding on this same board can reuse them. On error the
+// landings are nil.
+func buildWithLandings(g *game.Game, frame SeatFrame) (Observation, []game.Landing, error) {
 	// Stage 1: inputs. A frame is a promise about one particular board, so
 	// one that was never checked, or that describes another board, would
 	// rotate and label this one wrongly without any sign of it.
 	if g == nil {
-		return Observation{}, fmt.Errorf("obs-v2: nil game")
+		return Observation{}, nil, fmt.Errorf("obs-v2: nil game")
 	}
 	if !frame.built {
-		return Observation{}, fmt.Errorf("obs-v2: seat frame was not built by NewSeatFrame")
+		return Observation{}, nil, fmt.Errorf("obs-v2: seat frame was not built by NewSeatFrame")
 	}
 	if frame.game != g {
-		return Observation{}, fmt.Errorf("obs-v2: seat frame belongs to a different game")
+		return Observation{}, nil, fmt.Errorf("obs-v2: seat frame belongs to a different game")
 	}
 	// Identity says this is the frame's game, not that its board still suits
 	// the frame: Config is a plain field a caller could change after turn 0.
 	// The rotation is only valid about a centred sun on a square board.
 	if g.Config.Sun != frame.sun {
-		return Observation{}, fmt.Errorf("obs-v2: seat frame rotates about (%g, %g) but this board's sun is at (%g, %g)",
+		return Observation{}, nil, fmt.Errorf("obs-v2: seat frame rotates about (%g, %g) but this board's sun is at (%g, %g)",
 			frame.sun.X, frame.sun.Y, g.Config.Sun.X, g.Config.Sun.Y)
 	}
 	if err := checkSeatBoard(g.Config); err != nil {
-		return Observation{}, fmt.Errorf("obs-v2: %w", err)
+		return Observation{}, nil, fmt.Errorf("obs-v2: %w", err)
 	}
 
 	// Stage 2: slot table. Holds every remaining rejection.
 	slots, err := buildSlotTable(g, frame)
 	if err != nil {
-		return Observation{}, err
+		return Observation{}, nil, err
 	}
 
 	// Stages 3–7: encoding. Each stage writes its own columns or masks and
 	// reads only the game, the frame, and the slot table.
 	var obs Observation
 	encodeBodies(&obs, g, frame, slots)
-	if err := encodeIncoming(&obs, g, frame, slots); err != nil {
+	landings, err := encodeIncoming(&obs, g, frame, slots)
+	if err != nil {
 		// Only an unresolvable fleet or an engine/slot disagreement reaches
 		// here — both mean a broken state, so nothing partial is returned.
-		return Observation{}, err
+		return Observation{}, nil, err
 	}
 	encodeGlobals(&obs, g, slots)
 	encodePlayers(&obs, g, frame)
 	encodeMasks(&obs, frame, slots)
-	return obs, nil
+	return obs, landings, nil
 }
 
 // bodyRef is one planet or comet, flattened so slot assignment does not care
