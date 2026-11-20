@@ -5,7 +5,12 @@ GOFMT ?= gofmt
 UV ?= uv
 ARENA_ARGS ?=
 TRAIN_ARGS ?=
-GOMAXPROCS ?= 32
+# Go threads for the env process during training. On a Vast.ai 5090 container
+# limited to 46 CPUs, 4-player smoke runs measured about 2,900-3,000
+# env-steps/s at 12 and 16 against 2,291 at 32 and 2,234 at Go's own default:
+# more Go threads made each turn slower. Re-measure on a machine with a very
+# different CPU limit; `make train-4p GOMAXPROCS=16` overrides it per run.
+GOMAXPROCS ?= 12
 ENV_BINARY ?= .build/orrery-env
 ARENA_LINUX_BINARY ?= .build/linux-amd64/arena
 TURNS ?= 1
@@ -30,8 +35,8 @@ help:
 		'  arena-help    Show every arena command-line option' \
 		'  env           Start the long-lived env-v3 binary process' \
 		'  smoke         Run eight complete episodes through the env process' \
-		'  train         Start two-player rl-v2 CUDA training with GOMAXPROCS=32 (TRAIN_ARGS="...")' \
-		'  train-4p      Start four-player rl-v2 CUDA training with GOMAXPROCS=32 (TRAIN_ARGS="...")' \
+		'  train         Start two-player rl-v2 CUDA training with GOMAXPROCS=12 (TRAIN_ARGS="...")' \
+		'  train-4p      Start four-player rl-v2 CUDA training with GOMAXPROCS=12 (TRAIN_ARGS="...")' \
 		'  random-baseline Run the 100-game random-controller acceptance baseline' \
 		'  diagnose      Chart an rl-v2 run and play its latest checkpoint (DIAG_RUN=run DIAG_ARGS="--seeds 25")' \
 		'  control-center Browse runs and reports; launch training and evaluations' \
