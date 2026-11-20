@@ -148,3 +148,77 @@ func TestSharedPredictionLeavesHeuristicV2GamesUnchanged(t *testing.T) {
 		t.Fatal("opponents never launched, so the comparison exercised no aiming")
 	}
 }
+
+// TestLandingCacheMatchesFreshPrediction checks, after every turn of every
+// game, that the landings the environment carried over from earlier turns are
+// exactly what a prediction from scratch returns. 160 turns from the opening
+// cross the comet waves at turns 50 and 150, where the cache must start over.
+func TestLandingCacheMatchesFreshPrediction(t *testing.T) {
+	ctx := context.Background()
+	const size, turns = 8, 160
+	const spec = "random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2"
+	opponent, err := agent.ParseFactory(spec)
+	if err != nil {
+		t.Fatalf("ParseFactory(%q) error = %v", spec, err)
+	}
+	batch := newTestBatch(t, benchmarkScenario(4), opponent, size, scenario.SeedRange{Start: 0, End: 1000}, ScheduleTrainV2, 0, 1)
+	state := newBenchmarkState(size)
+	reset := func(ids []int) {
+		t.Helper()
+		result, err := batch.Reset(ctx, ids, nil)
+		if err != nil {
+			t.Fatalf("Reset() error = %v", err)
+		}
+		for _, env := range result.Envs {
+			state.installReset(env.EpisodeInfo, env.Observation)
+		}
+	}
+	ids := benchmarkIDs(size)
+	reset(ids)
+
+	waves := 0
+	for turn := range turns {
+		before := make([]int, size)
+		for _, id := range ids {
+			before[id] = len(batch.envs[id].game.Comets)
+		}
+		results, err := batch.Step(ctx, state.actions(ids))
+		if err != nil {
+			t.Fatalf("turn %d: Step() error = %v", turn, err)
+		}
+		var ended []int
+		for _, result := range results {
+			state.installStep(result)
+			env := batch.envs[result.EnvID]
+			if len(env.game.Comets) > before[result.EnvID] {
+				waves++
+			}
+			want, err := predictFleets(env.game)
+			if err != nil {
+				t.Fatalf("turn %d: env %d predictFleets() error = %v", turn, result.EnvID, err)
+			}
+			if !reflect.DeepEqual(env.prediction.Landings, want) {
+				t.Fatalf("turn %d: env %d cached landings differ from a fresh prediction", turn, result.EnvID)
+			}
+			if result.Terminated || result.Truncated {
+				ended = append(ended, result.EnvID)
+			}
+		}
+		if len(ended) > 0 {
+			reset(ended)
+		}
+	}
+
+	// Both paths must actually run: carrying landings over, and starting over
+	// after a wave.
+	reused := 0
+	for _, id := range ids {
+		reused += batch.envs[id].landings.reused
+	}
+	if reused == 0 {
+		t.Fatal("no landing was carried over between turns")
+	}
+	if waves == 0 {
+		t.Fatal("no comet wave spawned, so the start-over path was not exercised")
+	}
+}
