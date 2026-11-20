@@ -47,7 +47,7 @@ SOURCE_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "rl-v2-2p.toml
     ("name", "device", "gomaxprocs"),
     [
         # The production file trains on CUDA without saying so in its name.
-        ("rl-v2-2p.toml", "cuda", "32"),
+        ("rl-v2-2p.toml", "cuda", "12"),
         # A CPU copy keeps its CPU setting even when its name mentions CUDA.
         ("cuda-cpu-copy.toml", "cpu", None),
     ],
