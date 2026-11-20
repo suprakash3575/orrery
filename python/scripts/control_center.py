@@ -146,7 +146,9 @@ def _run_command(
 ) -> None:
     environment = dict(os.environ)
     if cuda:
-        environment.setdefault("GOMAXPROCS", "32")
+        # Same default as the Makefile's GOMAXPROCS, which records the
+        # measurements behind it. A value already in the environment wins.
+        environment.setdefault("GOMAXPROCS", "12")
     code = launch([sys.executable, "-m", module, *arguments], root / "python", environment)
     show(f"Command finished with exit code {code}.")
 
