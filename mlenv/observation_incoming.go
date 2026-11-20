@@ -22,11 +22,12 @@ import (
 //
 // It returns the landings it predicted, one per fleet in g.Fleets order, so
 // the environment can hand the same prediction to scripted opponents instead
-// of having each one run it again.
-func encodeIncoming(obs *Observation, g *game.Game, frame SeatFrame, slots slotTable) ([]game.Landing, error) {
-	// Stage 1: predict every fleet once. predictFleets fails if any fleet is
+// of having each one run it again. predict supplies them: predictFleets, or
+// an environment's landingCache, which returns the same landings.
+func encodeIncoming(obs *Observation, g *game.Game, frame SeatFrame, slots slotTable, predict fleetPredictor) ([]game.Landing, error) {
+	// Stage 1: predict every fleet once. Both predictors fail if any fleet is
 	// still flying after the longest crossing the board allows.
-	landings, err := predictFleets(g)
+	landings, err := predict(g)
 	if err != nil {
 		return nil, err
 	}

@@ -161,16 +161,21 @@ type Observation struct {
 // alone, and draws no randomness — fleet prediction runs on a copy with no
 // random source.
 func Build(g *game.Game, frame SeatFrame) (Observation, error) {
-	obs, _, err := buildWithLandings(g, frame)
+	obs, _, err := buildWithLandings(g, frame, predictFleets)
 	return obs, err
 }
 
+// fleetPredictor returns one landing per fleet in g.Fleets order, looked
+// ahead maxPredictionSegments(g) turns, or an error if any fleet is still
+// flying after that. predictFleets computes them from scratch; an
+// environment's landingCache returns the same landings, reusing last turn's.
+type fleetPredictor func(g *game.Game) ([]game.Landing, error)
+
 // buildWithLandings is Build that also returns the fleet landings it
-// predicted for the incoming columns: one per fleet in g.Fleets order, looked
-// ahead maxPredictionSegments(g) turns. The environment keeps them so the
-// scripted opponents deciding on this same board can reuse them. On error the
-// landings are nil.
-func buildWithLandings(g *game.Game, frame SeatFrame) (Observation, []game.Landing, error) {
+// predicted for the incoming columns, using predict. The environment keeps
+// them so the scripted opponents deciding on this same board can reuse them.
+// On error the landings are nil.
+func buildWithLandings(g *game.Game, frame SeatFrame, predict fleetPredictor) (Observation, []game.Landing, error) {
 	// Stage 1: inputs. A frame is a promise about one particular board, so
 	// one that was never checked, or that describes another board, would
 	// rotate and label this one wrongly without any sign of it.
@@ -204,7 +209,7 @@ func buildWithLandings(g *game.Game, frame SeatFrame) (Observation, []game.Landi
 	// reads only the game, the frame, and the slot table.
 	var obs Observation
 	encodeBodies(&obs, g, frame, slots)
-	landings, err := encodeIncoming(&obs, g, frame, slots)
+	landings, err := encodeIncoming(&obs, g, frame, slots, predict)
 	if err != nil {
 		// Only an unresolvable fleet or an engine/slot disagreement reaches
 		// here — both mean a broken state, so nothing partial is returned.

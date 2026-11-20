@@ -229,6 +229,10 @@ type environment struct {
 	prediction *agent.FleetPrediction
 	// predictionTurn is the game turn prediction was computed for.
 	predictionTurn int
+	// landings carries fleet landings from one turn to the next, so each
+	// Build predicts only newly launched fleets. It belongs to this slot's
+	// game alone and is used only by the worker advancing that game.
+	landings landingCache
 	// terminated prevents another step after the game has ended.
 	terminated bool
 	// poisoned records a stateful step failure and requires the slot to reset.
@@ -543,7 +547,7 @@ func (b *Batch) Step(ctx context.Context, decisions map[int][BodySlots]SlotActio
 			errs[index] = &EnvError{Kind: ErrorEngine, EnvID: step.id, Err: err}
 			return
 		}
-		obs, landings, err := buildWithLandings(step.env.game, step.env.frame)
+		obs, landings, err := buildWithLandings(step.env.game, step.env.frame, step.env.landings.predict)
 		if err != nil {
 			errs[index] = &EnvError{Kind: ErrorObservation, EnvID: step.id, Err: err}
 			return
@@ -682,7 +686,10 @@ func (b *Batch) newEnvironment(ctx context.Context, plan episodeAssignment) (*en
 			return nil, &EnvError{Kind: ErrorScenario, EnvID: info.EnvID, Err: err}
 		}
 	}
-	obs, landings, err := buildWithLandings(g, frame)
+	// A new episode starts a new cache. This first Build fills it, so the
+	// first step already reuses the opening fleets' landings.
+	var cache landingCache
+	obs, landings, err := buildWithLandings(g, frame, cache.predict)
 	if err != nil {
 		return nil, &EnvError{Kind: ErrorObservation, EnvID: info.EnvID, Err: err}
 	}
@@ -708,7 +715,7 @@ func (b *Batch) newEnvironment(ctx context.Context, plan episodeAssignment) (*en
 	}
 	env := &environment{
 		info: info, matchID: matchID, game: g, frame: frame,
-		opponents: opponents, observation: obs,
+		opponents: opponents, observation: obs, landings: cache,
 	}
 	env.setPrediction(landings)
 	return env, nil
