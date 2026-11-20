@@ -18,7 +18,12 @@ import orrery.checkpoint as checkpoint_module
 import orrery.train as training
 from orrery.archive import freeze_passing_checkpoint
 from orrery.checkpoint import load_checkpoint, sha256_file
-from orrery.config import RunConfig, load_run_config
+from orrery.config import (
+    HEURISTIC_V2_OPPONENT,
+    RANDOM_V1_OPPONENT,
+    RunConfig,
+    load_run_config,
+)
 from orrery.env_client import (
     END_GAME_FINISHED,
     END_LEARNER_ELIMINATED,
@@ -1629,6 +1634,47 @@ def test_release_validation_uses_the_training_player_count() -> None:
     # Validation runs the configured evaluator on the policy's own device.
     assert captured["evaluation_policy"] == "eval-policy-v2"
     assert captured["device"] == torch.device("cpu")
+
+
+def test_release_validation_plays_heuristic_v2_when_training_used_random_v1() -> None:
+    """Training against the easier bot never makes release play it.
+
+    The runner is replaced to observe its inputs. Both the requested opponent
+    and the metadata Go's response is checked against must name heuristic-v2;
+    either one naming random-v1 would let a run qualify against random bots.
+    """
+
+    config = _test_config(
+        training_opponent=RANDOM_V1_OPPONENT,
+        release_validation_seeds=1,
+        release_required_wins=2,
+    )
+    captured: dict[str, object] = {}
+
+    def complete_result(_policy: object, **kwargs: object) -> EvaluationResult:
+        captured.update(kwargs)
+        metadata = dict(kwargs["expected_metadata"])
+        metadata.update(engine="test-engine", dimensions=OBSERVATION_DIMENSIONS, evaluation=_EVALUATION)
+        return EvaluationResult(
+            tuple(
+                EvaluationOutcome(kwargs["seeds"].start, seat, 1.0, 10, END_GAME_FINISHED, 1)
+                for seat in (0, 1)
+            ),
+            metadata,
+            rejected_actions=0,
+            timings=RunnerTimings(3.0, 1.0, 2.0),
+        )
+
+    result = training._run_release_readiness_validation(
+        torch.nn.Linear(1, 1),
+        config,
+        ("unused",),
+        complete_result,
+    )
+
+    assert captured["opponent"] == HEURISTIC_V2_OPPONENT
+    assert captured["expected_metadata"]["opponent"] == HEURISTIC_V2_OPPONENT
+    assert result.metadata["opponent"] == HEURISTIC_V2_OPPONENT
 
 
 def test_pipeline_validation_rechecks_seed_and_seat_completeness() -> None:

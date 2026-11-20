@@ -142,12 +142,16 @@ def validate_checkpoint(
     policy = loaded.policy.to(device=target)
     if checkpoint.parent.name != "checkpoints":
         raise ValueError("checkpoint must be inside a run's checkpoints/ directory")
-    expected = evaluation_metadata(config, seed_range, config.training_opponent)
+    # This report applies the release-readiness thresholds, so its games are
+    # played against the fixed release opponent, never the training opponent:
+    # a run that trained against random-v1 must not appear to meet release
+    # thresholds by beating random-v1.
+    expected = evaluation_metadata(config, seed_range, config.release_opponent)
     raw = runner(
         policy,
         command=command,
         seeds=seed_range,
-        opponent=config.training_opponent,
+        opponent=config.release_opponent,
         batch_size=config.environment_count,
         evaluation_policy=config.evaluation_policy,
         device=target,
@@ -193,7 +197,7 @@ def validate_checkpoint(
         "completed_updates": state.completed_updates,
         "environment_steps": state.environment_steps,
         "seed_range": [seed_range.start, seed_range.end],
-        "opponent": config.training_opponent,
+        "opponent": config.release_opponent,
         "metadata": result.metadata,
         "wins": decision.wins,
         "losses": decision.losses,
@@ -225,7 +229,7 @@ def validate_checkpoint(
         # different devices are separate evidence, not exact replays.
         f"- Evaluator: `{evaluation['policy']}` on {evaluation['device']}"
         + (f" ({evaluation['device_name']})" if "device_name" in evaluation else ""),
-        f"- Opponent: `{config.training_opponent}`", "",
+        f"- Opponent: `{config.release_opponent}`", "",
         f"**Results:** {decision.wins} wins, {decision.losses} losses, {decision.draws} draws in {len(result.outcomes)} games ({report['win_rate']:.1%} win rate).", "",
         "| Seat | Wins | Losses | Draws | Eliminated |", "| ---: | ---: | ---: | ---: | ---: |",
     ]

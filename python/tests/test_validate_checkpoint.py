@@ -98,7 +98,7 @@ def test_validate_checkpoint_writes_rotated_report_without_spending_pool(tmp_pat
     assert calls[0]["evaluation_policy"] == "eval-policy-v2"
     assert calls[0]["device"].type == "cpu"
     assert "Evaluator: `eval-policy-v2` on cpu" in (out / "report.md").read_text()
-    assert calls[0]["opponent"] == state.config.training_opponent
+    assert calls[0]["opponent"] == state.config.release_opponent
     assert calls[0]["players"] == 2
     assert "protocol_version" not in calls[0]
     assert report["wins"] == 500
@@ -110,6 +110,50 @@ def test_validate_checkpoint_writes_rotated_report_without_spending_pool(tmp_pat
     assert saved["confidence_interval"]["nominal"] is True
     assert saved["confidence_interval"]["assumption"] == NOMINAL_INTERVAL_ASSUMPTION
     assert not (tmp_path / "runs" / "evaluation-pools-v1.json").exists()
+
+
+def test_validate_checkpoint_judges_a_random_v1_trained_run_against_heuristic_v2(
+    tmp_path: Path,
+) -> None:
+    """Release thresholds are only ever reported for games against heuristic-v2.
+
+    The run trained against random-v1. The fake runner wins every game it is
+    given, so if validation asked it to play random-v1 the report would claim
+    release thresholds met against random bots.
+    """
+
+    checkpoint, state = _fixture(tmp_path, "exp-b-4p-s1501.toml")
+    assert state.config.training_opponent.startswith("random-v1:")
+    calls = []
+
+    def runner(_policy, **kwargs):
+        calls.append(kwargs)
+        seeds = kwargs["seeds"]
+        outcomes = tuple(
+            EvaluationOutcome(seed, seat, 1.0, 80, END_GAME_FINISHED, 1)
+            for seed in range(seeds.start, seeds.end)
+            for seat in range(4)
+        )
+        return EvaluationResult(
+            outcomes,
+            {
+                **kwargs["expected_metadata"], "engine": "test",
+                "dimensions": OBSERVATION_DIMENSIONS, "evaluation": _EVALUATION,
+            },
+            0,
+        )
+
+    out = tmp_path / "runs" / "validation-random-trained"
+    report = validate_checkpoint(
+        checkpoint, out, runner=runner, loader=lambda *_a, **_k: state,
+        policy_factory=_Policy, device="cpu",
+    )
+
+    release = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+    assert calls[0]["opponent"] == release
+    assert calls[0]["expected_metadata"]["opponent"] == release
+    assert report["opponent"] == release
+    assert f"Opponent: `{release}`" in (out / "report.md").read_text()
 
 
 def test_validate_checkpoint_reports_every_seat_of_a_four_player_run(tmp_path: Path) -> None:

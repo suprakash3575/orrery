@@ -9,6 +9,8 @@ import pytest
 
 from orrery.config import (
     CONTRACT,
+    HEURISTIC_V2_OPPONENT,
+    RANDOM_V1_OPPONENT,
     SeedRange,
     load_run_config,
     run_config_from_mapping,
@@ -162,7 +164,14 @@ def test_run_config_rejects_malformed_contract_identity(
         (
             "training_opponent",
             "heuristic-v1:aggression=1.2,defense=0.1,economy=1,efficiency=1",
-            "must be 'heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1'",
+            "training_opponent must be 'heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1' or",
+        ),
+        # Specs are compared whole: random-v1 with any other parameter is a
+        # different opponent, not the allowed easier one.
+        (
+            "training_opponent",
+            "random-v1:launch_probability=0.5,max_fraction=0.8,min_fraction=0.2",
+            "training_opponent must be",
         ),
     ),
 )
@@ -193,6 +202,18 @@ def test_four_player_required_wins_are_capped_at_seeds_times_players(
     replace(config, **{field: games})
     with pytest.raises(ValueError, match=message):
         replace(config, **{field: games + 1})
+
+
+def test_random_v1_is_an_allowed_training_opponent_but_never_the_release_opponent() -> None:
+    """A run may train against the easier bot; release still plays heuristic-v2."""
+
+    config = replace(load_run_config(FOUR_PLAYER_CONFIG), training_opponent=RANDOM_V1_OPPONENT)
+
+    assert config.training_opponent == RANDOM_V1_OPPONENT
+    assert config.release_opponent == HEURISTIC_V2_OPPONENT
+    # The recorded configuration keeps the opponent, so a resume or a later
+    # reader sees exactly what the run trained against.
+    assert run_config_from_mapping(json_value(config.to_dict())) == config
 
 
 def test_run_config_rejects_overlapping_seed_ranges() -> None:

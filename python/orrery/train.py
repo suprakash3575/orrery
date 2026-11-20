@@ -510,7 +510,9 @@ def _validation_record(
     seed_range = result.metadata["seed_range"]
     common.update(
         evaluation_policy=config.evaluation_policy,
-        opponent=config.training_opponent,
+        # The release record names the opponent these games were played
+        # against, which is the fixed release opponent, not the training one.
+        opponent=config.release_opponent,
         seed_range=list(seed_range),
         requirements={
             "validation_seeds": config.release_validation_seeds,
@@ -2339,6 +2341,8 @@ def _run_release_readiness_validation(
     the first 500 reusable validation boards from every seat (2,000 games on
     four-player maps) and replaces random-v1 with the canonical heuristic
     opponent, in every opponent seat, used by the final learning objective.
+    That opponent is config.release_opponent, not the training opponent: a
+    run that trained against an easier bot is still judged against heuristic-v2.
     """
 
     validation_seeds = type(config.validation_seeds)(
@@ -2348,13 +2352,13 @@ def _run_release_readiness_validation(
     expected_metadata = evaluation_metadata(
         config,
         validation_seeds,
-        config.training_opponent,
+        config.release_opponent,
     )
     result = validation_runner(
         policy,
         command=command,
         seeds=validation_seeds,
-        opponent=config.training_opponent,
+        opponent=config.release_opponent,
         evaluation_policy=config.evaluation_policy,
         device=policy_device(policy),
         batch_size=config.environment_count,
