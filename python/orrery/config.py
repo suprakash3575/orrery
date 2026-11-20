@@ -24,18 +24,30 @@ from .env_client import (
 CONTRACT = "rl-v2"
 CONTRACT_LAYOUT = (512, 64)
 
+# The pinned heuristic-v2 spec (agent.HeuristicV2Default in Go). The opponent
+# check against it gave "keep": no skill-less tester won a game, where diag-lead
+# beat heuristic-v1 59.4% of the time. It is the default training opponent and
+# the only release opponent.
+HEURISTIC_V2_OPPONENT = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+# The pinned random-v1 spec: the pipeline gate's opponent, and the easier
+# training opponent for runs that test whether a learner improves faster when
+# it wins some of its training games.
+RANDOM_V1_OPPONENT = "random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2"
+# The exact specs a run may train against. A spec is compared as a whole
+# string, so a changed parameter is a different opponent and is refused.
+TRAINING_OPPONENTS = (HEURISTIC_V2_OPPONENT, RANDOM_V1_OPPONENT)
+# Release readiness and final evaluation always play this opponent, whatever
+# the run trained against. Without a separate identity, a run that trained
+# against random-v1 would be judged for release against random-v1 too, and
+# could qualify against a far weaker bot than the release requirement means.
+RELEASE_OPPONENT = HEURISTIC_V2_OPPONENT
+
 # These identities are the same in every rl-v2 run. The generator is fixed by
-# the player count instead, through GENERATOR_FOR_PLAYERS.
+# the player count instead, through GENERATOR_FOR_PLAYERS, and the training
+# opponent is chosen from TRAINING_OPPONENTS.
 _FIXED_IDENTITIES = {
     "training_schedule": SCHEDULE_TRAIN_V2,
-    # The pinned heuristic-v2 spec (agent.HeuristicV2Default in Go). The
-    # opponent check against it gave "keep": no skill-less tester won a game,
-    # where diag-lead beat heuristic-v1 59.4% of the time. It is the opponent
-    # in every training seat and in the release gate.
-    "training_opponent": "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1",
-    "pipeline_opponent": (
-        "random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2"
-    ),
+    "pipeline_opponent": RANDOM_V1_OPPONENT,
     "evaluation_policy": "eval-policy-v2",
     "protocol_version": PROTOCOL_VERSION,
     "observation_schema": OBSERVATION_SCHEMA,
@@ -142,7 +154,9 @@ class RunConfig:
     evaluation_pool_names: tuple[str, ...]
     # training_schedule names Go's deterministic cursor-to-seed-and-seat mapping.
     training_schedule: str
-    # training_opponent is the complete versioned opponent specification used to learn.
+    # training_opponent is the complete versioned opponent specification used to
+    # learn: one of TRAINING_OPPONENTS. Release readiness and final evaluation
+    # do not use it; they play release_opponent.
     training_opponent: str
     # pipeline_opponent is the complete opponent specification used by the initial gate.
     pipeline_opponent: str
@@ -174,6 +188,18 @@ class RunConfig:
         """Return games in one release validation: every seed from every seat."""
 
         return self.release_validation_seeds * self.players
+
+    @property
+    def release_opponent(self) -> str:
+        """Return the opponent release readiness and final evaluation play.
+
+        It is fixed rather than configured, and independent of
+        training_opponent, so no configuration can make a run qualify for
+        release against an easier opponent. It is not stored in the run
+        configuration; release records and evaluation reports name it instead.
+        """
+
+        return RELEASE_OPPONENT
 
     @property
     def held_out_games(self) -> int:
@@ -319,6 +345,9 @@ class RunConfig:
                     f"{name} must be {expected!r} for {CONTRACT} "
                     f"with {self.players} players"
                 )
+        if self.training_opponent not in TRAINING_OPPONENTS:
+            allowed = " or ".join(repr(spec) for spec in TRAINING_OPPONENTS)
+            raise ValueError(f"training_opponent must be {allowed} for {CONTRACT}")
 
         if len(self.evaluation_seeds) != len(self.evaluation_pool_names):
             raise ValueError("evaluation pool names and seed ranges must align")
