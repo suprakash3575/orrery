@@ -22,7 +22,7 @@ from orrery.checkpoint import (
     save_checkpoint,
     sha256_file,
 )
-from orrery.config import load_run_config
+from orrery.config import RANDOM_V1_OPPONENT, load_run_config
 from orrery.env_client import OBSERVATION_DIMENSIONS
 
 
@@ -276,6 +276,33 @@ def test_two_player_checkpoint_cannot_resume_as_a_four_player_run(
 
     with pytest.raises(ValueError, match="does not match the requested run"):
         load_checkpoint(path, expected_config=load_run_config(FOUR_PLAYER_CONFIG))
+
+
+def test_checkpoint_cannot_resume_against_a_different_training_opponent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The training opponent is part of the run identity.
+
+    A run that trained against heuristic-v2 must not continue against random-v1
+    (or the reverse): its learning curve would mix two experiments while its
+    records still named one.
+    """
+
+    path = tmp_path / "checkpoint.pt"
+    state = _state()
+    save_checkpoint(path, state)
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("torch.load must not be called"),
+    )
+
+    with pytest.raises(ValueError, match="does not match the requested run"):
+        load_checkpoint(
+            path,
+            expected_config=replace(state.config, training_opponent=RANDOM_V1_OPPONENT),
+        )
 
 
 @pytest.mark.parametrize(
