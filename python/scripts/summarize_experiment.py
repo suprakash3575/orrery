@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +67,34 @@ def reached_two_planets_by(
     return reached, games
 
 
+def sample_key(
+    opponent: str,
+    seeds: Sequence[int],
+    players: int,
+    engine: str,
+    evaluation: Mapping[str, Any],
+) -> str:
+    """Identify the games a report played: who, which maps, and how.
+
+    Two reports of the same model are only interchangeable when all of these
+    match: the opponent, the map seeds, the player count, the engine build, and
+    the evaluator settings (device, precision, determinism). A comparison names
+    the same fields, so it can be joined only to reports on exactly its sample.
+    The key is canonical JSON, so equal samples always produce equal keys.
+    """
+
+    return json.dumps(
+        {
+            "opponent": opponent,
+            "seeds": list(seeds),
+            "players": players,
+            "engine": engine,
+            "evaluation": evaluation,
+        },
+        sort_keys=True,
+    )
+
+
 @dataclass(frozen=True)
 class ModelReport:
     """One ``diagnose.py`` report: one saved model against one opponent."""
@@ -85,6 +114,8 @@ class ModelReport:
     # weights_sha256 identifies the model, so comparisons can be matched to
     # reports even after their folders move between machines.
     weights_sha256: str
+    # sample is sample_key() of the games played; see that function.
+    sample: str
     games: int
     wins: int
     reached_two_by_deadline: int
@@ -110,6 +141,8 @@ class WinRateComparison:
     baseline_sha256: str
     candidate_sha256: str
     opponent: str
+    # sample is sample_key() of the games both models played.
+    sample: str
     difference: float
     low: float
     high: float
@@ -132,6 +165,13 @@ def load_report(folder: Path) -> ModelReport:
         environment_steps=int(games["environment_steps"]),
         opponent=games["opponent"],
         weights_sha256=games["weights_sha256"],
+        sample=sample_key(
+            games["opponent"],
+            games["seeds"],
+            int(identity["players"]),
+            games["engine"],
+            games["evaluation"],
+        ),
         games=count,
         wins=int(games["measurements"]["wins"]),
         reached_two_by_deadline=reached,
@@ -146,11 +186,19 @@ def load_comparison(folder: Path) -> WinRateComparison:
         raise ValueError(f"{folder}: not a {COMPARISON_FORMAT} comparison")
     win_rate = next(m for m in comparison["measures"] if m["measure"] == "win_rate")
     low, high = win_rate["range_95"]
+    shared = comparison["shared"]
     return WinRateComparison(
         path=folder,
         baseline_sha256=comparison["models"]["baseline"]["weights_sha256"],
         candidate_sha256=comparison["models"]["candidate"]["weights_sha256"],
-        opponent=comparison["shared"]["opponent"],
+        opponent=shared["opponent"],
+        sample=sample_key(
+            shared["opponent"],
+            shared["seeds"],
+            int(shared["players"]),
+            shared["engine"],
+            shared["evaluation"],
+        ),
         difference=float(win_rate["mean_difference"]),
         low=float(low),
         high=float(high),
@@ -189,24 +237,100 @@ def _points(value: float) -> str:
     return f"{value * 100:+.1f}"
 
 
-def learning_curve_rows(
+@dataclass(frozen=True)
+class JoinedComparisons:
+    """Every comparison, sorted by what it can be used for."""
+
+    # against_untrained maps a trained model's (weights_sha256, sample) to its
+    # comparison with the same seed's untrained model on that same sample.
+    against_untrained: dict[tuple[str, str], WinRateComparison]
+    # direct holds (baseline, candidate, comparison) for two trained models of
+    # the same learner seed, such as A and B at update 153.
+    direct: list[tuple[ModelReport, ModelReport, WinRateComparison]]
+    # ignored holds each comparison that could not be used, with the reason.
+    ignored: list[tuple[WinRateComparison, str]]
+
+
+def join_comparisons(
     reports: Sequence[ModelReport],
     comparisons: Sequence[WinRateComparison],
+) -> JoinedComparisons:
+    """Match each comparison to the reports of its two models.
+
+    A comparison is used only when all of these hold:
+
+    1. Each model has a report on exactly the comparison's sample (opponent,
+       maps, players, engine, evaluator). A report of the same model on other
+       maps or another engine describes different games.
+    2. Those reports agree on who the model is. Several reports of one model on
+       one sample are repeats, such as the untrained model diagnosed once for
+       the A run and once for the B run of the same seed.
+    3. The candidate is a trained model.
+    4. Both models come from the same learner seed. A gain is measured from
+       that seed's own starting weights, and A and B are compared seed by
+       seed; mixing seeds would credit training with the seeds' difference.
+
+    Anything else is listed with its reason rather than shown as a result.
+    """
+
+    index: dict[tuple[str, str], list[ModelReport]] = {}
+    for report in reports:
+        index.setdefault((report.weights_sha256, report.sample), []).append(report)
+
+    def resolve(weights_sha256: str, sample: str) -> ModelReport | str:
+        """The model's report on this sample, or why there is no single one."""
+
+        matches = index.get((weights_sha256, sample), [])
+        if not matches:
+            return "no report of this model on the comparison's exact sample"
+        if len({(r.learner_seed, r.completed_updates) for r in matches}) > 1:
+            return "reports of this model disagree on its learner seed or updates"
+        return matches[0]
+
+    against_untrained: dict[tuple[str, str], WinRateComparison] = {}
+    direct: list[tuple[ModelReport, ModelReport, WinRateComparison]] = []
+    ignored: list[tuple[WinRateComparison, str]] = []
+    # Folder order makes the choice deterministic when a comparison repeats.
+    for comparison in sorted(comparisons, key=lambda c: c.path.name):
+        baseline = resolve(comparison.baseline_sha256, comparison.sample)
+        candidate = resolve(comparison.candidate_sha256, comparison.sample)
+        if isinstance(baseline, str):
+            ignored.append((comparison, f"baseline: {baseline}"))
+        elif isinstance(candidate, str):
+            ignored.append((comparison, f"candidate: {candidate}"))
+        elif candidate.untrained:
+            ignored.append((comparison, "candidate is an untrained model"))
+        elif baseline.learner_seed != candidate.learner_seed:
+            ignored.append(
+                (
+                    comparison,
+                    f"baseline is learner seed {baseline.learner_seed} but the "
+                    f"candidate is learner seed {candidate.learner_seed}",
+                )
+            )
+        elif baseline.untrained:
+            key = (comparison.candidate_sha256, comparison.sample)
+            if key in against_untrained:
+                ignored.append(
+                    (comparison, f"repeats {against_untrained[key].path.name}, which is used instead")
+                )
+            else:
+                against_untrained[key] = comparison
+        else:
+            direct.append((baseline, candidate, comparison))
+    return JoinedComparisons(against_untrained, direct, ignored)
+
+
+def learning_curve_rows(
+    reports: Sequence[ModelReport],
+    joined: JoinedComparisons,
 ) -> list[dict[str, str]]:
     """One row per report, with its win-rate change against the untrained model.
 
-    The change comes from the comparison whose baseline is the same seed's
-    untrained model and whose candidate is this model, on the same opponent.
-    It is blank when no such comparison was run, and for the untrained model
-    itself.
+    The change comes from the comparison join_comparisons accepted between
+    this model and the same seed's untrained model, on this report's exact
+    sample. It is blank when there is none, and for the untrained model itself.
     """
-
-    by_sha = {(r.weights_sha256, r.opponent): r for r in reports}
-    against_untrained: dict[tuple[str, str], WinRateComparison] = {}
-    for comparison in comparisons:
-        baseline = by_sha.get((comparison.baseline_sha256, comparison.opponent))
-        if baseline is not None and baseline.untrained:
-            against_untrained[(comparison.candidate_sha256, comparison.opponent)] = comparison
 
     rows: list[dict[str, str]] = []
     ordered = sorted(
@@ -214,7 +338,7 @@ def learning_curve_rows(
         key=lambda r: (r.opponent, r.training_opponent, r.learner_seed, r.completed_updates),
     )
     for report in ordered:
-        change = against_untrained.get((report.weights_sha256, report.opponent))
+        change = joined.against_untrained.get((report.weights_sha256, report.sample))
         rows.append(
             {
                 "played_against": _short(report.opponent),
@@ -234,26 +358,17 @@ def learning_curve_rows(
     return rows
 
 
-def direct_comparison_rows(
-    reports: Sequence[ModelReport],
-    comparisons: Sequence[WinRateComparison],
-) -> list[dict[str, str]]:
+def direct_comparison_rows(joined: JoinedComparisons) -> list[dict[str, str]]:
     """Comparisons between two trained models, such as A and B at update 153."""
 
-    by_sha = {(r.weights_sha256, r.opponent): r for r in reports}
+    def label(report: ModelReport) -> str:
+        return (
+            f"trained vs {_short(report.training_opponent)}, "
+            f"seed {report.learner_seed}, update {report.completed_updates}"
+        )
+
     rows: list[dict[str, str]] = []
-    for comparison in comparisons:
-        baseline = by_sha.get((comparison.baseline_sha256, comparison.opponent))
-        candidate = by_sha.get((comparison.candidate_sha256, comparison.opponent))
-        if baseline is None or candidate is None or baseline.untrained:
-            continue
-
-        def label(report: ModelReport) -> str:
-            return (
-                f"trained vs {_short(report.training_opponent)}, "
-                f"seed {report.learner_seed}, update {report.completed_updates}"
-            )
-
+    for baseline, candidate, comparison in joined.direct:
         rows.append(
             {
                 "played_against": _short(comparison.opponent),
@@ -277,10 +392,20 @@ def _markdown_table(rows: Sequence[Mapping[str, str]]) -> list[str]:
     return lines
 
 
+def ignored_rows(joined: JoinedComparisons) -> list[dict[str, str]]:
+    """Comparisons left out of the tables, each with the reason."""
+
+    return [
+        {"comparison": comparison.path.name, "reason": reason}
+        for comparison, reason in joined.ignored
+    ]
+
+
 def write_summary(
     out: Path,
     curve: Sequence[Mapping[str, str]],
     direct: Sequence[Mapping[str, str]],
+    ignored: Sequence[Mapping[str, str]] = (),
 ) -> None:
     """Write ``summary.md`` for reading and ``learning_curve.csv`` for charts."""
 
@@ -300,6 +425,9 @@ def write_summary(
         lines.append("")
     lines += ["## Direct comparisons between trained models", ""]
     lines += _markdown_table(direct)
+    lines.append("")
+    lines += ["## Comparisons not used", ""]
+    lines += _markdown_table(ignored)
     lines.append("")
     (out / "summary.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -322,12 +450,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
 
     reports, comparisons = discover(arguments.results)
-    curve = learning_curve_rows(reports, comparisons)
-    direct = direct_comparison_rows(reports, comparisons)
-    write_summary(arguments.out, curve, direct)
+    joined = join_comparisons(reports, comparisons)
+    curve = learning_curve_rows(reports, joined)
+    direct = direct_comparison_rows(joined)
+    ignored = ignored_rows(joined)
+    write_summary(arguments.out, curve, direct, ignored)
     print(
         f"summarized {len(reports)} reports and {len(comparisons)} comparisons "
-        f"into {arguments.out}"
+        f"into {arguments.out}; {len(ignored)} comparisons not used"
     )
     return 0
 
