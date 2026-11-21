@@ -944,9 +944,10 @@ Rules that `ParseLineup` and `NewBatch` enforce:
 
 - A four-player map takes 1 or 3 entries; a two-player map takes 1.
 - No empty entries (`a||b`, or `|` at either end) and no unknown agents.
-- Two entries may be the same agent type with different settings, but a
-  lineup of identical entries is refused: write the single specification
-  instead, so each setup has exactly one recorded identity.
+- Two entries may be the same agent type with different settings. A lineup
+  whose entries are all identical is accepted and normalized to that single
+  specification, so both spellings record one identity and give the same
+  games.
 
 Each entry is canonicalized like a single specification (parameters sorted by
 name), and the canonical lineup is the `opponent` value the `create` response

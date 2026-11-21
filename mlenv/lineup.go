@@ -45,19 +45,18 @@ func SingleOpponent(factory agent.Factory) Lineup {
 
 // NewLineup builds a lineup from factories in seat order counted from the
 // learner. It refuses an empty list, a nil factory (including a typed nil),
-// an agent without an ID, and a list of two or more identical
-// specifications: the single specification already means "this agent in
-// every seat", and allowing both forms would record one setup under two
-// different identities.
+// and an agent without an ID.
+//
+// Two or more entries with the same specification are accepted and
+// normalized to that single specification, which already means "this agent
+// in every seat". Both forms then record the same identity and derive the
+// same seeds, so writing a setup either way gives the same games.
 func NewLineup(factories ...agent.Factory) (Lineup, error) {
 	if err := checkFactories(factories); err != nil {
 		return Lineup{}, err
 	}
 	if len(factories) > 1 && allSameSpec(factories) {
-		return Lineup{}, fmt.Errorf(
-			"opponent lineup names %s in every seat; write that specification once instead",
-			factories[0].Spec(),
-		)
+		return Lineup{factories: []agent.Factory{factories[0]}}, nil
 	}
 	return Lineup{factories: append([]agent.Factory(nil), factories...)}, nil
 }

@@ -43,7 +43,13 @@ func TestParseLineup(t *testing.T) {
 		{name: "doubled separator", text: lineupIdle + "||" + lineupRandom, wantErr: "entry 2 is empty"},
 		{name: "trailing separator", text: lineupIdle + "|", wantErr: "entry 2 is empty"},
 		{name: "unknown agent", text: lineupIdle + "|nobody-v1", wantErr: "entry 2"},
-		{name: "same agent in every seat", text: lineupIdle + "|" + lineupIdle + "|" + lineupIdle, wantErr: "write that specification once"},
+		{
+			// The same agent in every seat is the single specification, so
+			// both spellings record one identity.
+			name: "same agent in every seat",
+			text: lineupRandom + "|" + lineupRandom + "|" + lineupRandom,
+			want: lineupRandom,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			lineup, err := ParseLineup(test.text, agent.ParseFactory)
