@@ -593,6 +593,7 @@ def run_training(
     max_updates: int | None = None,
     review_reason: str | None = None,
     resume_checkpoint: str | Path | None = None,
+    init_checkpoint: str | Path | None = None,
     archive_root: str | Path | None = None,
     validation_runner: ValidationRunner = run_rotated_matches,
     clock: Callable[[], float] = monotonic,
@@ -609,6 +610,8 @@ def run_training(
        written or Go is started.
     2. Build the untrained policy, its optimizer, and two random-number
        generators: one picks moves while playing, one shuffles minibatches.
+       A new run started with ``init_checkpoint`` then replaces the untrained
+       weights with that checkpoint's weights; nothing else is carried over.
     3. Create a new run directory, or check an existing one and restore the
        policy, optimizer, generators, counters, and validation history from the
        resume checkpoint. Open the metrics and timing logs.
@@ -636,7 +639,10 @@ def run_training(
     normal runs use the repository's Git-ignored ``runs/archive`` directory.
     ``clock`` lets deterministic tests remove wall-clock throughput differences
     from otherwise identical metric rows. This function starts a new run unless
-    ``resume_checkpoint`` names a completed update from that same run. Resume
+    ``resume_checkpoint`` names a completed update from that same run.
+    ``init_checkpoint`` starts a new run from another run's trained weights,
+    which may have trained against a different opponent; it cannot be combined
+    with a resume. Resume
     deliberately abandons the checkpoint's live games and asks Go for new
     assignments beginning at its saved schedule cursor. ``profile`` adds CUDA
     synchronization around detailed phases and therefore must be disabled when
@@ -656,6 +662,10 @@ def run_training(
     # to stop after a known number of complete updates.
     if max_updates is not None and max_updates < 1:
         raise ValueError("max_updates must be positive when supplied")
+    # A resume restores a run's own weights and counters; a starting checkpoint
+    # begins a new run. Doing both would leave it unclear whose weights train.
+    if init_checkpoint is not None and resume_checkpoint is not None:
+        raise ValueError("init_checkpoint starts a new run and cannot be combined with a resume")
     device = _training_device(config.device)
     profiler = PhaseProfiler(device) if profile else None
     frozen_archive_root = (
@@ -694,6 +704,14 @@ def run_training(
     # Both generators are saved in every checkpoint, so resuming a run
     # continues their random sequences exactly where they stopped.
     shuffle_generator = torch.Generator().manual_seed(config.learner_seed + 2)
+    # A starting checkpoint swaps in another run's trained weights now, before
+    # the run directory exists, so an incompatible or corrupt checkpoint
+    # leaves no half-created run behind.
+    parent = (
+        _load_starting_weights(config, init_checkpoint, policy)
+        if init_checkpoint is not None
+        else None
+    )
 
     # Step 3: create the run directory, or check it and restore the learner
     # from the resume checkpoint; then restore the counters and open the logs.
@@ -705,6 +723,7 @@ def run_training(
         optimizer,
         action_generator,
         shuffle_generator,
+        parent=parent,
     )
     checkpoint = resume.checkpoint if resume is not None else None
 
@@ -718,6 +737,14 @@ def run_training(
         f"artifacts={destination}",
         flush=True,
     )
+    if parent is not None:
+        print(
+            f"starting weights: {parent['checkpoint']} "
+            f"sha256={parent['checkpoint_sha256']} "
+            f"update={parent['completed_updates']} "
+            f"trained_against={parent['training_opponent']}",
+            flush=True,
+        )
 
     # Both CSV logs must end at the checkpoint's update.
     environment_steps = checkpoint.environment_steps if checkpoint is not None else 0
@@ -1381,17 +1408,20 @@ def _open_run_directory(
     optimizer: torch.optim.Optimizer,
     action_generator: torch.Generator,
     shuffle_generator: torch.Generator,
+    *,
+    parent: Mapping[str, Any] | None = None,
 ) -> tuple[Path, _ResumePoint | None]:
     """Create a new run directory, or verify an existing one and restore its checkpoint.
 
     A resume restores the policy, optimizer, and both random streams in place.
-    Nothing here starts Go.
+    ``parent`` describes the starting checkpoint of a new run, if it has one,
+    and is written into the new manifest. Nothing here starts Go.
     """
 
     if resume_checkpoint is None:
         # A new run directory is created once and never reused. Its configuration
         # is written before training so even an early failure retains its identity.
-        return _prepare_run_directory(run_directory, config), None
+        return _prepare_run_directory(run_directory, config, parent=parent), None
 
     # Directory and readable metadata checks happen before deserialization.
     # The model signature passed here lets load_checkpoint reject weights for
@@ -2638,28 +2668,98 @@ def _training_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def _prepare_run_directory(path: str | Path, config: RunConfig) -> Path:
+def _prepare_run_directory(
+    path: str | Path,
+    config: RunConfig,
+    *,
+    parent: Mapping[str, Any] | None = None,
+) -> Path:
     """Create a new artifact directory and write its immutable identity files.
 
     ``exist_ok=False`` protects earlier experiments from accidental reuse. The
     JSON configuration records every setting that produced the run, and the
     initially empty manifest becomes the readable index of checkpoints written
-    after completed updates.
+    after completed updates. A run started from another run's weights also
+    records that ``parent`` checkpoint in the manifest. It stays out of
+    run-config.json, which describes how the run trains, not where its first
+    weights came from, so a resume's configuration check is unchanged.
     """
 
     destination = Path(path)
     destination.mkdir(parents=True, exist_ok=False)
     write_json_exclusive(destination / "run-config.json", config.to_dict())
-    write_json_atomic(
-        destination / "manifest.json",
-        {
-            "format": "run-manifest-v1",
-            "configuration": "run-config.json",
-            "checkpoints": [],
-            "resumes": [],
-        },
-    )
+    manifest: dict[str, Any] = {
+        "format": "run-manifest-v1",
+        "configuration": "run-config.json",
+        "checkpoints": [],
+        "resumes": [],
+    }
+    if parent is not None:
+        manifest["parent"] = dict(parent)
+    write_json_atomic(destination / "manifest.json", manifest)
     return destination
+
+
+# Settings a starting checkpoint must share with the run it starts. They fix
+# what the model reads and writes: the contract, the player count (which also
+# chooses the map generator), the observation layout, the Go protocol, and the
+# checkpoint format. Everything else, such as the training opponent or the
+# learner seed, may differ, because only the weights are carried over.
+_STARTING_CHECKPOINT_FIELDS = (
+    "contract",
+    "players",
+    "generator_version",
+    "observation_schema",
+    "protocol_version",
+    "checkpoint_format",
+)
+
+
+def _load_starting_weights(
+    config: RunConfig,
+    checkpoint_path: str | Path,
+    policy: nn.Module,
+) -> dict[str, Any]:
+    """Load another run's trained weights into a new run's untrained policy.
+
+    Only the model weights carry over. The optimizer, both random generators,
+    the step counter, and the learning-rate and entropy schedules start fresh,
+    exactly as in a run built from the learner seed: the new run is a separate
+    experiment whose first update is update 1. The schedules decay over
+    hundreds of millions of turns, so restarting them after a parent of a few
+    million turns changes their values by about 1-2%.
+
+    The returned record names the parent by path and SHA-256 for the manifest.
+    The path is where the file was on this machine; the SHA-256 identifies it
+    anywhere.
+    """
+
+    source = Path(checkpoint_path)
+    # load_checkpoint checks the SHA-256 sidecar, file size, and tensor shapes
+    # against this model before unpickling, so a corrupt file or another
+    # architecture is refused before any run directory exists.
+    parent = load_checkpoint(source, expected_model_state=policy.state_dict())
+    mismatched = [
+        name
+        for name in _STARTING_CHECKPOINT_FIELDS
+        if getattr(parent.config, name) != getattr(config, name)
+    ]
+    if mismatched:
+        raise ValueError(
+            "starting checkpoint does not match this run: "
+            f"{', '.join(mismatched)} differ"
+        )
+    # The saved tensors are on the CPU; load_state_dict copies them onto the
+    # policy's device.
+    policy.load_state_dict(parent.model_state)
+    return {
+        "checkpoint": str(source.resolve()),
+        "checkpoint_sha256": recorded_checkpoint_fingerprint(source),
+        "completed_updates": parent.completed_updates,
+        "environment_steps": parent.environment_steps,
+        "learner_seed": parent.config.learner_seed,
+        "training_opponent": parent.config.training_opponent,
+    }
 
 
 def _prepare_resume_directory(
@@ -2720,6 +2820,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ``--config`` identifies the versioned TOML contract. ``--run-dir`` can fix
     an artifact location; otherwise a timestamped local directory is selected.
     ``--resume`` continues the run that owns a completed checkpoint;
+    ``--init-from`` starts a new run from another run's checkpoint weights;
     ``--max-updates`` provides a bounded cumulative update count, and
     ``--review-reason`` records why training may continue after the 25M review.
     ``--profile`` adds synchronized phase timings for performance diagnosis.
@@ -2738,6 +2839,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--resume",
         type=Path,
         help="continue the run containing this completed-update checkpoint",
+    )
+    parser.add_argument(
+        "--init-from",
+        type=Path,
+        help=(
+            "start a new run from this checkpoint's weights; the checkpoint may "
+            "come from a run with another training opponent"
+        ),
     )
     parser.add_argument("--max-updates", type=int)
     parser.add_argument(
@@ -2760,6 +2869,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.allow_development and arguments.resume is None:
         parser.error("--allow-development only applies together with --resume")
+    if arguments.init_from is not None and arguments.resume is not None:
+        parser.error("--init-from starts a new run and cannot be combined with --resume")
 
     # The versioned TOML fields are the complete compatibility identity. This
     # deliberately requires neither Git nor a .git directory, so a copied cloud
@@ -2778,6 +2889,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_updates=arguments.max_updates,
         review_reason=arguments.review_reason,
         resume_checkpoint=arguments.resume,
+        init_checkpoint=arguments.init_from,
         profile=arguments.profile,
         allow_development_engine=arguments.allow_development,
     )
