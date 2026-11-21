@@ -1866,6 +1866,126 @@ def test_command_refuses_allow_development_without_resume(
         training.main(["--config", str(CONFIG), "--allow-development"])
 
 
+# The smallest layout that still runs a real PPO update and saves a checkpoint
+# after it, shared by the --init-from tests below.
+_INIT_FROM_LAYOUT = {
+    "environment_count": 2,
+    "rollout_steps": 2,
+    "minibatch_size": 4,
+    "ppo_epochs": 1,
+    "checkpoint_every_updates": 1,
+}
+
+
+def test_init_from_starts_a_new_run_from_another_runs_weights(
+    env_command: tuple[str, ...],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Start a heuristic-v2 run from a random-v1 run's trained weights.
+
+    A one-update parent trains against random-v1, so its weights differ from
+    any untrained model. A child with another opponent and learner seed then
+    starts from that checkpoint. The rollout wrapper copies the weights the
+    child plays its first rollout with, before PPO changes them: they must be
+    the parent's exactly. The child counts its own updates from zero, and its
+    manifest names the parent by SHA-256 and training opponent.
+    """
+
+    parent_config = _test_config(
+        **_INIT_FROM_LAYOUT, training_opponent=RANDOM_V1_OPPONENT, learner_seed=11
+    )
+    parent_run = tmp_path / "parent"
+    run_training(parent_config, parent_run, command=env_command, max_updates=1)
+    parent_checkpoint = parent_run / "checkpoints" / "update-000001.pt"
+    parent_weights = load_checkpoint(parent_checkpoint).model_state
+
+    first_rollout_weights: list[dict[str, torch.Tensor]] = []
+    original_collect = training.collect_rollout
+
+    def recording_collect(environment, policy, *args, **kwargs):
+        if not first_rollout_weights:
+            first_rollout_weights.append(
+                {name: value.detach().clone() for name, value in policy.state_dict().items()}
+            )
+        return original_collect(environment, policy, *args, **kwargs)
+
+    monkeypatch.setattr(training, "collect_rollout", recording_collect)
+
+    child_config = _test_config(
+        **_INIT_FROM_LAYOUT, training_opponent=HEURISTIC_V2_OPPONENT, learner_seed=12
+    )
+    child_run = tmp_path / "child"
+    result = run_training(
+        child_config,
+        child_run,
+        command=env_command,
+        max_updates=1,
+        init_checkpoint=parent_checkpoint,
+    )
+
+    assert first_rollout_weights[0].keys() == parent_weights.keys()
+    for name, value in parent_weights.items():
+        assert torch.equal(first_rollout_weights[0][name].cpu(), value), name
+    assert result.completed_updates == 1
+    manifest = json.loads((child_run / "manifest.json").read_text())
+    assert manifest["parent"] == {
+        "checkpoint": str(parent_checkpoint.resolve()),
+        "checkpoint_sha256": sha256_file(parent_checkpoint),
+        "completed_updates": 1,
+        "environment_steps": parent_config.batch_size,
+        "learner_seed": 11,
+        "training_opponent": RANDOM_V1_OPPONENT,
+    }
+    child_recorded = json.loads((child_run / "run-config.json").read_text())
+    assert child_recorded["training_opponent"] == HEURISTIC_V2_OPPONENT
+
+
+def test_init_from_refuses_a_resume_and_a_checkpoint_that_fails_its_hash(
+    env_command: tuple[str, ...],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refuse the two unsafe starts before any run directory is created.
+
+    --init-from together with --resume would leave it unclear whose weights
+    train, so the command refuses it before training starts. A starting
+    checkpoint whose bytes no longer match its SHA-256 sidecar is refused
+    before the new run's directory exists, so no half-created run is left.
+    """
+
+    checkpoint = tmp_path / "parent" / "checkpoints" / "update-000001.pt"
+    monkeypatch.setattr(
+        training, "run_training", lambda *_args, **_kwargs: pytest.fail("training started")
+    )
+    with pytest.raises(SystemExit):
+        training.main(
+            [
+                "--config", str(CONFIG),
+                "--init-from", str(checkpoint),
+                "--resume", str(checkpoint),
+            ]
+        )
+
+    # run_training here is the module-level import, not the patched attribute.
+    config = _test_config(**_INIT_FROM_LAYOUT)
+    run_training(config, tmp_path / "parent", command=env_command, max_updates=1)
+    corrupted = bytearray(checkpoint.read_bytes())
+    corrupted[-1] ^= 0xFF
+    checkpoint.write_bytes(bytes(corrupted))
+
+    child_run = tmp_path / "child"
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        run_training(
+            config,
+            child_run,
+            command=env_command,
+            max_updates=1,
+            init_checkpoint=checkpoint,
+        )
+    assert not child_run.exists()
+
+
 _REAL_ENGINE = "v0.1.0+0123456789abcdef0123456789abcdef01234567"
 
 
