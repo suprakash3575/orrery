@@ -36,27 +36,22 @@ type Lineup struct {
 }
 
 // SingleOpponent returns the lineup that plays one agent in every opponent
-// seat, as every batch did before lineups existed.
+// seat, as every batch did before lineups existed. It doesn't check the
+// factory, so callers keep the one-value form they had; NewBatch checks every
+// lineup's factories, however it was built, before any episode starts.
 func SingleOpponent(factory agent.Factory) Lineup {
 	return Lineup{factories: []agent.Factory{factory}}
 }
 
 // NewLineup builds a lineup from factories in seat order counted from the
-// learner. It refuses an empty list, a nil factory, an agent without an ID,
-// and a list of two or more identical specifications: the single
-// specification already means "this agent in every seat", and allowing both
-// forms would record one setup under two different identities.
+// learner. It refuses an empty list, a nil factory (including a typed nil),
+// an agent without an ID, and a list of two or more identical
+// specifications: the single specification already means "this agent in
+// every seat", and allowing both forms would record one setup under two
+// different identities.
 func NewLineup(factories ...agent.Factory) (Lineup, error) {
-	if len(factories) == 0 {
-		return Lineup{}, fmt.Errorf("opponent lineup must name at least one agent")
-	}
-	for i, factory := range factories {
-		if nilInterface(factory) {
-			return Lineup{}, fmt.Errorf("opponent lineup entry %d: factory must not be nil", i+1)
-		}
-		if factory.Spec().ID() == "" {
-			return Lineup{}, fmt.Errorf("opponent lineup entry %d: agent ID must not be empty", i+1)
-		}
+	if err := checkFactories(factories); err != nil {
+		return Lineup{}, err
 	}
 	if len(factories) > 1 && allSameSpec(factories) {
 		return Lineup{}, fmt.Errorf(
@@ -65,6 +60,26 @@ func NewLineup(factories ...agent.Factory) (Lineup, error) {
 		)
 	}
 	return Lineup{factories: append([]agent.Factory(nil), factories...)}, nil
+}
+
+// checkFactories refuses an empty lineup, a nil factory, and an agent without
+// an ID. NewLineup and NewBatch both call it, so a lineup built by
+// SingleOpponent or as a zero value is checked before it is used.
+func checkFactories(factories []agent.Factory) error {
+	if len(factories) == 0 {
+		return fmt.Errorf("opponent lineup must name at least one agent")
+	}
+	for i, factory := range factories {
+		// nilInterface also catches an interface holding a typed nil
+		// pointer, which a plain == nil comparison would miss.
+		if nilInterface(factory) {
+			return fmt.Errorf("opponent lineup entry %d: factory must not be nil", i+1)
+		}
+		if factory.Spec().ID() == "" {
+			return fmt.Errorf("opponent lineup entry %d: agent ID must not be empty", i+1)
+		}
+	}
+	return nil
 }
 
 // ParseLineup reads a lineup's text form: one agent specification, or several
@@ -108,12 +123,14 @@ func (l Lineup) String() string {
 	return strings.Join(specs, LineupSeparator)
 }
 
-// validateFor checks that the lineup fits a map with this many players: one
-// entry for every seat, or exactly one entry per opponent seat.
+// validateFor checks that every factory is usable and that the lineup fits a
+// map with this many players: one entry for every seat, or exactly one entry
+// per opponent seat.
 func (l Lineup) validateFor(players int) error {
+	if err := checkFactories(l.factories); err != nil {
+		return err
+	}
 	switch count := len(l.factories); {
-	case count == 0:
-		return fmt.Errorf("opponent lineup must name at least one agent")
 	case count == 1 || count == players-1:
 		return nil
 	default:

@@ -92,6 +92,46 @@ func TestLineupCountMustMatchPlayers(t *testing.T) {
 	}
 }
 
+// emptyIDFactory is an agent factory without an ID. Its pointer form also
+// gives the typed nil that a plain == nil check would let through.
+type emptyIDFactory struct{}
+
+func (emptyIDFactory) Spec() agent.Spec { return agent.NewSpec("", nil) }
+
+func (emptyIDFactory) New(context.Context, agent.AgentInit) (agent.Agent, error) {
+	return agent.IdleAgent{}, nil
+}
+
+// TestNewBatchChecksEveryLineupFactory checks that NewBatch refuses an
+// unusable factory however the lineup was built. SingleOpponent and the zero
+// Lineup skip NewLineup's checks, so without this a nil factory would pass
+// NewBatch and panic during the first reset.
+func TestNewBatchChecksEveryLineupFactory(t *testing.T) {
+	var typedNil *emptyIDFactory
+	for _, test := range []struct {
+		name       string
+		lineup     Lineup
+		wantInText string
+	}{
+		{name: "zero lineup", lineup: Lineup{}, wantInText: "at least one agent"},
+		{name: "nil factory", lineup: SingleOpponent(nil), wantInText: "must not be nil"},
+		{name: "typed nil factory", lineup: SingleOpponent(typedNil), wantInText: "must not be nil"},
+		{name: "empty agent ID", lineup: SingleOpponent(emptyIDFactory{}), wantInText: "ID must not be empty"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := NewBatch(context.Background(), BatchConfig{
+				Size: 1, Seeds: scenario.SeedRange{Start: 0, End: 10}, Schedule: ScheduleRotate,
+				Scenario:  testScenario{id: "lineup-factories-v1", maxTurns: 2, players: 4},
+				Opponents: test.lineup,
+			})
+			assertEnvErrorKind(t, err, ErrorValidation)
+			if !strings.Contains(err.Error(), test.wantInText) {
+				t.Fatalf("NewBatch() error = %q, want it to contain %q", err, test.wantInText)
+			}
+		})
+	}
+}
+
 // TestLineupSeatsCountedFromLearner places the learner in each seat of a
 // four-player map and checks that the seats one, two, and three places after
 // it hold the agents named by lineup entries 0, 1, and 2, wrapping past seat 3.
