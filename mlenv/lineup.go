@@ -48,19 +48,16 @@ func SingleOpponent(factory agent.Factory) Lineup {
 }
 
 // NewLineup builds a lineup from factories in role order: clockwise,
-// opposite, then counter-clockwise of the learner. It refuses an empty list, a nil factory (including a typed nil),
-// and an agent without an ID.
+// opposite, then counter-clockwise of the learner. It refuses an empty list,
+// a nil factory (including a typed nil), and an agent without an ID.
 //
-// Two or more entries with the same specification are accepted and
-// normalized to that single specification, which already means "this agent
-// in every seat". Both forms then record the same identity and derive the
-// same seeds, so writing a setup either way gives the same games.
+// Every supplied entry is kept, even when all of them are the same, so that
+// NewBatch checks the count that was actually written against the map: two
+// identical entries on a four-player map are as wrong as two different ones.
+// Only the recorded identity is normalized, in String.
 func NewLineup(factories ...agent.Factory) (Lineup, error) {
 	if err := checkFactories(factories); err != nil {
 		return Lineup{}, err
-	}
-	if len(factories) > 1 && allSameSpec(factories) {
-		return Lineup{factories: []agent.Factory{factories[0]}}, nil
 	}
 	return Lineup{factories: append([]agent.Factory(nil), factories...)}, nil
 }
@@ -118,7 +115,17 @@ func parseLineupText(text string) (Lineup, error) {
 // String returns the canonical text form recorded as a run's opponent: each
 // entry's canonical specification, joined by LineupSeparator. A one-entry
 // lineup is that specification alone, as before lineups existed.
+//
+// A lineup whose entries all have the same specification is recorded as
+// that specification once, which already means "this agent in every seat".
+// Both spellings then share one identity, and since every seat derives its
+// seed from the same specification either way, they also give the same
+// games. NewBatch has checked the supplied count before the batch reports
+// this identity.
 func (l Lineup) String() string {
+	if len(l.factories) > 1 && allSameSpec(l.factories) {
+		return l.factories[0].Spec().String()
+	}
 	specs := make([]string, len(l.factories))
 	for i, factory := range l.factories {
 		specs[i] = factory.Spec().String()

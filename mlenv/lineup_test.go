@@ -73,8 +73,12 @@ func TestParseLineup(t *testing.T) {
 }
 
 // TestLineupCountMustMatchPlayers checks that NewBatch refuses a lineup that
-// names neither one agent nor one per opponent seat.
+// names neither one agent nor one per opponent seat. The repeated-entry cases
+// guard the identity normalization: identical entries count as written.
 func TestLineupCountMustMatchPlayers(t *testing.T) {
+	repeat := func(spec string, count int) string {
+		return strings.Repeat(spec+LineupSeparator, count-1) + spec
+	}
 	for _, test := range []struct {
 		name    string
 		players int
@@ -82,6 +86,9 @@ func TestLineupCountMustMatchPlayers(t *testing.T) {
 	}{
 		{name: "two agents on a 4-player map", players: 4, text: lineupIdle + "|" + lineupRandom},
 		{name: "three agents on a 2-player map", players: 2, text: lineupIdle + "|" + lineupRandom + "|" + lineupHeuristic},
+		{name: "two identical agents on a 4-player map", players: 4, text: repeat(lineupRandom, 2)},
+		{name: "four identical agents on a 4-player map", players: 4, text: repeat(lineupRandom, 4)},
+		{name: "three identical agents on a 2-player map", players: 2, text: repeat(lineupRandom, 3)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			lineup, err := ParseLineup(test.text, agent.ParseFactory)
