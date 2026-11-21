@@ -128,8 +128,9 @@ flowchart TD
 1. **Start the environment process.** The client starts `cmd/env`, which stays
    alive while the client runs multiple games.
 2. **Create the batch.** The client sends `create` with the batch size, seed
-   range, schedule, starting cursor, and scripted opponent. A direct Go caller
-   performs the equivalent setup by constructing a `Batch`.
+   range, schedule, starting cursor, and scripted opponents (see
+   [Opponent lineups](#opponent-lineups)). A direct Go caller performs the
+   equivalent setup by constructing a `Batch`.
 3. **Reset an environment.** `Batch.Reset` chooses the scenario seed and which
    seat the learner controls, then starts an episode in that
    batch slot.
@@ -803,11 +804,13 @@ changing their request order cannot change which seed an environment receives.
 The map decides how many players there are. `Reset` generates the board, reads
 its starting roster — two or four players — and only then settles the
 learner's seat, builds the learner's seat frame and first obs-v2 observation,
-and creates one opponent for every other seat, in ascending seat order. Each
+and creates one opponent for every other seat, in ascending seat order, each
+from that seat's entry in the [opponent lineup](#opponent-lineups). Each
 opponent gets its own contestant ID, `opponent-seat-<p>`, and so its own agent
-seed: `arena.DeriveAgentSeed` leaves the seat out of its hash, so opponents
-sharing one ID would also share one random stream. (`heuristic-v1` ignores its
-seed today; distinct seeds matter for seeded opponents.) If anything fails, the
+seed, derived from that ID and its seat's specification:
+`arena.DeriveAgentSeed` leaves the seat out of its hash, so opponents sharing
+one ID would also share one random stream. (`heuristic-v1` ignores its seed
+today; distinct seeds matter for seeded opponents.) If anything fails, the
 reset closes every opponent it created — including a partly built one the
 factory returned with its error — and leaves the installed episodes and the
 cursor unchanged.
@@ -918,6 +921,37 @@ amounts before a later failure is known. Such a failure returns no partial
 results, marks every episode in that step request as `poisoned`, and requires
 those episodes to be reset. This makes the failed turn impossible to retry as
 though nothing happened, which would otherwise create a different replay.
+
+### Opponent lineups
+
+The `create` request's opponent text, and `BatchConfig.Opponents` in Go, is a
+**lineup**: which scripted agent plays each seat the learner doesn't hold. It
+takes one of two forms.
+
+| Form | Example | Meaning |
+|---|---|---|
+| One specification | `heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1` | That agent in every opponent seat. This was the only form before lineups, and it is recorded and seeded exactly as before. |
+| One per opponent seat, joined by `\|` | `heuristic-v2:…\|random-v1:…\|random-v1:…` | Entry 1 plays the first seat after the learner, entry 2 the second, entry 3 the third. |
+
+Seats are **counted from the learner**, wrapping from the last seat back to
+seat 0, because the learner's seat changes from game to game. With the learner
+in seat 2 of a four-player map, the lineup `a|b|c` puts `a` in seat 3, `b` in
+seat 0 and `c` in seat 1. Every game then has the same mix of opponents.
+Fixed seat numbers wouldn't give that: whichever fixed seat the learner took
+would lose its agent.
+
+Rules that `ParseLineup` and `NewBatch` enforce:
+
+- A four-player map takes 1 or 3 entries; a two-player map takes 1.
+- No empty entries (`a||b`, or `|` at either end) and no unknown agents.
+- Two entries may be the same agent type with different settings, but a
+  lineup of identical entries is refused: write the single specification
+  instead, so each setup has exactly one recorded identity.
+
+Each entry is canonicalized like a single specification (parameters sorted by
+name), and the canonical lineup is the `opponent` value the `create` response
+returns and runs record. `|` can't appear inside a specification, which uses
+only `:`, `,` and `=`, so the split is unambiguous.
 
 ## How the environment process communicates
 
