@@ -2,6 +2,9 @@ package mlenv
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -190,5 +193,92 @@ func TestLineupSeatsFollowBoardRoles(t *testing.T) {
 				t.Errorf("learner seat %d: %s seat %d = %q, want %q", learner, roleNames[entry], seat, got, wantIDs[entry])
 			}
 		}
+	}
+}
+
+// legacySingleRandomFingerprint is the SHA-256 of fmt's %v text of every step
+// result in one game: four players, 30 turns, seed 7, learner in seat 1, the
+// learner never launching, and a single random-v1 specification (lineupRandom)
+// in every opponent seat. It was recorded with the code from before lineups
+// existed (origin/main at 9037531, BatchConfig.Opponent), where the random
+// bots had 18 fleets in flight at the end. The observations include every
+// opponent fleet and garrison, so any change to which agent plays a seat, its
+// seed, or its moves changes this value.
+const legacySingleRandomFingerprint = "d9ace97f4b49f06c03fdb806e921ae8214cb12815babeeb53559384d43f273f2"
+
+// playLineupGame plays the fingerprinted game above against lineup and
+// returns every step result.
+func playLineupGame(t *testing.T, lineup Lineup) []StepResult {
+	t.Helper()
+	batch, err := NewBatch(context.Background(), BatchConfig{
+		Size: 1, Seeds: scenario.SeedRange{Start: 0, End: 10}, Schedule: ScheduleRotate,
+		Scenario:  testScenario{id: "legacy-fingerprint-v1", maxTurns: 30, players: 4},
+		Opponents: lineup,
+	})
+	if err != nil {
+		t.Fatalf("NewBatch() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := batch.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	override := []EpisodeOverride{{EnvID: 0, Seed: 7, Seat: 1}}
+	if _, err := batch.Reset(context.Background(), []int{0}, override); err != nil {
+		t.Fatalf("Reset() error = %v", err)
+	}
+	_, results := playToCompletion(t, batch)
+	return results
+}
+
+func stepFingerprint(results []StepResult) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%v", results))))
+}
+
+func mustParseLineup(t *testing.T, text string) Lineup {
+	t.Helper()
+	lineup, err := ParseLineup(text, agent.ParseFactory)
+	if err != nil {
+		t.Fatalf("ParseLineup(%q) error = %v", text, err)
+	}
+	return lineup
+}
+
+// TestSingleSpecGameplayUnchangedByLineups replays the recorded legacy game
+// through both spellings of "random-v1 in every seat" and requires the exact
+// results the pre-lineup code produced.
+func TestSingleSpecGameplayUnchangedByLineups(t *testing.T) {
+	random, err := agent.ParseFactory(lineupRandom)
+	if err != nil {
+		t.Fatalf("ParseFactory() error = %v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		lineup Lineup
+	}{
+		{name: "single specification", lineup: SingleOpponent(random)},
+		{name: "same specification in every seat", lineup: mustParseLineup(t, lineupRandom+"|"+lineupRandom+"|"+lineupRandom)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := stepFingerprint(playLineupGame(t, test.lineup)); got != legacySingleRandomFingerprint {
+				t.Fatalf("step results fingerprint = %s, want the pre-lineup %s", got, legacySingleRandomFingerprint)
+			}
+		})
+	}
+}
+
+// TestMixedLineupReplaysIdentically plays the same game twice in fresh
+// batches against a mixed lineup with seeded random-v1 bots and requires
+// identical results. It also requires them to differ from the all-random
+// game, which shows the heuristic-v2 entry really took its seat.
+func TestMixedLineupReplaysIdentically(t *testing.T) {
+	text := lineupHeuristic + "|" + lineupRandom + "|" + lineupRandom
+	first := playLineupGame(t, mustParseLineup(t, text))
+	second := playLineupGame(t, mustParseLineup(t, text))
+	if !reflect.DeepEqual(first, second) {
+		t.Fatal("the same mixed lineup, seed and seat gave different step results")
+	}
+	if stepFingerprint(first) == legacySingleRandomFingerprint {
+		t.Fatal("the mixed lineup played the same game as random-v1 in every seat")
 	}
 }
