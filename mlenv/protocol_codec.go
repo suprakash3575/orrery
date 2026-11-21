@@ -9,8 +9,6 @@ import (
 	"math"
 	"strings"
 	"unicode/utf8"
-
-	"orrery/agent"
 )
 
 const (
@@ -198,7 +196,7 @@ func ServeBinaryProtocol(
 	output io.Writer,
 	config ProtocolConfig,
 ) error {
-	return serveBinaryProtocol(ctx, input, output, config, agent.ParseFactory)
+	return serveBinaryProtocol(ctx, input, output, config, parseLineupText)
 }
 
 func serveBinaryProtocol(
@@ -206,7 +204,7 @@ func serveBinaryProtocol(
 	input io.Reader,
 	output io.Writer,
 	config ProtocolConfig,
-	parseOpponent func(string) (agent.Factory, error),
+	parseOpponent func(string) (Lineup, error),
 ) (returnErr error) {
 	if err := validateProtocolConfig(config); err != nil {
 		return err

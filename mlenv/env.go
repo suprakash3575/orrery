@@ -118,8 +118,8 @@ type SeatedScenarioFactory interface {
 }
 
 // BatchConfig fixes the replay-relevant inputs and execution width of one
-// batch. Scenario and Opponent are factories: every reset constructs an
-// independent game and opponent instance for that environment.
+// batch. Scenario and the Opponents lineup hold factories: every reset
+// constructs an independent game and opponent instances for that environment.
 type BatchConfig struct {
 	// Size is the fixed number of independent environment slots in the batch.
 	Size int
@@ -132,9 +132,11 @@ type BatchConfig struct {
 	// Scenario creates a fresh deterministic game for each reset seed, and is
 	// the one source of the batch's player count.
 	Scenario SeatedScenarioFactory
-	// Opponent creates an independent scripted agent for every seat the
-	// learner does not hold, in every episode.
-	Opponent agent.Factory
+	// Opponents chooses the scripted agent for every seat the learner does
+	// not hold, counted from the learner's seat, and creates an independent
+	// instance of it in every episode. SingleOpponent plays one agent in
+	// every opponent seat.
+	Opponents Lineup
 	// Workers limits concurrent turns; zero uses the available Go processors.
 	Workers int
 }
@@ -304,11 +306,10 @@ func NewBatch(ctx context.Context, config BatchConfig) (*Batch, error) {
 	if config.Cursor > length {
 		return nil, batchError(ErrorExhausted, "cursor %d exceeds schedule length %d", config.Cursor, length)
 	}
-	if nilInterface(config.Opponent) {
-		return nil, batchError(ErrorValidation, "opponent factory must not be nil")
-	}
-	if config.Opponent.Spec().ID() == "" {
-		return nil, batchError(ErrorValidation, "opponent ID must not be empty")
+	// NewLineup has already refused nil factories and empty IDs. Only the
+	// zero Lineup and a count that doesn't fit this map can still get here.
+	if err := config.Opponents.validateFor(players); err != nil {
+		return nil, batchError(ErrorValidation, "%v", err)
 	}
 
 	// Zero means "choose a sensible runtime default," while the size cap avoids
@@ -702,7 +703,8 @@ func (b *Batch) newEnvironment(ctx context.Context, plan episodeAssignment) (*en
 		if _, seated := frame.RoleOf(seat); !seated || seat == info.Seat {
 			continue
 		}
-		opponent, err := b.newOpponent(ctx, info, matchID, seat)
+		factory := b.config.Opponents.forSeat(seat, info.Seat, b.players)
+		opponent, err := b.newOpponent(ctx, info, matchID, seat, factory)
 		if err != nil {
 			// newOpponent has already closed the failed agent itself; close the
 			// ones before it so the episode leaves nothing running.
@@ -721,23 +723,25 @@ func (b *Batch) newEnvironment(ctx context.Context, plan episodeAssignment) (*en
 	return env, nil
 }
 
-// newOpponent creates the scripted agent for one seat. On failure it closes
-// whatever the factory returned, so the caller only has to clean up the
-// opponents created before this one.
-func (b *Batch) newOpponent(ctx context.Context, info EpisodeInfo, matchID string, seat int) (agent.Agent, error) {
+// newOpponent creates the scripted agent for one seat from that seat's
+// factory in the lineup. On failure it closes whatever the factory returned,
+// so the caller only has to clean up the opponents created before this one.
+func (b *Batch) newOpponent(ctx context.Context, info EpisodeInfo, matchID string, seat int, factory agent.Factory) (agent.Agent, error) {
 	// Each seat gets its own contestant ID, and so its own seed:
 	// DeriveAgentSeed leaves the seat out of its hash, so opponents sharing one
 	// ID would also share one random stream. heuristic-v1 ignores the seed
 	// today, but a seeded opponent must not mirror its neighbours. The seed is
 	// also kept apart from the scenario and game RNGs, so the episode seed and
-	// canonical opponent specification reproduce it.
+	// this seat's canonical specification reproduce it. A one-agent lineup
+	// passes the same specification for every seat, so its seeds are exactly
+	// the ones a batch derived before lineups existed.
 	contestant := fmt.Sprintf("opponent-seat-%d", seat)
-	opponent, err := b.config.Opponent.New(ctx, agent.AgentInit{
+	opponent, err := factory.New(ctx, agent.AgentInit{
 		MatchID:      matchID,
 		ScenarioSeed: info.Seed,
 		ContestantID: contestant,
 		PlayerID:     seat,
-		AgentSeed:    arena.DeriveAgentSeed(info.Seed, contestant, b.config.Opponent.Spec()),
+		AgentSeed:    arena.DeriveAgentSeed(info.Seed, contestant, factory.Spec()),
 	})
 	if err != nil {
 		// A factory may return a partially constructed agent together with an
@@ -753,10 +757,11 @@ func (b *Batch) newOpponent(ctx context.Context, info EpisodeInfo, matchID strin
 	if nilInterface(opponent) {
 		return nil, fmt.Errorf("seat %d: opponent factory returned a nil agent", seat)
 	}
-	// The factory specification is recorded as replay metadata. Reject an agent
-	// with a different ID so the recorded opponent still identifies what ran.
-	if opponent.ID() != b.config.Opponent.Spec().ID() {
-		err := fmt.Errorf("seat %d: opponent ID %q does not match factory ID %q", seat, opponent.ID(), b.config.Opponent.Spec().ID())
+	// The lineup's specifications are recorded as replay metadata. Reject an
+	// agent with a different ID so the recorded opponent still identifies what
+	// ran in this seat.
+	if opponent.ID() != factory.Spec().ID() {
+		err := fmt.Errorf("seat %d: opponent ID %q does not match factory ID %q", seat, opponent.ID(), factory.Spec().ID())
 		if closeErr := closeAgent(opponent); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close mismatched opponent: %w", closeErr))
 		}

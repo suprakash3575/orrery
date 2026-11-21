@@ -117,7 +117,7 @@ func newTestBatch(t testing.TB, factory SeatedScenarioFactory, opponent agent.Fa
 	t.Helper()
 	batch, err := NewBatch(context.Background(), BatchConfig{
 		Size: size, Seeds: seeds, Schedule: schedule, Cursor: cursor,
-		Scenario: factory, Opponent: opponent, Workers: workers,
+		Scenario: factory, Opponents: SingleOpponent(opponent), Workers: workers,
 	})
 	if err != nil {
 		t.Fatalf("NewBatch() error = %v", err)
@@ -513,8 +513,8 @@ func TestNewBatchRejectsRemovedAndUnknownSchedules(t *testing.T) {
 		t.Run(string(mode), func(t *testing.T) {
 			_, err := NewBatch(context.Background(), BatchConfig{
 				Size: 1, Seeds: scenario.SeedRange{Start: 0, End: 10}, Schedule: mode,
-				Scenario: testScenario{id: "schedule-rejection-v1", maxTurns: 2},
-				Opponent: agent.IdleFactory{},
+				Scenario:  testScenario{id: "schedule-rejection-v1", maxTurns: 2},
+				Opponents: SingleOpponent(agent.IdleFactory{}),
 			})
 			assertEnvErrorKind(t, err, ErrorValidation)
 			if !strings.Contains(err.Error(), "unknown schedule") || !strings.Contains(err.Error(), string(mode)) {
@@ -544,7 +544,7 @@ func TestNewBatchRejectsUnsupportedPlayerCounts(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := NewBatch(context.Background(), BatchConfig{
 				Size: 1, Seeds: scenario.SeedRange{Start: 0, End: 10}, Schedule: ScheduleRotate,
-				Scenario: test.factory, Opponent: agent.IdleFactory{},
+				Scenario: test.factory, Opponents: SingleOpponent(agent.IdleFactory{}),
 			})
 			assertEnvErrorKind(t, err, ErrorValidation)
 			if !strings.Contains(err.Error(), test.wantInText) {
