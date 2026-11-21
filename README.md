@@ -162,6 +162,22 @@ make train TRAIN_ARGS="--max-updates 1"
 make train TRAIN_ARGS="--resume ../runs/<run>/checkpoints/<checkpoint>.pt"
 ```
 
+`--resume` continues the same run with the same configuration. To start a
+**new** run from another run's trained weights, for example to continue a
+model trained against `random-v1` against `heuristic-v2`, use `--init-from`:
+
+```bash
+make train-4p TRAIN_ARGS="--init-from ../runs/<run>/checkpoints/<checkpoint>.pt \
+  --run-dir ../runs/<new-run>"
+```
+
+Only the weights carry over. The new run counts its updates from zero, starts
+a fresh optimizer and schedules, and may use a different training opponent or
+learner seed. Its `manifest.json` records the starting checkpoint's path and
+SHA-256 under `parent`. `--init-from` can't be combined with `--resume`.
+`diagnose.py --untrained` on such a run rebuilds random weights from the
+learner seed, not the starting checkpoint, so it isn't that run's baseline.
+
 If a run has not passed its first validation check by 25 million steps,
 training pauses. Resuming past that point also needs a written reason, such as
 `--review-reason 'validation results are still improving'`.
