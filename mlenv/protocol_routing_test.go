@@ -118,7 +118,7 @@ func TestBinaryProtocolJoinsCleanupFailureWithFatalOutputError(t *testing.T) {
 	output := &failAfterOneWrite{err: writeFailure}
 	err := serveBinaryProtocol(
 		context.Background(), bytes.NewReader(input), output, config,
-		func(string) (agent.Factory, error) { return factory, nil },
+		func(string) (Lineup, error) { return SingleOpponent(factory), nil },
 	)
 	if !errors.Is(err, writeFailure) || !errors.Is(err, closeFailure) {
 		t.Fatalf("serveBinaryProtocol() error = %v, want joined output and cleanup failures", err)

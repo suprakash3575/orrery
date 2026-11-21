@@ -519,7 +519,7 @@ func benchmarkProtocolConfig() ProtocolConfig {
 func newBenchmarkProtocolCoreV3() *benchmarkProtocolCoreV3 {
 	return &benchmarkProtocolCoreV3{server: protocolServer{
 		config:        benchmarkProtocolConfig(),
-		parseOpponent: agent.ParseFactory,
+		parseOpponent: parseLineupText,
 	}}
 }
 

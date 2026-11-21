@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"orrery/agent"
 	"orrery/scenario"
 )
 
@@ -117,8 +116,10 @@ func closeInputOnCancel(ctx context.Context, input io.Reader) func() {
 // binary codec in protocol_codec.go decodes requests and encodes responses; this
 // type owns the lifecycle rules and batch construction those requests share.
 type protocolServer struct {
-	config        ProtocolConfig
-	parseOpponent func(string) (agent.Factory, error)
+	config ProtocolConfig
+	// parseOpponent turns a create request's opponent text into a lineup.
+	// Production uses parseLineupText; tests may supply their own lineup.
+	parseOpponent func(string) (Lineup, error)
 	batch         *Batch
 }
 
@@ -161,14 +162,14 @@ func (server *protocolServer) createBatch(
 	schedule ScheduleMode,
 	cursor int64,
 ) (protocolCreateResult, error) {
-	opponent, err := server.parseOpponent(opponentText)
+	opponents, err := server.parseOpponent(opponentText)
 	if err != nil {
 		return protocolCreateResult{}, validationFailure("opponent: %v", err)
 	}
 	seeds := scenario.SeedRange{Start: seedRange[0], End: seedRange[1]}
 	batch, err := NewBatch(ctx, BatchConfig{
 		Size: batchSize, Seeds: seeds, Schedule: schedule, Cursor: cursor,
-		Scenario: server.config.Scenario, Opponent: opponent,
+		Scenario: server.config.Scenario, Opponents: opponents,
 	})
 	if err != nil {
 		return protocolCreateResult{}, err
@@ -178,7 +179,7 @@ func (server *protocolServer) createBatch(
 	configuredSchedule := batch.config.Schedule
 	return protocolCreateResult{
 		engine: server.config.EngineVersion, schema: SchemaID,
-		generator: server.config.Scenario.ID(), opponent: opponent.Spec().String(),
+		generator: server.config.Scenario.ID(), opponent: opponents.String(),
 		seedRange: [2]int64{configuredSeeds.Start, configuredSeeds.End},
 		schedule:  string(configuredSchedule), cursor: batch.Cursor(),
 	}, nil
