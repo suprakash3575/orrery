@@ -931,14 +931,19 @@ takes one of two forms.
 | Form | Example | Meaning |
 |---|---|---|
 | One specification | `heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1` | That agent in every opponent seat. This was the only form before lineups, and it is recorded and seeded exactly as before. |
-| One per opponent seat, joined by `\|` | `heuristic-v2:…\|random-v1:…\|random-v1:…` | Entry 1 plays the first seat after the learner, entry 2 the second, entry 3 the third. |
+| One per opponent seat, joined by `\|` | `heuristic-v2:…\|random-v1:…\|random-v1:…` | Entry 1 plays the seat **clockwise** of the learner, entry 2 the seat **opposite**, entry 3 the seat **counter-clockwise**. |
 
-Seats are **counted from the learner**, wrapping from the last seat back to
-seat 0, because the learner's seat changes from game to game. With the learner
-in seat 2 of a four-player map, the lineup `a|b|c` puts `a` in seat 3, `b` in
-seat 0 and `c` in seat 1. Every game then has the same mix of opponents.
-Fixed seat numbers wouldn't give that: whichever fixed seat the learner took
-would lose its agent.
+Entries follow the learner's **board roles**, the same roles its observation
+uses (see [Seeing every seat from the same chair](#seeing-every-seat-from-the-same-chair)),
+because the learner's seat changes from game to game. Every game then has the
+same mix of opponents in the same places around the board. Fixed seat numbers
+wouldn't give that: whichever fixed seat the learner took would lose its
+agent.
+
+Roles follow the board, not player numbers. Going clockwise around the sun the
+seats run 0 → 1 → 3 → 2, so with the learner in seat 2 of a four-player map,
+the lineup `a|b|c` puts `a` in seat 0 (clockwise), `b` in seat 1 (opposite)
+and `c` in seat 3 (counter-clockwise).
 
 Rules that `ParseLineup` and `NewBatch` enforce:
 

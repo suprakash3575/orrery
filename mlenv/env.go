@@ -133,7 +133,7 @@ type BatchConfig struct {
 	// the one source of the batch's player count.
 	Scenario SeatedScenarioFactory
 	// Opponents chooses the scripted agent for every seat the learner does
-	// not hold, counted from the learner's seat, and creates an independent
+	// not hold, by its board role from the learner, and creates an independent
 	// instance of it in every episode. SingleOpponent plays one agent in
 	// every opponent seat.
 	Opponents Lineup
@@ -700,10 +700,15 @@ func (b *Batch) newEnvironment(ctx context.Context, plan episodeAssignment) (*en
 	matchID := fmt.Sprintf("env-%d-seed-%d-seat-%d", info.EnvID, info.Seed, info.Seat)
 	var opponents [PlayerSlots]agent.Agent
 	for seat := range PlayerSlots {
-		if _, seated := frame.RoleOf(seat); !seated || seat == info.Seat {
+		role, seated := frame.RoleOf(seat)
+		if !seated || seat == info.Seat {
 			continue
 		}
-		factory := b.config.Opponents.forSeat(seat, info.Seat, b.players)
+		// The learner's frame gives this seat's board role, so each lineup
+		// entry keeps its place around the board whichever seat the learner
+		// holds. Seats are still visited, and opponents created, in
+		// ascending seat order.
+		factory := b.config.Opponents.forRole(role)
 		opponent, err := b.newOpponent(ctx, info, matchID, seat, factory)
 		if err != nil {
 			// newOpponent has already closed the failed agent itself; close the

@@ -138,10 +138,15 @@ func TestNewBatchChecksEveryLineupFactory(t *testing.T) {
 	}
 }
 
-// TestLineupSeatsCountedFromLearner places the learner in each seat of a
-// four-player map and checks that the seats one, two, and three places after
-// it hold the agents named by lineup entries 0, 1, and 2, wrapping past seat 3.
-func TestLineupSeatsCountedFromLearner(t *testing.T) {
+// TestLineupSeatsFollowBoardRoles places the learner in each seat of a
+// four-player map and checks that the seats clockwise, opposite, and
+// counter-clockwise of it hold lineup entries 0, 1, and 2.
+//
+// The expected seats are written out from the board, not computed with a
+// formula: going clockwise around the sun the seats run 0 → 1 → 3 → 2, so
+// counting player numbers upwards would put an entry in a different board
+// position depending on the learner's seat.
+func TestLineupSeatsFollowBoardRoles(t *testing.T) {
 	lineup, err := ParseLineup(lineupHeuristic+"|"+lineupRandom+"|"+lineupIdle, agent.ParseFactory)
 	if err != nil {
 		t.Fatalf("ParseLineup() error = %v", err)
@@ -161,7 +166,17 @@ func TestLineupSeatsCountedFromLearner(t *testing.T) {
 		}
 	})
 
-	for learner := range 4 {
+	// boardSeats[learner] lists the seats clockwise, opposite, and
+	// counter-clockwise of the learner, read off the board's clockwise
+	// order 0 → 1 → 3 → 2.
+	boardSeats := [4][3]int{
+		{1, 3, 2},
+		{3, 2, 0},
+		{0, 1, 3},
+		{2, 0, 1},
+	}
+	roleNames := [3]string{"clockwise", "opposite", "counter-clockwise"}
+	for learner, seats := range boardSeats {
 		override := []EpisodeOverride{{EnvID: 0, Seed: 0, Seat: learner}}
 		if _, err := batch.Reset(context.Background(), []int{0}, override); err != nil {
 			t.Fatalf("learner seat %d: Reset() error = %v", learner, err)
@@ -170,10 +185,9 @@ func TestLineupSeatsCountedFromLearner(t *testing.T) {
 		if opponents[learner] != nil {
 			t.Fatalf("learner seat %d holds an opponent %q", learner, opponents[learner].ID())
 		}
-		for after, want := range wantIDs {
-			seat := (learner + after + 1) % 4
-			if got := opponents[seat].ID(); got != want {
-				t.Errorf("learner seat %d: seat %d (%d after the learner) = %q, want %q", learner, seat, after+1, got, want)
+		for entry, seat := range seats {
+			if got := opponents[seat].ID(); got != wantIDs[entry] {
+				t.Errorf("learner seat %d: %s seat %d = %q, want %q", learner, roleNames[entry], seat, got, wantIDs[entry])
 			}
 		}
 	}

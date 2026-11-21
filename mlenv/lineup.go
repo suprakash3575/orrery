@@ -18,18 +18,22 @@ const LineupSeparator = "|"
 // only form that existed before lineups, and it is recorded and seeded exactly
 // as it was then, so earlier runs replay unchanged.
 //
-// A longer lineup names one agent per opponent seat, counted from the learner:
-// entry 0 plays the first seat after the learner's, entry 1 the second, and so
-// on, wrapping from the last seat back to seat 0. The learner's seat changes
-// from game to game, and counting from it gives every game the same mix of
-// opponents. Fixed seat numbers would not: whichever fixed seat the learner
-// took would lose its agent, and the mix would depend on the learner's seat.
+// A longer lineup names one agent per opponent seat by its board role from
+// the learner, the same roles the learner's observation uses (see SeatFrame):
+// entry 0 plays the seat clockwise of the learner, entry 1 the seat opposite,
+// and entry 2 the seat counter-clockwise. The learner's seat changes from game
+// to game, and assigning by role gives every game the same mix of opponents
+// in the same places around the board. Fixed seat numbers would not: whichever
+// fixed seat the learner took would lose its agent.
 //
-// For example, with the learner in seat 2 of a four-player game, the lineup
-// "a|b|c" seats a in seat 3, b in seat 0, and c in seat 1.
+// Roles follow the board, not player numbers: going clockwise around the sun
+// the seats run 0 → 1 → 3 → 2. For example, with the learner in seat 2 of a
+// four-player game, the lineup "a|b|c" seats a in seat 0 (clockwise), b in
+// seat 1 (opposite), and c in seat 3 (counter-clockwise).
 type Lineup struct {
-	// factories holds one agent factory per opponent seat, in seat order
-	// counted from the learner, or a single factory for every opponent seat.
+	// factories holds one agent factory per opponent seat, in role order
+	// (clockwise, opposite, counter-clockwise of the learner), or a single
+	// factory for every opponent seat.
 	// NewLineup never builds an empty one; the zero Lineup is empty, and
 	// NewBatch refuses it.
 	factories []agent.Factory
@@ -43,8 +47,8 @@ func SingleOpponent(factory agent.Factory) Lineup {
 	return Lineup{factories: []agent.Factory{factory}}
 }
 
-// NewLineup builds a lineup from factories in seat order counted from the
-// learner. It refuses an empty list, a nil factory (including a typed nil),
+// NewLineup builds a lineup from factories in role order: clockwise,
+// opposite, then counter-clockwise of the learner. It refuses an empty list, a nil factory (including a typed nil),
 // and an agent without an ID.
 //
 // Two or more entries with the same specification are accepted and
@@ -140,19 +144,19 @@ func (l Lineup) validateFor(players int) error {
 	}
 }
 
-// forSeat returns the factory for an opponent seat. seat and learner are
-// player IDs on a map with players seats, and seat is never the learner's.
+// forRole returns the factory for the opponent seat holding role, as seen
+// from the learner. role is never RoleMe.
 //
-// The offset counts how many seats after the learner this seat comes, from 1
-// to players-1. Adding players before taking the remainder keeps it positive
-// when the seat number is lower than the learner's: with the learner in seat
-// 2 of 4, seat 0 has offset (0 - 2 + 4) % 4 = 2, the second seat after it.
-func (l Lineup) forSeat(seat, learner, players int) agent.Factory {
+// A one-entry lineup serves every role. Otherwise validateFor has already
+// required one entry per opponent seat, which on a four-player map is three:
+// RoleCW, RoleOpposite, and RoleCCW are 1, 2, and 3, so role-1 indexes
+// entries 0, 1, and 2. A two-player map seats only RoleOpposite and takes a
+// one-entry lineup, so it never reaches the index.
+func (l Lineup) forRole(role Role) agent.Factory {
 	if len(l.factories) == 1 {
 		return l.factories[0]
 	}
-	offset := (seat - learner + players) % players
-	return l.factories[offset-1]
+	return l.factories[role-1]
 }
 
 // allSameSpec reports whether every factory has the same canonical
