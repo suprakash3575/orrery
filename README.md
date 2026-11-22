@@ -178,6 +178,24 @@ SHA-256 under `parent`. `--init-from` can't be combined with `--resume`.
 `diagnose.py --untrained` on such a run rebuilds random weights from the
 learner seed, not the starting checkpoint, so it isn't that run's baseline.
 
+`training_opponent` in a config is one pinned spec for every opponent seat,
+or a **lineup**: one pinned spec per opponent seat, joined by `|`, in board
+order from the learner: clockwise, opposite, then counter-clockwise. A
+four-player run takes three entries, and a two-player run takes a single
+spec. For the same opponent in every seat, write the spec once. The
+`configs/ladder-*` files are a mixed-opponent ladder:
+
+| Rung | Configs | Clockwise | Opposite | Counter-clockwise |
+|---|---|---|---|---|
+| 1 | `ladder-r1-4p-s*.toml` | `heuristic-v2` | `random-v1` | `random-v1` |
+| 2 | `ladder-r2-4p-s*.toml` | `heuristic-v2` | `heuristic-v2` | `random-v1` |
+| 3 | `exp-a-4p-s*.toml` | `heuristic-v2` | `heuristic-v2` | `heuristic-v2` |
+
+Each rung starts from the previous rung's checkpoint with `--init-from`.
+Whatever the lineup, the pipeline gate still plays `random-v1` and release
+readiness still plays `heuristic-v2`. The [mlenv README](mlenv/README.md#opponent-lineups)
+describes how Go seats a lineup.
+
 If a run has not passed its first validation check by 25 million steps,
 training pauses. Resuming past that point also needs a written reason, such as
 `--review-reason 'validation results are still improving'`.
