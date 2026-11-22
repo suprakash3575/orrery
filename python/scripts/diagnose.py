@@ -33,6 +33,15 @@ every seat, so a four-player run plays ``4 × N`` games. ``--no-charts`` skips
 the charts and the matplotlib dependency. ``--opponent SPEC`` plays a different
 opponent than the one the run trained against, for example
 ``random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2``.
+It also accepts a lineup, one canonical spec per opponent seat joined by
+``|`` (clockwise, opposite, then counter-clockwise of the learner). Quote the
+whole argument, because ``|`` is a shell pipe::
+
+    --opponent 'heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1|random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2|random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2'
+
+For the same opponent in every seat, write its spec once. Go records a lineup
+of identical specs as that single spec, so the long form fails the check that
+Go played exactly the requested opponent.
 ``--untrained`` plays a never-trained model rebuilt from the run's learner
 seed instead of a checkpoint, as the baseline that shows how much training
 helped; its report records a weights fingerprint so rebuilds can be compared.
@@ -1487,7 +1496,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--opponent",
-        help="complete opponent spec to play against (default: the run's training opponent)",
+        help=(
+            "complete opponent spec to play against, or a lineup of canonical specs "
+            "joined by '|' (quote it); write a uniform opponent once "
+            "(default: the run's training opponent)"
+        ),
     )
     parser.add_argument("--no-games", action="store_true", help="only chart the training history")
     parser.add_argument("--no-charts", action="store_true", help="skip charts and matplotlib")

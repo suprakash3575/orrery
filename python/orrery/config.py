@@ -36,6 +36,11 @@ RANDOM_V1_OPPONENT = "random-v1:launch_probability=0.3,max_fraction=0.8,min_frac
 # The exact specs a run may train against. A spec is compared as a whole
 # string, so a changed parameter is a different opponent and is refused.
 TRAINING_OPPONENTS = (HEURISTIC_V2_OPPONENT, RANDOM_V1_OPPONENT)
+# Separates the specs of an opponent lineup, as Go's mlenv.LineupSeparator
+# does. A lineup names one opponent per seat by its board position from the
+# learner: clockwise, opposite, then counter-clockwise. Go owns what a lineup
+# does; Python only checks that each entry is pinned and the count fits.
+LINEUP_SEPARATOR = "|"
 # Release readiness and final evaluation always play this opponent, whatever
 # the run trained against. Without a separate identity, a run that trained
 # against random-v1 would be judged for release against random-v1 too, and
@@ -154,9 +159,11 @@ class RunConfig:
     evaluation_pool_names: tuple[str, ...]
     # training_schedule names Go's deterministic cursor-to-seed-and-seat mapping.
     training_schedule: str
-    # training_opponent is the complete versioned opponent specification used to
-    # learn: one of TRAINING_OPPONENTS. Release readiness and final evaluation
-    # do not use it; they play release_opponent.
+    # training_opponent is what the learner trains against: one of
+    # TRAINING_OPPONENTS in every opponent seat, or a lineup of them joined by
+    # LINEUP_SEPARATOR, one per opponent seat (clockwise, opposite, then
+    # counter-clockwise of the learner). Release readiness and final
+    # evaluation do not use it; they play release_opponent.
     training_opponent: str
     # pipeline_opponent is the complete opponent specification used by the initial gate.
     pipeline_opponent: str
@@ -345,9 +352,7 @@ class RunConfig:
                     f"{name} must be {expected!r} for {CONTRACT} "
                     f"with {self.players} players"
                 )
-        if self.training_opponent not in TRAINING_OPPONENTS:
-            allowed = " or ".join(repr(spec) for spec in TRAINING_OPPONENTS)
-            raise ValueError(f"training_opponent must be {allowed} for {CONTRACT}")
+        _check_training_opponent(self.training_opponent, self.players)
 
         if len(self.evaluation_seeds) != len(self.evaluation_pool_names):
             raise ValueError("evaluation pool names and seed ranges must align")
@@ -436,3 +441,44 @@ def _seed_range(value: object, name: str) -> SeedRange:
     if any(isinstance(bound, bool) or not isinstance(bound, int) for bound in value):
         raise TypeError(f"{name} bounds must be integers")
     return SeedRange(value[0], value[1])
+
+
+def _check_training_opponent(opponent: str, players: int) -> None:
+    """Refuse a training opponent that isn't a pinned spec or a valid lineup.
+
+    A single pinned spec plays every opponent seat. A lineup names one pinned
+    spec per opponent seat, so it must have players - 1 entries: three on a
+    four-player map, and none longer than one on a two-player map. Each entry
+    is compared as a whole string, as a single spec is, so an unpinned bot or a
+    changed parameter is refused before Go starts.
+
+    A lineup whose entries are all the same is refused too. Go records it as
+    that single spec, and training's exact check of Go's echoed opponent would
+    then fail with a confusing mismatch, so a config writes such a setup once.
+    """
+
+    entries = opponent.split(LINEUP_SEPARATOR)
+    allowed = " or ".join(repr(spec) for spec in TRAINING_OPPONENTS)
+    if len(entries) == 1:
+        if opponent not in TRAINING_OPPONENTS:
+            raise ValueError(f"training_opponent must be {allowed} for {CONTRACT}")
+        return
+    for position, entry in enumerate(entries, start=1):
+        # An empty entry comes from a doubled separator or one at either end.
+        if not entry:
+            raise ValueError(f"training_opponent lineup entry {position} is empty")
+        if entry not in TRAINING_OPPONENTS:
+            raise ValueError(
+                f"training_opponent lineup entry {position} is {entry!r}; "
+                f"each entry must be {allowed}"
+            )
+    if len(entries) != players - 1:
+        raise ValueError(
+            f"training_opponent lineup has {len(entries)} entries; a {players}-player "
+            f"run takes one spec for every seat or {players - 1} (one per opponent seat)"
+        )
+    if len(set(entries)) == 1:
+        raise ValueError(
+            "training_opponent lineup names the same spec in every seat; "
+            f"write it once: {entries[0]!r}"
+        )

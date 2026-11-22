@@ -216,6 +216,68 @@ def test_random_v1_is_an_allowed_training_opponent_but_never_the_release_opponen
     assert run_config_from_mapping(json_value(config.to_dict())) == config
 
 
+# Short names for the lineup tests: H is heuristic-v2, R is random-v1.
+_H, _R = HEURISTIC_V2_OPPONENT, RANDOM_V1_OPPONENT
+
+
+@pytest.mark.parametrize(
+    ("path", "opponent"),
+    [
+        (FOUR_PLAYER_CONFIG, f"{_H}|{_R}|{_R}"),
+        (FOUR_PLAYER_CONFIG, f"{_H}|{_H}|{_R}"),
+        (FOUR_PLAYER_CONFIG, _H),
+        (FOUR_PLAYER_CONFIG, _R),
+        (CONFIG, _H),
+        (CONFIG, _R),
+    ],
+    ids=["4p H|R|R", "4p H|H|R", "4p single H", "4p single R", "2p single H", "2p single R"],
+)
+def test_training_opponent_accepts_pinned_lineups_and_single_specs(
+    path: Path, opponent: str
+) -> None:
+    """A lineup of pinned specs, one per opponent seat, trains like a single spec.
+
+    Single specs keep working as before. The recorded configuration keeps the
+    lineup text exactly, so a resume or --init-from sees what the run trained
+    against, and release still plays heuristic-v2.
+    """
+
+    config = replace(load_run_config(path), training_opponent=opponent)
+
+    assert config.training_opponent == opponent
+    assert config.release_opponent == HEURISTIC_V2_OPPONENT
+    assert run_config_from_mapping(json_value(config.to_dict())) == config
+
+
+@pytest.mark.parametrize(
+    ("path", "opponent", "message"),
+    [
+        (FOUR_PLAYER_CONFIG, f"{_H}|{_R}|idle-v1", "entry 3 is 'idle-v1'"),
+        (FOUR_PLAYER_CONFIG, f"{_H}|{_R}", "has 2 entries"),
+        (FOUR_PLAYER_CONFIG, f"{_H}|{_R}|{_R}|{_R}", "has 4 entries"),
+        (CONFIG, f"{_H}|{_R}", "has 2 entries"),
+        (FOUR_PLAYER_CONFIG, f"{_H}|{_H}|{_H}", "same spec in every seat"),
+        (FOUR_PLAYER_CONFIG, f"{_H}||{_R}", "entry 2 is empty"),
+        (FOUR_PLAYER_CONFIG, f"{_H}|{_R}|", "entry 3 is empty"),
+    ],
+    ids=[
+        "unpinned entry", "two entries on 4p", "four entries on 4p", "lineup on 2p",
+        "same spec in every seat", "doubled separator", "trailing separator",
+    ],
+)
+def test_training_opponent_rejects_invalid_lineups(
+    path: Path, opponent: str, message: str
+) -> None:
+    """Python refuses a bad lineup before Go starts: unpinned, wrong count, or empty.
+
+    A lineup of one repeated spec is refused too: Go records it as the single
+    spec, so training's exact check of Go's echoed opponent would fail later.
+    """
+
+    with pytest.raises(ValueError, match=message):
+        replace(load_run_config(path), training_opponent=opponent)
+
+
 def test_run_config_rejects_overlapping_seed_ranges() -> None:
     config = load_run_config(CONFIG)
 

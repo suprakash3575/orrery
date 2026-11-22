@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from orrery.config import LINEUP_SEPARATOR
 from orrery.jsonio import read_json_object
 
 # The expansion target's deadline: a game counts when the learner first held
@@ -224,9 +225,17 @@ def discover(results: Path) -> tuple[list[ModelReport], list[WinRateComparison]]
 
 
 def _short(opponent: str) -> str:
-    """The opponent's name without its parameters, e.g. ``random-v1``."""
+    """The opponent's name without its parameters, e.g. ``random-v1``.
 
-    return opponent.split(":", 1)[0]
+    A lineup keeps one name per seat, in its own order and separator, e.g.
+    ``heuristic-v2|random-v1|random-v1``, so rungs that differ only in their
+    mix still read differently. The text stays plain here, as CSV stores it;
+    _markdown_table escapes the separator when it renders a table.
+    """
+
+    return LINEUP_SEPARATOR.join(
+        entry.split(":", 1)[0] for entry in opponent.split(LINEUP_SEPARATOR)
+    )
 
 
 def _percent(value: float) -> str:
@@ -388,8 +397,19 @@ def _markdown_table(rows: Sequence[Mapping[str, str]]) -> list[str]:
         return ["(none)"]
     columns = list(rows[0])
     lines = ["| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
-    lines += ["| " + " | ".join(row[c] for c in columns) + " |" for row in rows]
+    lines += ["| " + " | ".join(_markdown_cell(row[c]) for c in columns) + " |" for row in rows]
     return lines
+
+
+def _markdown_cell(value: str) -> str:
+    """Escape a table cell's pipes so Markdown doesn't read them as columns.
+
+    A lineup label such as ``heuristic-v2|random-v1|random-v1`` would
+    otherwise split one cell into three and shift every later column. Only the
+    rendered Markdown is escaped; the row values and the CSV keep plain text.
+    """
+
+    return value.replace("|", "\\|")
 
 
 def ignored_rows(joined: JoinedComparisons) -> list[dict[str, str]]:

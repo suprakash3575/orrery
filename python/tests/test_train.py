@@ -34,6 +34,7 @@ from orrery.evaluator import (
     EvaluationOutcome,
     EvaluationResult,
     RunnerTimings,
+    run_rotated_matches,
 )
 from orrery.model import OrbitPolicy
 from orrery.train import (
@@ -1636,16 +1637,33 @@ def test_release_validation_uses_the_training_player_count() -> None:
     assert captured["device"] == torch.device("cpu")
 
 
-def test_release_validation_plays_heuristic_v2_when_training_used_random_v1() -> None:
-    """Training against the easier bot never makes release play it.
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"training_opponent": RANDOM_V1_OPPONENT},
+        {
+            "players": 4,
+            "generator_version": "generator-v2-4p",
+            "training_opponent": (
+                f"{HEURISTIC_V2_OPPONENT}|{RANDOM_V1_OPPONENT}|{RANDOM_V1_OPPONENT}"
+            ),
+        },
+    ],
+    ids=["random-v1", "mixed lineup"],
+)
+def test_release_validation_plays_heuristic_v2_when_training_used_random_v1(
+    overrides: dict[str, object],
+) -> None:
+    """Training against easier bots never makes release play them.
 
     The runner is replaced to observe its inputs. Both the requested opponent
-    and the metadata Go's response is checked against must name heuristic-v2;
+    and the metadata Go's response is checked against must name heuristic-v2
+    alone, whether training used random-v1 or a lineup that includes it;
     either one naming random-v1 would let a run qualify against random bots.
     """
 
     config = _test_config(
-        training_opponent=RANDOM_V1_OPPONENT,
+        **overrides,
         release_validation_seeds=1,
         release_required_wins=2,
     )
@@ -1658,7 +1676,7 @@ def test_release_validation_plays_heuristic_v2_when_training_used_random_v1() ->
         return EvaluationResult(
             tuple(
                 EvaluationOutcome(kwargs["seeds"].start, seat, 1.0, 10, END_GAME_FINISHED, 1)
-                for seat in (0, 1)
+                for seat in range(kwargs["players"])
             ),
             metadata,
             rejected_actions=0,
@@ -2029,3 +2047,59 @@ def test_resume_refuses_engine_versions_that_do_not_name_exact_code(
     else:
         with pytest.raises(ValueError, match=message):
             resume()
+
+
+def test_mixed_lineup_trains_with_real_go_and_the_pipeline_gate_plays_random_v1(
+    env_command: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    """Train one update against a mixed lineup, then play the real pipeline gate.
+
+    Real Go creates the training batch from the lineup, and training's exact
+    check of Go's echoed opponent must accept it; the checkpoint keeps that
+    echo. The gate's boundary falls inside the one update, so it runs, and the
+    real runner plays it. The recording wrapper keeps what was requested and
+    what Go reported: both must be random-v1 alone, not the lineup. One win in
+    four games is a reachable threshold, but the gate runs and records its
+    opponent whether or not it passes.
+    """
+
+    lineup = f"{HEURISTIC_V2_OPPONENT}|{RANDOM_V1_OPPONENT}|{RANDOM_V1_OPPONENT}"
+    config = _test_config(
+        **_INIT_FROM_LAYOUT,
+        players=4,
+        generator_version="generator-v2-4p",
+        training_opponent=lineup,
+        pipeline_gate_every_steps=4,
+        pipeline_validation_seeds=1,
+        pipeline_required_wins=1,
+    )
+    gate_calls: list[tuple[dict[str, object], EvaluationResult]] = []
+
+    def recording_runner(policy: object, **kwargs: object) -> EvaluationResult:
+        result = run_rotated_matches(policy, **kwargs)
+        gate_calls.append((kwargs, result))
+        return result
+
+    run_directory = tmp_path / "lineup"
+    result = run_training(
+        config,
+        run_directory,
+        command=env_command,
+        max_updates=1,
+        validation_runner=recording_runner,
+    )
+
+    assert result.completed_updates == 1
+    checkpoint = load_checkpoint(
+        run_directory / "checkpoints" / "update-000001.pt", expected_config=config
+    )
+    assert checkpoint.environment_metadata["opponent"] == lineup
+    assert len(gate_calls) == 1
+    requested, gate_result = gate_calls[0]
+    assert requested["opponent"] == RANDOM_V1_OPPONENT
+    assert requested["expected_metadata"]["opponent"] == RANDOM_V1_OPPONENT
+    assert gate_result.metadata["opponent"] == RANDOM_V1_OPPONENT
+    assert len(gate_result.outcomes) == 4
+    pipeline_record = json.loads((run_directory / "pipeline-000000004.json").read_text())
+    assert pipeline_record["games"] == 4
