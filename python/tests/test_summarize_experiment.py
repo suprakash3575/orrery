@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -9,10 +10,13 @@ from typing import Any
 import pytest
 
 from scripts.summarize_experiment import (
+    _short,
+    direct_comparison_rows,
     discover,
     join_comparisons,
     learning_curve_rows,
     reached_two_planets_by,
+    write_summary,
 )
 
 _OPPONENT = "random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2"
@@ -25,14 +29,16 @@ _SAMPLE: dict[str, Any] = {
 }
 
 
-def _report(folder: Path, *, seed: int, updates: int, sha: str) -> None:
+def _report(
+    folder: Path, *, seed: int, updates: int, sha: str, training_opponent: str = _OPPONENT
+) -> None:
     """Write the fields summarize_experiment reads from a diagnose report."""
 
     folder.mkdir()
     report = {
         "format": "diagnosis-v2",
         "identity": {
-            "training_opponent": _OPPONENT,
+            "training_opponent": training_opponent,
             "learner_seed": seed,
             "players": _SAMPLE["players"],
         },
@@ -154,3 +160,54 @@ def test_comparison_on_another_sample_is_not_joined(tmp_path: Path, different: d
     assert [(c.path.name, reason) for c, reason in joined.ignored] == [
         ("cmp", "baseline: no report of this model on the comparison's exact sample"),
     ]
+
+
+_HEURISTIC = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+_LINEUP = f"{_HEURISTIC}|{_OPPONENT}|{_OPPONENT}"
+
+
+def _unescaped_pipes(line: str) -> int:
+    """Count the pipes Markdown reads as column borders: those not after a backslash."""
+
+    return sum(1 for i, char in enumerate(line) if char == "|" and (i == 0 or line[i - 1] != "\\"))
+
+
+def test_lineups_render_as_one_markdown_cell_and_stay_plain_in_csv(tmp_path: Path) -> None:
+    """A lineup label keeps its own cell in Markdown and its plain text in CSV.
+
+    One model trained against random-v1 and one against a mixed lineup are
+    compared directly, so the lineup appears in a learning-curve row and in a
+    direct-comparison label. Every Markdown row must have as many column
+    borders as its table's header; an unescaped "|" inside the label would add
+    columns. The CSV keeps the plain label for charts and scripts.
+    """
+
+    results = tmp_path / "results"
+    results.mkdir()
+    _report(results / "random", seed=1501, updates=153, sha="r1501")
+    _report(results / "lineup", seed=1501, updates=153, sha="l1501", training_opponent=_LINEUP)
+    _comparison(results / "cmp-random-vs-lineup", baseline="r1501", candidate="l1501", difference=0.10)
+    reports, comparisons = discover(results)
+    joined = join_comparisons(reports, comparisons)
+    out = tmp_path / "summary"
+
+    write_summary(out, learning_curve_rows(reports, joined), direct_comparison_rows(joined))
+
+    short = "heuristic-v2|random-v1|random-v1"
+    assert _short(_LINEUP) == short
+    assert _short(_OPPONENT) == "random-v1"
+    markdown = (out / "summary.md").read_text().splitlines()
+    escaped = short.replace("|", "\\|")
+    assert any(f"| {escaped} |" in line for line in markdown)
+    assert any(f"trained vs {escaped}, seed 1501, update 153" in line for line in markdown)
+    header_pipes = None
+    for line in markdown:
+        if not line.startswith("|"):
+            header_pipes = None
+        elif header_pipes is None:
+            header_pipes = _unescaped_pipes(line)
+        else:
+            assert _unescaped_pipes(line) == header_pipes, line
+    with (out / "learning_curve.csv").open(newline="") as handle:
+        trained_against = {row["report"]: row["trained_against"] for row in csv.DictReader(handle)}
+    assert trained_against == {"lineup": short, "random": "random-v1"}
