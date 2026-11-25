@@ -406,6 +406,128 @@ func TestHeuristicV2LearnerAim(t *testing.T) {
 	}
 }
 
+// TestHeuristicV2Epsilon checks the epsilon dial: at 1 v2 plays exactly like
+// random-v1, at 0 it never rolls the die, and in between a game replays
+// exactly from its seed.
+func TestHeuristicV2Epsilon(t *testing.T) {
+	v2 := func(t *testing.T, spec string) Factory {
+		t.Helper()
+		factory, err := ParseFactory(HeuristicV2Default + spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return factory
+	}
+
+	t.Run("epsilon=1 plays exactly like random-v1 with the same settings and seed", func(t *testing.T) {
+		pairs := []struct{ v2, random string }{
+			// The epsilon_* defaults are the pinned random-v1 settings.
+			{",epsilon=1", "random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2"},
+			// Custom epsilon_* settings become random-v1's settings.
+			{",epsilon=1,epsilon_launch_probability=1,epsilon_min_fraction=0.5", "random-v1:launch_probability=1,max_fraction=0.8,min_fraction=0.5"},
+		}
+		for _, pair := range pairs {
+			random, err := ParseFactory(pair.random)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// random-v1 plays seat 0, and the epsilon=1 v2 is asked on the
+			// same boards with the same seed: every decision must match.
+			want := playSeatZero(t, random, 7, nil)
+			got := playSeatZero(t, random, 7, v2(t, pair.v2))
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s decided differently from %s", pair.v2, pair.random)
+			}
+			if countLaunches(want) == 0 {
+				t.Fatalf("%s never launched, so the comparison proves nothing", pair.random)
+			}
+		}
+	})
+
+	t.Run("epsilon=0 never rolls the die", func(t *testing.T) {
+		for _, tt := range []struct {
+			spec    string
+			wantRNG bool
+		}{{"", false}, {",epsilon=0.5", true}} {
+			created, err := v2(t, tt.spec).New(context.Background(), AgentInit{AgentSeed: 7})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hasRNG := created.(*HeuristicV2Agent).rng != nil; hasRNG != tt.wantRNG {
+				t.Errorf("spec %q: has a random source = %v, want %v", tt.spec, hasRNG, tt.wantRNG)
+			}
+		}
+	})
+
+	t.Run("epsilon=0.5 replays from its seed", func(t *testing.T) {
+		half := v2(t, ",epsilon=0.5")
+		first := playSeatZero(t, half, 7, nil)
+		if again := playSeatZero(t, half, 7, nil); !reflect.DeepEqual(again, first) {
+			t.Fatal("the same seed played a different game")
+		}
+		if other := playSeatZero(t, half, 8, nil); reflect.DeepEqual(other, first) {
+			t.Fatal("seeds 7 and 8 played the same game, so the seed isn't used")
+		}
+		if countLaunches(first) == 0 {
+			t.Fatal("epsilon=0.5 never launched")
+		}
+	})
+}
+
+// playSeatZero plays the first 60 turns of a four-player game in which seat 0
+// is played by player, seeded with seed, and the other seats hold. It returns
+// seat 0's moves, turn by turn. When shadow is set, a second agent with the
+// same seed is asked on each of the same boards, and its moves are returned
+// instead; the game itself still follows player's moves.
+func playSeatZero(t *testing.T, player Factory, seed int64, shadow Factory) [][]game.Action {
+	t.Helper()
+	ctx := context.Background()
+	g, err := scenario.GeneratorV2{FourPlayer: true}.New(1000000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAgent := func(factory Factory) Agent {
+		created, err := factory.New(ctx, AgentInit{PlayerID: 0, AgentSeed: seed})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return created
+	}
+	playing := newAgent(player)
+	asked := playing
+	if shadow != nil {
+		asked = newAgent(shadow)
+	}
+
+	var moves [][]game.Action
+	for !g.Finished() && g.Turn < 60 {
+		decision, err := playing.Decide(ctx, TurnRequest{PlayerID: 0, View: NewView(g)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorded := decision
+		if shadow != nil {
+			if recorded, err = asked.Decide(ctx, TurnRequest{PlayerID: 0, View: NewView(g)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		moves = append(moves, recorded.Actions)
+		if err := g.AdvanceTurn(decision.Actions); err != nil {
+			t.Fatalf("turn %d: the engine rejected the moves: %v", g.Turn, err)
+		}
+	}
+	return moves
+}
+
+// countLaunches is the number of launches in a game's moves.
+func countLaunches(moves [][]game.Action) int {
+	launches := 0
+	for _, turn := range moves {
+		launches += len(turn)
+	}
+	return launches
+}
+
 // TestHeuristicV2IsDeterministicAndLegal plays whole four-player games with
 // heuristic-v2 in every seat. Each decision is made twice on separate views
 // and must match, and the engine must accept every turn.
