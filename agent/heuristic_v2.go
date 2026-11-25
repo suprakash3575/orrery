@@ -39,6 +39,14 @@ import (
 // The forecast sees only fleets already flying, not launches other players
 // make later. The policy does not reinforce threatened bodies from elsewhere
 // or split a garrison between several targets.
+//
+// HeuristicV2Config's optional restrictions change some stages, so the bot can
+// play under the learner's controls:
+//
+//   - WholeGarrison (stages 2, 3 and 5): a body sends every ship or none.
+//     Reserve says whether a body that needs defenders holds, and
+//     GarrisonCost whether the score charges every ship sent or only those
+//     the capture needs.
 
 // HeuristicV2 is the stable identity of the prediction-based strategy.
 const HeuristicV2 = "heuristic-v2"
@@ -73,8 +81,12 @@ type arrival struct {
 type launchOption struct {
 	target body
 	ships  int // fleet size to send
-	aim    game.Aim
-	score  float64
+	// cost is the ships the score charges for this launch. It equals ships,
+	// except with WholeGarrison and GarrisonCostNeeded, where it is only the
+	// ships the capture needs (see fleet).
+	cost  int
+	aim   game.Aim
+	score float64
 }
 
 // beats reports whether o is a better launch than other: a higher score, or
@@ -144,7 +156,17 @@ func (a *HeuristicV2Agent) Decide(ctx context.Context, request TurnRequest) (Dec
 		}
 		// Stage 2: defend. Launches leave before this turn's production, so
 		// only ships beyond the reserve may go.
-		available := source.ships - reserve(source, arrivals[source.id])
+		kept := reserve(source, arrivals[source.id])
+		available := source.ships - kept
+		if a.config.WholeGarrison {
+			// The learner can only hold or send every ship, so a body keeps
+			// all of them or none. With ReserveHold a body that needs
+			// defenders holds; with ReserveIgnore it may launch them all.
+			if kept > 0 && a.config.Reserve == ReserveHold {
+				continue
+			}
+			available = source.ships
+		}
 		if available <= 0 {
 			continue
 		}
@@ -307,11 +329,12 @@ func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, sour
 		}
 		distance := max(source.position.Distance(target.position)-source.radius-target.radius, 0)
 		turns := distance / view.FleetSpeed(available)
-		ships, ok := a.price(source.ownerID, target, arrivals[target.id], int(turns), available)
+		needed, ok := a.price(source.ownerID, target, arrivals[target.id], int(turns), available)
 		if !ok {
 			continue // out of reach of this force
 		}
-		candidates = append(candidates, launchOption{target: target, ships: ships, score: a.score(view, target, ships, turns)})
+		ships, cost := a.fleet(needed, available)
+		candidates = append(candidates, launchOption{target: target, ships: ships, cost: cost, score: a.score(view, target, cost, turns)})
 	}
 	// Best first, lower ID on equal scores; the stable sort keeps body order.
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].score > candidates[j].score })
@@ -337,6 +360,10 @@ func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, sour
 // time LeadAim reports. A fleet's speed depends on its size, so if the real
 // arrival needs more ships than the estimate, it aims once more with that many
 // and accepts only if they then suffice.
+//
+// With WholeGarrison the fleet is already every available ship, and price
+// never asks for more than available, so the first attempt always suffices:
+// the fleet is never resized. Only its cost is re-priced at the real arrival.
 func (a *HeuristicV2Agent) aim(view View, predictor *game.Predictor, source body, available int, c launchOption, incoming []arrival) (launchOption, bool) {
 	ships := c.ships
 	for range 2 {
@@ -351,11 +378,35 @@ func (a *HeuristicV2Agent) aim(view View, predictor *game.Predictor, source body
 			return launchOption{}, false
 		}
 		if needed <= ships {
-			return launchOption{target: c.target, ships: ships, aim: aim, score: a.score(view, c.target, ships, aim.Turns)}, true
+			// v2 sends and charges the fleet it aimed, which may be more than
+			// needed. A whole-garrison fleet is charged as fleet says.
+			cost := ships
+			if a.config.WholeGarrison {
+				ships, cost = a.fleet(needed, available)
+			}
+			return launchOption{target: c.target, ships: ships, cost: cost, aim: aim, score: a.score(view, c.target, cost, aim.Turns)}, true
 		}
 		ships = needed
 	}
 	return launchOption{}, false
+}
+
+// fleet is the launch for a capture priced at needed ships from a source
+// that can send available: the ships sent, and the ships the score charges.
+//
+// v2 sends and charges exactly what the capture needs. WholeGarrison sends
+// every available ship. It charges them all with GarrisonCostSent, or only
+// those needed with GarrisonCostNeeded, because the rest land on the captured
+// body as its new garrison and are not spent.
+func (a *HeuristicV2Agent) fleet(needed, available int) (ships, cost int) {
+	switch {
+	case !a.config.WholeGarrison:
+		return needed, needed
+	case a.config.GarrisonCost == GarrisonCostNeeded:
+		return available, needed
+	default:
+		return available, available
+	}
 }
 
 // price is how many ships to send so that a fleet landing on target in
@@ -378,10 +429,10 @@ func (a *HeuristicV2Agent) price(player int, target body, incoming []arrival, se
 }
 
 // score is the production a capture gains over the turns left after the
-// fleet lands, minus the ships it costs; both are counts of ships. A comet
-// produces only until it leaves the board, and taking a player's body counts
-// 1+EnemyBonus times.
-func (a *HeuristicV2Agent) score(view View, target body, ships int, turns float64) float64 {
+// fleet lands, minus cost, the ships it is charged for; both are counts of
+// ships. A comet produces only until it leaves the board, and taking a
+// player's body counts 1+EnemyBonus times.
+func (a *HeuristicV2Agent) score(view View, target body, cost int, turns float64) float64 {
 	left := float64(view.Config.MaxTurns - view.Turn)
 	for _, comet := range view.Comets {
 		if comet.ID == target.id {
@@ -392,5 +443,5 @@ func (a *HeuristicV2Agent) score(view View, target body, ships int, turns float6
 	if target.ownerID != game.NeutralPlayer {
 		gain *= 1 + a.config.EnemyBonus
 	}
-	return gain - float64(ships)
+	return gain - float64(cost)
 }
