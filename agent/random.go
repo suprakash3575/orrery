@@ -41,21 +41,8 @@ type RandomFactory struct {
 
 // NewRandomFactory validates a random strategy before any match begins.
 func NewRandomFactory(config RandomConfig) (*RandomFactory, error) {
-	values := []struct {
-		name  string
-		value float64
-	}{
-		{"launch_probability", config.LaunchProbability},
-		{"min_fraction", config.MinFraction},
-		{"max_fraction", config.MaxFraction},
-	}
-	for _, candidate := range values {
-		if !finite(candidate.value) || candidate.value < 0 || candidate.value > 1 {
-			return nil, fmt.Errorf("%s must be finite and in [0,1]", candidate.name)
-		}
-	}
-	if config.MinFraction > config.MaxFraction {
-		return nil, fmt.Errorf("min_fraction must not exceed max_fraction")
+	if err := validateRandomConfig(config, ""); err != nil {
+		return nil, err
 	}
 
 	return &RandomFactory{
@@ -66,6 +53,30 @@ func NewRandomFactory(config RandomConfig) (*RandomFactory, error) {
 			"max_fraction":       canonicalFloat(config.MaxFraction),
 		}),
 	}, nil
+}
+
+// validateRandomConfig checks random-v1's rule wherever it is configured.
+// prefix is put in front of each parameter name in errors, so a rule set
+// through other spec names, such as heuristic-v2's epsilon_* settings, is
+// reported under the names the spec actually used.
+func validateRandomConfig(config RandomConfig, prefix string) error {
+	values := []struct {
+		name  string
+		value float64
+	}{
+		{"launch_probability", config.LaunchProbability},
+		{"min_fraction", config.MinFraction},
+		{"max_fraction", config.MaxFraction},
+	}
+	for _, candidate := range values {
+		if !finite(candidate.value) || candidate.value < 0 || candidate.value > 1 {
+			return fmt.Errorf("%s%s must be finite and in [0,1]", prefix, candidate.name)
+		}
+	}
+	if config.MinFraction > config.MaxFraction {
+		return fmt.Errorf("%smin_fraction must not exceed %smax_fraction", prefix, prefix)
+	}
+	return nil
 }
 
 // Spec returns the canonical validated configuration.
