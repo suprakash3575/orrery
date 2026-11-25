@@ -253,6 +253,102 @@ func TestHeuristicV2DecisionsOnSmallBoards(t *testing.T) {
 	}
 }
 
+// TestHeuristicV2WholeGarrison checks whole_garrison, and the reserve and
+// garrison_cost settings that refine it, on small boards built like
+// TestHeuristicV2DecisionsOnSmallBoards's.
+func TestHeuristicV2WholeGarrison(t *testing.T) {
+	mine := func(id int, x, y float64, ships int) game.Planet {
+		return game.Planet{ID: id, OwnerID: 0, Ships: ships, Production: 1, Position: game.Vec2{X: x, Y: y}}
+	}
+	neutral := func(id int, x, y float64, ships int) game.Planet {
+		return game.Planet{ID: id, OwnerID: game.NeutralPlayer, Ships: ships, Production: 3, Position: game.Vec2{X: x, Y: y}}
+	}
+	// plain is a board where planet 1 can take planet 2 with 11 ships.
+	plain := func(ships int) []game.Planet {
+		return []game.Planet{mine(1, 20, 20, ships), neutral(2, 30, 20, 10)}
+	}
+	// threatened is planet 1 with 30 ships, and 28 enemy ships landing on it
+	// in its sixth turn, so normal v2 keeps 22 of them at home.
+	threatened := []game.Planet{mine(1, 20, 20, 30), neutral(2, 20, 40, 10)}
+	threat := []game.Fleet{{ID: 10, OwnerID: 1, Ships: 28, Position: game.Vec2{X: 35, Y: 20},
+		Velocity: game.Vec2{X: -game.FleetSpeed(28, 6)}, Angle: math.Pi, LaunchTurn: -1}}
+
+	whole := func(reserve ReserveRule, cost GarrisonCost) HeuristicV2Config {
+		return HeuristicV2Config{Margin: 0, EnemyBonus: 1, Candidates: 4, WholeGarrison: true, Reserve: reserve, GarrisonCost: cost}
+	}
+	tests := []struct {
+		name    string
+		config  HeuristicV2Config
+		planets []game.Planet
+		fleets  []game.Fleet
+		// turn is how many of the board's 500 turns are already played.
+		turn int
+		// want lists the expected launches as source → ships, in order.
+		want [][2]int
+	}{
+		{
+			name:    "sends every ship, not only the 11 needed",
+			config:  whole(ReserveHold, GarrisonCostSent),
+			planets: plain(50),
+			want:    [][2]int{{1, 50}},
+		},
+		{
+			name:    "reserve=hold holds a body that needs defenders",
+			config:  whole(ReserveHold, GarrisonCostSent),
+			planets: threatened,
+			fleets:  threat,
+		},
+		{
+			name:    "reserve=ignore launches every ship anyway",
+			config:  whole(ReserveIgnore, GarrisonCostSent),
+			planets: threatened,
+			fleets:  threat,
+			want:    [][2]int{{1, 30}},
+		},
+		{
+			// With 20 turns left, planet 2's production gains more than the
+			// 11 ships the capture needs, but less than the 100 sent.
+			name:    "garrison_cost=sent holds when the ships sent outweigh the gain",
+			config:  whole(ReserveHold, GarrisonCostSent),
+			planets: plain(100),
+			turn:    480,
+		},
+		{
+			name:    "garrison_cost=needed launches when only the ships needed count",
+			config:  whole(ReserveHold, GarrisonCostNeeded),
+			planets: plain(100),
+			turn:    480,
+			want:    [][2]int{{1, 100}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			factory, err := NewHeuristicV2Factory(tt.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			g := smallV2Board(t, tt.planets, tt.fleets)
+			g.Turn = tt.turn
+			decision := decideV2(t, factory, g, 0)
+
+			var got [][2]int
+			for _, action := range decision.Actions {
+				got = append(got, [2]int{action.PlanetID, action.Ships})
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("launches (source, ships) = %v, want %v", got, tt.want)
+			}
+			// The whole garrison is aimed as the engine's LeadAim aims it.
+			for _, action := range decision.Actions {
+				if !aimedByLeadAim(g, action) {
+					t.Errorf("launch %+v is not a verified LeadAim heading", action)
+				}
+			}
+		})
+	}
+}
+
 // TestHeuristicV2IsDeterministicAndLegal plays whole four-player games with
 // heuristic-v2 in every seat. Each decision is made twice on separate views
 // and must match, and the engine must accept every turn.

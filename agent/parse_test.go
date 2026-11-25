@@ -26,6 +26,25 @@ func TestParseFactoryCanonicalizesValidSpecifications(t *testing.T) {
 			input:     "heuristic-v1:efficiency=0.5,economy=1,defense=0.10,aggression=1.2",
 			canonical: "heuristic-v1:aggression=1.2,defense=0.1,economy=1,efficiency=0.5",
 		},
+		{
+			// A setting at its default is left out, so the pinned spec keeps
+			// its exact identity however it is written.
+			name:      "heuristic-v2 settings at their defaults",
+			input:     "heuristic-v2:margin=0.1,enemy_bonus=1,candidates=4,whole_garrison=0,learner_aim=0,no_aim_check=0,epsilon=0",
+			canonical: HeuristicV2Default,
+		},
+		{
+			name:      "heuristic-v2 settings unordered",
+			input:     "heuristic-v2:no_aim_check=1,reserve=ignore,epsilon=0.25,learner_aim=1,garrison_cost=needed,whole_garrison=1,margin=0.1,epsilon_max_fraction=1,enemy_bonus=1,candidates=4",
+			canonical: "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.25,epsilon_max_fraction=1,garrison_cost=needed,learner_aim=1,margin=0.1,no_aim_check=1,reserve=ignore,whole_garrison=1",
+		},
+		{
+			// epsilon_launch_probability's default is the pinned random-v1
+			// value, so naming it changes nothing and it is left out.
+			name:      "heuristic-v2 epsilon setting at its default",
+			input:     "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1,epsilon=0.5,epsilon_launch_probability=0.3",
+			canonical: "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.5,margin=0.1",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -86,6 +105,15 @@ func TestParseFactoryRejectsInvalidSpecifications(t *testing.T) {
 		{"heuristic unknown parameter", "heuristic-v1:aggression=1,economy=1,efficiency=1,defense=0,extra=1"},
 		{"heuristic negative weight", "heuristic-v1:aggression=-1,economy=1,efficiency=1,defense=0"},
 		{"heuristic defense out of range", "heuristic-v1:aggression=1,economy=1,efficiency=1,defense=1.1"},
+		// heuristic-v2's settings: each one that would change nothing without
+		// another, and each value outside its allowed set.
+		{"heuristic-v2 garrison_cost without whole_garrison", "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1,garrison_cost=sent"},
+		{"heuristic-v2 no_aim_check without learner_aim", "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1,no_aim_check=1"},
+		{"heuristic-v2 epsilon setting without epsilon", "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1,epsilon_min_fraction=0.1"},
+		{"heuristic-v2 switch not 0 or 1", "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1,whole_garrison=2"},
+		{"heuristic-v2 unknown reserve rule", "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1,whole_garrison=1,reserve=maybe"},
+		{"heuristic-v2 epsilon out of range", "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1,epsilon=1.5"},
+		{"heuristic-v2 reversed epsilon fractions", "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1,epsilon=0.5,epsilon_min_fraction=0.9"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
