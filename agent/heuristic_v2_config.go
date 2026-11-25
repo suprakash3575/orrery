@@ -92,8 +92,8 @@ type HeuristicV2Config struct {
 	// 1+EnemyBonus. 0 values enemy and neutral bodies alike.
 	EnemyBonus float64
 	// Candidates is how many targets per source, best first by a
-	// straight-line estimate, are aimed with LeadAim. It bounds the cost of a
-	// turn; at least 1.
+	// straight-line estimate, are aimed ahead (see heuristic_v2.go). It bounds
+	// the cost of a turn; at least 1.
 	Candidates int
 
 	// WholeGarrison makes every launch send all of the source's ships, as the
@@ -109,9 +109,9 @@ type HeuristicV2Config struct {
 	// set.
 	Reserve ReserveRule
 	// LearnerAim aims each launch once with its chosen fleet, never resizing
-	// it, and fires at the target's current centre when LeadAim finds no
-	// heading, as the learner's decoder does. False keeps v2's aiming: up to
-	// two attempts, and a target with no verified aim is skipped.
+	// it, and aims straight when it can't aim ahead, as the learner's decoder
+	// does (see heuristic_v2.go for both terms). False keeps v2's aiming: up
+	// to two attempts, and a target it can't aim ahead at is skipped.
 	LearnerAim bool
 	// NoAimCheck commits to a target before aiming, choosing by the
 	// straight-line estimate alone, so an aim result can neither cancel nor

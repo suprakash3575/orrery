@@ -19,8 +19,8 @@ import (
 //     to land on each owned body; only the rest may launch.
 //  3. Price: for each body it does not own, the ships needed to take it when
 //     a fleet would arrive (see price).
-//  4. Aim: ask LeadAim for that fleet size. A target with no verified aim is
-//     skipped; v2 never falls back to aiming at the current position.
+//  4. Aim: aim ahead with that fleet size (see below). A target it can't aim
+//     ahead at is skipped; v2 never aims straight.
 //  5. Choose: score each reachable target by the production it gains over
 //     the rest of the game against the ships it costs, and send exactly the
 //     ships needed.
@@ -34,11 +34,25 @@ import (
 //
 // Each source launches at most once per turn, and only when the best score is
 // positive. To keep a turn cheap, only a source's Candidates best targets by a
-// straight-line estimate are aimed with LeadAim.
+// straight-line estimate are aimed.
 //
 // The forecast sees only fleets already flying, not launches other players
 // make later. The policy does not reinforce threatened bodies from elsewhere
 // or split a garrison between several targets.
+//
+// Aiming, in this file's words:
+//
+//   - aim ahead: fly towards where the target will be when the fleet arrives,
+//     since bodies move. The engine's game.LeadAim works out that direction
+//     by simulating the flight, so it also says when the fleet lands. It can
+//     find no way to get there, for example when the path crosses the sun.
+//   - aim straight: fly towards where the target is now. Simple, but a moving
+//     target may have left by the time the fleet arrives, so the fleet can
+//     miss, or hit something else.
+//
+// Normal v2 only aims ahead, and skips a target it can't aim ahead at. The
+// learner aims ahead when it can and aims straight otherwise; LearnerAim makes
+// v2 do the same.
 //
 // HeuristicV2Config's optional restrictions change some stages, so the bot can
 // play under the learner's controls:
@@ -47,6 +61,10 @@ import (
 //     Reserve says whether a body that needs defenders holds, and
 //     GarrisonCost whether the score subtracts every ship sent as the
 //     launch's cost, or only those the capture needs.
+//   - LearnerAim (stage 4): aim once with the fleet already chosen, and aim
+//     straight when it can't aim ahead, instead of skipping the target.
+//   - NoAimCheck (stages 4 and 5): choose the target from the straight-line
+//     estimate alone, then aim it, so an aim result can't change the choice.
 
 // HeuristicV2 is the stable identity of the prediction-based strategy.
 const HeuristicV2 = "heuristic-v2"
@@ -371,11 +389,11 @@ func reserve(source body, incoming []arrival) int {
 // bestTarget runs stages 3–5 for one source and returns its best positive-
 // scoring launch, if any.
 //
-// It works in two passes because aiming is expensive. LeadAim simulates the
+// It works in two passes because aiming ahead is expensive: it simulates the
 // fleet's whole flight, while a straight-line estimate is one division:
 //
 //	pass 1, every target:  estimate travel time, price, cost and score
-//	pass 2, best few:      aim with LeadAim, re-price at the real arrival time,
+//	pass 2, best few:      aim ahead, re-price at the real arrival time,
 //	                       and keep the best positive score
 //
 // With Candidates = 3 and ten possible targets, ten are estimated but only
@@ -384,7 +402,7 @@ func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, sour
 	bodies []body, arrivals map[int][]arrival, claimed map[int]bool) (launchOption, bool) {
 	// Pass 1: rank every target by a straight-line estimate at the speed of
 	// the whole available force, which is cheap. Only the best few are then
-	// aimed with LeadAim, which runs a full simulation each time.
+	// aimed ahead, which simulates a whole flight each time.
 	var candidates []launchOption
 	for _, target := range bodies {
 		// Own bodies aren't targets, and neither is one already being taken
@@ -406,6 +424,24 @@ func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, sour
 	}
 	// Best first, lower ID on equal scores; the stable sort keeps body order.
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].score > candidates[j].score })
+
+	// NoAimCheck: pick the target without aiming first, as the learner must.
+	// The learner chooses a target, and only afterwards is its fleet aimed,
+	// so it can't know whether the aim will work.
+	//
+	// So take pass 1's top-ranked target and launch at it if its score is
+	// above 0, aiming ahead if it can and straight if not; a failed aim
+	// never cancels the launch. Pass 2 is skipped, so Candidates has no
+	// effect.
+	if a.config.NoAimCheck {
+		if len(candidates) == 0 || candidates[0].score <= 0 {
+			return launchOption{}, false
+		}
+		chosen := candidates[0]
+		chosen.aim, _ = aimAheadOrStraight(predictor, source, chosen.target, chosen.ships)
+		return chosen, true
+	}
+
 	if len(candidates) > a.config.Candidates {
 		candidates = candidates[:a.config.Candidates]
 	}
@@ -428,10 +464,10 @@ func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, sour
 	return best, found
 }
 
-// aim verifies one candidate with LeadAim and re-prices it at the arrival
-// time LeadAim reports. A fleet's speed depends on its size, so if the real
-// arrival needs more ships than the estimate, it aims once more with that many
-// and accepts only if they then suffice.
+// aim aims one candidate ahead and re-prices it at the arrival time that
+// reports. A fleet's speed depends on its size, so if the real arrival needs
+// more ships than the estimate, it aims once more with that many and accepts
+// only if they then suffice.
 //
 // With WholeGarrison the fleet is already every available ship, and price
 // never asks for more than available, so the first attempt always suffices:
@@ -443,14 +479,19 @@ func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, sour
 //	attempt 1: aim 11 ships → lands in 6 turns; by then 13 are needed
 //	attempt 2: aim 13 ships → a different speed, lands in 6 turns; 13 suffice
 //
-// The launch is 13 ships on attempt 2's heading. If attempt 2 had needed
+// The launch is 13 ships in attempt 2's direction. If attempt 2 had needed
 // more than 13, the target would be dropped: resizing could go on forever,
 // because each new size changes the speed and so the arrival again.
+//
+// With LearnerAim, learnerAim aims instead.
 func (a *HeuristicV2Agent) aim(view View, predictor *game.Predictor, source body, available int, c launchOption, incoming []arrival) (launchOption, bool) {
+	if a.config.LearnerAim {
+		return a.learnerAim(view, predictor, source, available, c, incoming)
+	}
 	ships := c.ships
 	for range 2 {
-		// LeadAim finds the heading that meets the target where it will
-		// be, for a fleet of exactly this size. No heading found: skip.
+		// Aim ahead, for a fleet of exactly this size. If it can't aim
+		// ahead, v2 skips the target.
 		aim, ok := predictor.LeadAim(source.id, c.target.id, ships)
 		if !ok {
 			return launchOption{}, false
@@ -474,6 +515,72 @@ func (a *HeuristicV2Agent) aim(view View, predictor *game.Predictor, source body
 		ships = needed
 	}
 	return launchOption{}, false
+}
+
+// learnerAim aims a launch the way the learner's controls allow, for the
+// LearnerAim setting.
+//
+// The learner can't resize a fleet, and can't skip a target because aiming
+// ahead fails: it picks a target, then its decoder (mlenv.Decode) aims the
+// fleet it already chose. So this aims c's fleet once, as it is:
+//
+//   - It can aim ahead: check the fleet still captures the target when it
+//     actually lands. If it does, keep the launch; if not, drop the target,
+//     because the fleet size is fixed once chosen.
+//   - It can't aim ahead: keep the launch anyway, and aim straight.
+//
+// Example, with WholeGarrison: c sends all 50 ships at a target the
+// straight-line estimate says needs 11.
+//
+//	aimed ahead, lands in 6 turns, 13 needed then   → keep: 50 is enough
+//	aimed ahead, lands in 9 turns, 60 needed then   → drop: 50 is too few
+//	can't aim ahead                                 → keep, aimed straight
+//
+// v2's own aim would instead resize the fleet, or skip a target it can't aim
+// ahead at (see aim).
+func (a *HeuristicV2Agent) learnerAim(view View, predictor *game.Predictor, source body, available int, c launchOption, incoming []arrival) (launchOption, bool) {
+	aim, aimedAhead := aimAheadOrStraight(predictor, source, c.target, c.ships)
+	if !aimedAhead {
+		// Aiming straight simulates no flight, so there is no real arrival
+		// time to re-price at: keep pass 1's estimated price and score.
+		c.aim = aim
+		return c, true
+	}
+	// Re-price at the real arrival. Aim.Turns' whole part is the turn it
+	// lands in (its segment), as in aim.
+	needed, ok := a.price(source.ownerID, c.target, incoming, int(aim.Turns), available)
+	if !ok || needed > c.ships {
+		return launchOption{}, false // the fleet no longer captures
+	}
+	// Score at the real arrival. The cost is the fleet sent, except that a
+	// whole-garrison fleet's cost comes from fleet.
+	cost := c.ships
+	if a.config.WholeGarrison {
+		_, cost = a.fleet(needed, available)
+	}
+	return launchOption{target: c.target, ships: c.ships, cost: cost, aim: aim, score: a.score(view, c.target, cost, aim.Turns)}, true
+}
+
+// aimAheadOrStraight aims a fleet of ships from source at target the way the
+// learner's decoder does: ahead if it can, straight if not. aimedAhead
+// reports which.
+//
+//   - aimedAhead = true: the direction meets the target where it will be,
+//     and aim.Turns is when the fleet lands.
+//   - aimedAhead = false: the direction points at where the target is now,
+//     and aim.Turns is 0, because no flight was simulated.
+//
+// Both are computed exactly as mlenv.Decode computes them, so the bot's
+// launch and the decoder's are identical to the last bit.
+func aimAheadOrStraight(predictor *game.Predictor, source, target body, ships int) (aim game.Aim, aimedAhead bool) {
+	// game.LeadAim is the engine's aim-ahead helper.
+	if aim, ok := predictor.LeadAim(source.id, target.id, ships); ok {
+		return aim, true
+	}
+	// Aim straight: the angle of the line from the source's centre to the
+	// target's.
+	delta := target.position.Sub(source.position)
+	return game.Aim{Angle: math.Atan2(delta.Y, delta.X)}, false
 }
 
 // fleet returns the ships to send for a capture priced at needed ships, from

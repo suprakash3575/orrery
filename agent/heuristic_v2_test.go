@@ -246,7 +246,7 @@ func TestHeuristicV2DecisionsOnSmallBoards(t *testing.T) {
 			// Every launch is aimed exactly as the engine's LeadAim aims it.
 			for _, action := range decision.Actions {
 				if !aimedByLeadAim(g, action) {
-					t.Errorf("launch %+v is not a verified LeadAim heading", action)
+					t.Errorf("launch %+v is not aimed ahead as the engine's LeadAim aims it", action)
 				}
 			}
 		})
@@ -342,7 +342,7 @@ func TestHeuristicV2WholeGarrison(t *testing.T) {
 			// The whole garrison is aimed as the engine's LeadAim aims it.
 			for _, action := range decision.Actions {
 				if !aimedByLeadAim(g, action) {
-					t.Errorf("launch %+v is not a verified LeadAim heading", action)
+					t.Errorf("launch %+v is not aimed ahead as the engine's LeadAim aims it", action)
 				}
 			}
 		})
@@ -409,8 +409,9 @@ func decideV2(t *testing.T, factory Factory, g *game.Game, player int) Decision 
 	return decision
 }
 
-// aimedByLeadAim reports whether action's angle is the live game's verified
-// LeadAim heading for that source, target and fleet size, for some target.
+// aimedByLeadAim reports whether action is aimed ahead: whether its angle is
+// the live game's LeadAim direction for that source and fleet size, for some
+// target.
 func aimedByLeadAim(g *game.Game, action game.Action) bool {
 	for _, p := range g.Planets {
 		if aim, ok := g.LeadAim(action.PlanetID, p.ID, action.Ships); ok && aim.Angle == action.Angle {
