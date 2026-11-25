@@ -55,7 +55,70 @@ const HeuristicV2Default = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
 // landing later is ignored for defense, pricing and claims.
 const heuristicV2LookAhead = 100
 
-// HeuristicV2Config holds heuristic-v2's tunable weights.
+// heuristicV2DefaultRandomMove is the rule for Epsilon's random moves when a
+// spec sets none: the pinned random-v1 opponent's settings, so a random move
+// is then exactly the move that opponent would make.
+var heuristicV2DefaultRandomMove = RandomConfig{
+	LaunchProbability: 0.3,
+	MinFraction:       0.2,
+	MaxFraction:       0.8,
+}
+
+// GarrisonCost says which ships a whole-garrison launch is charged for when
+// heuristic-v2 scores it. It matters only with WholeGarrison.
+type GarrisonCost int
+
+const (
+	// GarrisonCostSent charges every ship sent, as heuristic-v2 always has.
+	GarrisonCostSent GarrisonCost = iota
+	// GarrisonCostNeeded charges only the ships the capture needs, margin
+	// included. The rest land on the captured body and become its garrison,
+	// so they are not lost.
+	GarrisonCostNeeded
+)
+
+// String returns the spec spelling: "sent" or "needed".
+func (c GarrisonCost) String() string {
+	switch c {
+	case GarrisonCostSent:
+		return "sent"
+	case GarrisonCostNeeded:
+		return "needed"
+	default:
+		return fmt.Sprintf("GarrisonCost(%d)", int(c))
+	}
+}
+
+// ReserveRule says what a whole-garrison bot does at a body that, by the
+// forecast, needs defenders at home. It matters only with WholeGarrison.
+type ReserveRule int
+
+const (
+	// ReserveHold launches nothing from such a body this turn.
+	ReserveHold ReserveRule = iota
+	// ReserveIgnore launches the whole garrison anyway.
+	ReserveIgnore
+)
+
+// String returns the spec spelling: "hold" or "ignore".
+func (r ReserveRule) String() string {
+	switch r {
+	case ReserveHold:
+		return "hold"
+	case ReserveIgnore:
+		return "ignore"
+	default:
+		return fmt.Sprintf("ReserveRule(%d)", int(r))
+	}
+}
+
+// HeuristicV2Config holds heuristic-v2's tunable weights and its optional
+// restrictions.
+//
+// The restrictions make the bot play under the learner's controls (see
+// mlenv.Decode) or weaken it on purpose. Every one has a zero value that
+// keeps v2's own behaviour, so a config that sets none plays exactly as v2
+// always has.
 type HeuristicV2Config struct {
 	// Margin is the fraction of the bare minimum sent on top of it, so a
 	// slightly wrong estimate still captures. 0 sends exactly the minimum
@@ -69,15 +132,51 @@ type HeuristicV2Config struct {
 	// straight-line estimate, are aimed with LeadAim. It bounds the cost of a
 	// turn; at least 1.
 	Candidates int
+
+	// WholeGarrison makes every launch send all of the source's ships, as the
+	// learner's decoder does. The bot can still hold. False sends v2's own
+	// priced fleet.
+	WholeGarrison bool
+	// GarrisonCost is which ships a whole-garrison launch is charged for in
+	// its score. It must be GarrisonCostSent unless WholeGarrison is set.
+	GarrisonCost GarrisonCost
+	// Reserve is what a whole-garrison bot does when the forecast says a
+	// body needs defenders. It must be ReserveHold unless WholeGarrison is
+	// set.
+	Reserve ReserveRule
+	// LearnerAim aims each launch once with its chosen fleet, never resizing
+	// it, and fires at the target's current centre when LeadAim finds no
+	// heading, as the learner's decoder does. False keeps v2's aiming: up to
+	// two attempts, and a target with no verified aim is skipped.
+	LearnerAim bool
+	// NoAimCheck commits to a target before aiming, choosing by the
+	// straight-line estimate alone, so an aim result can neither cancel nor
+	// change the launch. It requires LearnerAim.
+	NoAimCheck bool
+	// Epsilon is the chance, drawn separately for each owned body each turn,
+	// that the body's move comes from random-v1's per-body rule instead of
+	// v2's. 0 keeps v2 deterministic; 1 makes every move random. In [0,1].
+	Epsilon float64
+	// RandomMove is the random-v1 rule Epsilon's moves use. Nil means the
+	// pinned random-v1 opponent's settings. It must be nil when Epsilon is 0,
+	// because it would change nothing.
+	RandomMove *RandomConfig
 }
 
 // HeuristicV2Factory is an immutable, validated heuristic-v2 configuration.
 type HeuristicV2Factory struct {
+	// config is the validated configuration. Its RandomMove, when set, points
+	// at the factory's own copy, so a caller can't change it afterwards.
 	config HeuristicV2Config
-	spec   Spec
+	// randomMove is the rule Epsilon's random moves use: config.RandomMove,
+	// or heuristicV2DefaultRandomMove when that is nil. Unused when Epsilon
+	// is 0.
+	randomMove RandomConfig
+	spec       Spec
 }
 
-// NewHeuristicV2Factory validates every weight before any match begins.
+// NewHeuristicV2Factory validates every weight and restriction before any
+// match begins.
 func NewHeuristicV2Factory(config HeuristicV2Config) (*HeuristicV2Factory, error) {
 	if !finite(config.Margin) || config.Margin < 0 {
 		return nil, fmt.Errorf("margin must be finite and non-negative")
@@ -88,14 +187,83 @@ func NewHeuristicV2Factory(config HeuristicV2Config) (*HeuristicV2Factory, error
 	if config.Candidates < 1 {
 		return nil, fmt.Errorf("candidates must be at least 1")
 	}
+	if config.GarrisonCost != GarrisonCostSent && config.GarrisonCost != GarrisonCostNeeded {
+		return nil, fmt.Errorf("garrison_cost %v is not a known rule", config.GarrisonCost)
+	}
+	if config.Reserve != ReserveHold && config.Reserve != ReserveIgnore {
+		return nil, fmt.Errorf("reserve %v is not a known rule", config.Reserve)
+	}
+	// A restriction that would change nothing is refused rather than
+	// ignored, so a spec never claims a setting the bot doesn't apply.
+	if !config.WholeGarrison && (config.GarrisonCost != GarrisonCostSent || config.Reserve != ReserveHold) {
+		return nil, fmt.Errorf("garrison_cost and reserve apply only with whole_garrison=1")
+	}
+	if config.NoAimCheck && !config.LearnerAim {
+		return nil, fmt.Errorf("no_aim_check requires learner_aim=1")
+	}
+	if !finite(config.Epsilon) || config.Epsilon < 0 || config.Epsilon > 1 {
+		return nil, fmt.Errorf("epsilon must be finite and in [0,1]")
+	}
+	randomMove := heuristicV2DefaultRandomMove
+	if config.RandomMove != nil {
+		if config.Epsilon == 0 {
+			return nil, fmt.Errorf("epsilon_* settings require epsilon above 0")
+		}
+		if err := validateRandomConfig(*config.RandomMove, "epsilon_"); err != nil {
+			return nil, err
+		}
+		randomMove = *config.RandomMove
+		config.RandomMove = &randomMove
+	}
 	return &HeuristicV2Factory{
-		config: config,
-		spec: NewSpec(HeuristicV2, map[string]string{
-			"margin":      canonicalFloat(config.Margin),
-			"enemy_bonus": canonicalFloat(config.EnemyBonus),
-			"candidates":  fmt.Sprint(config.Candidates),
-		}),
+		config:     config,
+		randomMove: randomMove,
+		spec:       NewSpec(HeuristicV2, heuristicV2SpecParameters(config, randomMove)),
 	}, nil
+}
+
+// heuristicV2SpecParameters builds the canonical parameters of a validated
+// config. The three weights are always written. Every other setting is
+// written only when it differs from its default, so a spec from before the
+// settings existed keeps its exact identity, and with it the seeds derived
+// from that identity and the results recorded under it.
+func heuristicV2SpecParameters(config HeuristicV2Config, randomMove RandomConfig) map[string]string {
+	parameters := map[string]string{
+		"margin":      canonicalFloat(config.Margin),
+		"enemy_bonus": canonicalFloat(config.EnemyBonus),
+		"candidates":  fmt.Sprint(config.Candidates),
+	}
+	if config.WholeGarrison {
+		parameters["whole_garrison"] = "1"
+	}
+	if config.GarrisonCost != GarrisonCostSent {
+		parameters["garrison_cost"] = config.GarrisonCost.String()
+	}
+	if config.Reserve != ReserveHold {
+		parameters["reserve"] = config.Reserve.String()
+	}
+	if config.LearnerAim {
+		parameters["learner_aim"] = "1"
+	}
+	if config.NoAimCheck {
+		parameters["no_aim_check"] = "1"
+	}
+	if config.Epsilon != 0 {
+		parameters["epsilon"] = canonicalFloat(config.Epsilon)
+	}
+	// randomMove differs from the default only when Epsilon is above 0,
+	// because validation refuses a RandomMove without it.
+	defaults := heuristicV2DefaultRandomMove
+	if randomMove.LaunchProbability != defaults.LaunchProbability {
+		parameters["epsilon_launch_probability"] = canonicalFloat(randomMove.LaunchProbability)
+	}
+	if randomMove.MinFraction != defaults.MinFraction {
+		parameters["epsilon_min_fraction"] = canonicalFloat(randomMove.MinFraction)
+	}
+	if randomMove.MaxFraction != defaults.MaxFraction {
+		parameters["epsilon_max_fraction"] = canonicalFloat(randomMove.MaxFraction)
+	}
+	return parameters
 }
 
 // Spec returns the canonical validated configuration.
