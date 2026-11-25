@@ -349,6 +349,63 @@ func TestHeuristicV2WholeGarrison(t *testing.T) {
 	}
 }
 
+// TestHeuristicV2LearnerAim checks learner_aim and no_aim_check on a board
+// where aiming ahead fails: the straight path from planet 1 at (20, 50) to
+// planet 2 at (80, 50) crosses the sun, so game.LeadAim finds no way there.
+// Normal v2 skips such a target; the learner, and v2 with its aim, aim
+// straight instead.
+func TestHeuristicV2LearnerAim(t *testing.T) {
+	planets := func(ships int) []game.Planet {
+		return []game.Planet{
+			{ID: 1, OwnerID: 0, Ships: ships, Production: 1, Position: game.Vec2{X: 20, Y: 50}},
+			{ID: 2, OwnerID: game.NeutralPlayer, Ships: 10, Production: 3, Position: game.Vec2{X: 80, Y: 50}},
+		}
+	}
+	// Aiming straight from (20, 50) at (80, 50) points along +x: angle 0.
+	straight := math.Atan2(50-50, 80-20)
+
+	base := HeuristicV2Config{Margin: 0, EnemyBonus: 1, Candidates: 4}
+	learnerAim := base
+	learnerAim.LearnerAim = true
+	noAimCheck := learnerAim
+	noAimCheck.NoAimCheck = true
+	wholeLearnerAim := learnerAim
+	wholeLearnerAim.WholeGarrison = true
+
+	tests := []struct {
+		name   string
+		config HeuristicV2Config
+		// want lists the expected launches as source → ships, in order.
+		want [][2]int
+	}{
+		{name: "normal v2 skips a target it can't aim ahead at", config: base},
+		{name: "learner_aim aims straight instead", config: learnerAim, want: [][2]int{{1, 11}}},
+		{name: "no_aim_check launches the top target, aimed straight", config: noAimCheck, want: [][2]int{{1, 11}}},
+		{name: "with whole_garrison, every ship goes, aimed straight", config: wholeLearnerAim, want: [][2]int{{1, 50}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			factory, err := NewHeuristicV2Factory(tt.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			g := smallV2Board(t, planets(50), nil)
+			decision := decideV2(t, factory, g, 0)
+
+			var got [][2]int
+			for _, action := range decision.Actions {
+				got = append(got, [2]int{action.PlanetID, action.Ships})
+				if action.Angle != straight {
+					t.Errorf("launch %+v: angle %v, want %v (aimed straight)", action, action.Angle, straight)
+				}
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("launches (source, ships) = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestHeuristicV2IsDeterministicAndLegal plays whole four-player games with
 // heuristic-v2 in every seat. Each decision is made twice on separate views
 // and must match, and the engine must accept every turn.
