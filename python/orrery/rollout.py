@@ -568,6 +568,11 @@ def collect_rollout(
         raise ValueError(f"gamma must be in [0, 1], got {gamma}")
     if not 0.0 <= lam <= 1.0:
         raise ValueError(f"lam must be in [0, 1], got {lam}")
+    # Put the games in a fixed order, sorted by environment ID, so row i of
+    # every tensor in this rollout always means the same game, whatever order
+    # ``episodes`` arrived in. This also stops with an error if the list is
+    # empty or names an environment twice. "initial episodes" only labels
+    # that error message.
     ordered_episodes = _ordered_episodes(episodes, "initial episodes")
     # Build both lookups in one pass over the ordered episodes.
     # ``active`` maps each environment ID to the episode currently playing in
@@ -908,13 +913,24 @@ def calculate_bootstrap_values(
     terminated: Tensor,
     truncated: Tensor,
 ) -> Tensor:
-    """Build the exact ``[turn, environment]`` next values consumed by GAE.
+    """Return the critic's estimate of what comes after each stored turn.
 
-    True terminals remain zero. Uninterrupted turns reuse the next stored
-    current-state value, while truncations and the final rollout boundary
-    evaluate their returned observations through the shared policy contract.
-    Bootstrap targets are always detached, including when this function is
-    called directly outside ``collect_rollout``.
+    GAE (gae.py) needs, for every turn t of every game, the critic's value of
+    the position *after* that turn: its ``next_values``. The result has shape
+    [turn, environment]. There are three cases:
+
+    | After turn t, the game... | Next value |
+    |---|---|
+    | ended (won, lost or tied) | 0: nothing more can happen |
+    | continues on the next stored turn | that turn's stored value, already computed when it was played, so it is reused |
+    | was cut off without ending, or the rollout stopped here | the critic is asked now, about the position the game was left in |
+
+    "Cut off without ending" is a truncation. Normal games never truncate
+    (see ``Truncated`` in mlenv/env.go). The last stored turn always needs
+    the critic, unless the game ended there, because no later turn was stored.
+
+    ``@torch.no_grad()`` keeps these values fixed: they are targets to learn
+    toward, so training must not change them through gradients.
     """
 
     next_values = torch.zeros_like(values)
@@ -925,10 +941,14 @@ def calculate_bootstrap_values(
         same_episode = ~(terminated[:-1] | truncated[:-1])
         next_values[:-1] = torch.where(same_episode, values[1:], next_values[:-1])
 
-    # Truncations still have a future but their returned observation is not the
-    # reset state on the following row. The final rollout row also has no later
-    # stored value. Evaluate precisely those observations; true terminals keep
-    # the exact zero already installed above.
+    # The third case in the docstring: positions the critic must be asked
+    # about now.
+    # - A truncated game still had a future, but its next stored row is the
+    #   first turn of a fresh game started after the reset, so that row's
+    #   value belongs to a different game and can't be reused.
+    # - The last stored turn has no next row at all, so every game that
+    #   didn't end on it needs a value.
+    # Games that ended keep the 0 they were given at the start.
     needs_evaluation = truncated.clone()
     needs_evaluation[-1] |= ~terminated[-1]
     flat_indices = needs_evaluation.reshape(-1).nonzero().flatten()
