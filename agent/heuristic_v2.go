@@ -190,7 +190,18 @@ func (a *HeuristicV2Agent) Decide(ctx context.Context, request TurnRequest) (Dec
 
 // predictedArrivals groups the landings that hand ships to a body by that
 // body's ID, each body's list in landing order (segment, then fleet order).
+//
+// A landing names only a fleet and where and when it lands, so the fleet's
+// owner and size are looked up from the view. For example, if fleet 7 (player
+// 1, 15 ships) lands on body 3 in segment 2, and fleet 9 (player 0, 4 ships)
+// lands there in segment 0, the result has
+//
+//	3 → [{owner 0, 4 ships, segment 0}, {owner 1, 15 ships, segment 2}]
+//
+// Everything that later reasons about a body's future (forecast, reserve,
+// price) reads only that body's list.
 func predictedArrivals(view View, landings []game.Landing) map[int][]arrival {
+	// Look up each fleet's owner and size once, by fleet ID.
 	owners := make(map[int]int, len(view.Fleets))
 	ships := make(map[int]int, len(view.Fleets))
 	for _, fleet := range view.Fleets {
@@ -204,6 +215,9 @@ func predictedArrivals(view View, landings []game.Landing) map[int][]arrival {
 		id := landing.Hit.BodyID
 		arrivals[id] = append(arrivals[id], arrival{owner: owners[landing.FleetID], ships: ships[landing.FleetID], segment: landing.Segment})
 	}
+	// Landings arrive in fleet order, not time order. Sort each body's list
+	// by segment; the stable sort keeps fleet order within one segment, so
+	// the lists never depend on map iteration.
 	for _, list := range arrivals {
 		sort.SliceStable(list, func(i, j int) bool { return list[i].segment < list[j].segment })
 	}
@@ -268,22 +282,45 @@ func sharedLandings(view View, prediction *FleetPrediction, horizon int) ([]game
 //
 // The forecast knows only fleets already flying, plus extra. Launches players
 // make on later turns are unknowable from this observation.
+//
+// Example: player 0 owns a body with a garrison of 10 and production 2, and
+// 15 enemy ships land in segment 1, the second turn from now.
+//
+//	segment 1: production twice (turns 0 and 1)  10 + 2×2 = 14 ships
+//	           battle: 15 attackers against 14    the enemy wins with 1
+//
+// forecast returns the enemy as owner, and held = false. With a garrison of
+// 13 instead, 13 + 4 = 17 beats 15, so player 0 keeps it with 2.
+//
+// Three callers ask it different questions:
+//
+//	Decide   (no extra, whole list)      who owns a target once every fleet now
+//	                                     flying has landed? (claims)
+//	reserve  (no extra, whole list)      is this garrison enough to keep my body?
+//	price    (extra = my new fleet,      does a fleet of this size capture the
+//	          stop after its battle)     target when it lands?
 func forecast(b body, garrison int, incoming []arrival, extra arrival, through int) (owner int, held bool) {
+	// Stage 1: the landings to replay, with extra added in time order.
 	landings := incoming
 	if extra.ships > 0 {
-		// Insert extra after the landings of earlier or equal segments, so the
-		// list stays in landing order. A copy keeps incoming untouched.
+		// incoming is sorted by segment, so a binary search finds at, the
+		// first landing later than extra: segments [0 1 1 3] with extra in
+		// segment 1 give at = 3, and the list [0 1 1 extra 3]. Order within a
+		// segment doesn't change the battle, which adds them all up.
 		at := sort.Search(len(incoming), func(i int) bool { return incoming[i].segment > extra.segment })
 		landings = append(append(append(make([]arrival, 0, len(incoming)+1), incoming[:at]...), extra), incoming[at:]...)
 	}
 
+	// Stage 2: replay one battle per segment that has landings. Turns with
+	// no landing need no battle; their production is added in one step at
+	// the next battle, which is why produced tracks how much is already in.
 	owner, ships, held := b.ownerID, garrison, true
 	produced := 0 // turns of production already added
 	forces := map[int]int{}
 	for i := 0; i < len(landings); {
 		segment := landings[i].segment
 		if through >= 0 && segment > through {
-			break
+			break // later landings can't change the battle price asks about
 		}
 		// A body produces once per turn before that turn's combat, so by the
 		// battle of segment s it has produced s+1 times since now.
@@ -291,11 +328,16 @@ func forecast(b body, garrison int, incoming []arrival, extra arrival, through i
 			ships += b.production * (segment + 1 - produced)
 		}
 		produced = segment + 1
+		// Add up every fleet landing this segment by owner; two fleets of
+		// one player join forces. game.Battle then settles them and the
+		// garrison exactly as the engine will.
 		clear(forces)
 		for ; i < len(landings) && landings[i].segment == segment; i++ {
 			forces[landings[i].owner] += landings[i].ships
 		}
 		owner, ships = game.Battle(owner, ships, forces)
+		// Losing the body even once counts as not held, even if a later
+		// landing wins it back: the defender lost its production meanwhile.
 		if owner != b.ownerID {
 			held = false
 		}
@@ -308,7 +350,18 @@ func forecast(b body, garrison int, incoming []arrival, extra arrival, through i
 // the body. More ships at home can only help, so a binary search finds that
 // number. A body that can't be held even with every ship keeps them all and
 // fights.
+//
+// Example, with forecast's body (production 2, 15 enemy ships landing in
+// segment 1, so the garrison grows by 4 before the battle):
+//
+//	kept 10 → 14 against 15: lost
+//	kept 11 → 15 against 15: a tie, which leaves the owner in place: held
+//
+// so reserve is 11. With 30 ships, 19 may launch. A body with no landings
+// predicted needs nothing kept: reserve is 0.
 func reserve(source body, incoming []arrival) int {
+	// sort.Search tries kept = 0 … ships-1 and returns the smallest kept for
+	// which the body is held, or ships if none is enough.
 	return sort.Search(source.ships, func(kept int) bool {
 		_, held := forecast(source, kept, incoming, arrival{}, -1)
 		return held
@@ -317,16 +370,31 @@ func reserve(source body, incoming []arrival) int {
 
 // bestTarget runs stages 3–5 for one source and returns its best positive-
 // scoring launch, if any.
+//
+// It works in two passes because aiming is expensive. LeadAim simulates the
+// fleet's whole flight, while a straight-line estimate is one division:
+//
+//	pass 1, every target:  estimate travel time, price, cost and score
+//	pass 2, best few:      aim with LeadAim, re-price at the real arrival time,
+//	                       and keep the best positive score
+//
+// With Candidates = 3 and ten possible targets, ten are estimated but only
+// three are aimed.
 func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, source body, available int,
 	bodies []body, arrivals map[int][]arrival, claimed map[int]bool) (launchOption, bool) {
-	// First rank every target by a straight-line estimate at the speed of
+	// Pass 1: rank every target by a straight-line estimate at the speed of
 	// the whole available force, which is cheap. Only the best few are then
 	// aimed with LeadAim, which runs a full simulation each time.
 	var candidates []launchOption
 	for _, target := range bodies {
+		// Own bodies aren't targets, and neither is one already being taken
+		// by this player's fleets (see Decide's claims).
 		if target.ownerID == source.ownerID || claimed[target.id] {
 			continue
 		}
+		// Fleets leave from the source's edge and land on the target's
+		// edge, so the gap between the two edges is the distance flown.
+		// A bigger fleet is slower, so the speed is that of available ships.
 		distance := max(source.position.Distance(target.position)-source.radius-target.radius, 0)
 		turns := distance / view.FleetSpeed(available)
 		needed, ok := a.price(source.ownerID, target, arrivals[target.id], int(turns), available)
@@ -342,6 +410,10 @@ func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, sour
 		candidates = candidates[:a.config.Candidates]
 	}
 
+	// Pass 2: aim the shortlist. The estimate's order is only a guess, since
+	// a real flight can take longer and need more ships, so every shortlisted
+	// target is aimed and the best aimed score wins. A target that can't be
+	// aimed, or no longer pays for itself, drops out.
 	var best launchOption
 	found := false
 	for _, c := range candidates {
@@ -364,9 +436,21 @@ func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, sour
 // With WholeGarrison the fleet is already every available ship, and price
 // never asks for more than available, so the first attempt always suffices:
 // the fleet is never resized. Only its cost is re-priced at the real arrival.
+//
+// Example: the straight-line estimate said 11 ships, landing in 4 turns. The
+// target moves, so the real flight is longer:
+//
+//	attempt 1: aim 11 ships → lands in 6 turns; by then 13 are needed
+//	attempt 2: aim 13 ships → a different speed, lands in 6 turns; 13 suffice
+//
+// The launch is 13 ships on attempt 2's heading. If attempt 2 had needed
+// more than 13, the target would be dropped: resizing could go on forever,
+// because each new size changes the speed and so the arrival again.
 func (a *HeuristicV2Agent) aim(view View, predictor *game.Predictor, source body, available int, c launchOption, incoming []arrival) (launchOption, bool) {
 	ships := c.ships
 	for range 2 {
+		// LeadAim finds the heading that meets the target where it will
+		// be, for a fleet of exactly this size. No heading found: skip.
 		aim, ok := predictor.LeadAim(source.id, c.target.id, ships)
 		if !ok {
 			return launchOption{}, false
@@ -400,6 +484,12 @@ func (a *HeuristicV2Agent) aim(view View, predictor *game.Predictor, source body
 // WholeGarrison sends every available ship. With GarrisonCostSent the cost is
 // every ship sent; with GarrisonCostNeeded it is only those needed, because
 // the rest land on the captured body as its new garrison and are not spent.
+//
+// Example: the capture needs 11 and the source has 50 available.
+//
+//	normal v2                        sends 11, cost 11
+//	WholeGarrison, GarrisonCostSent    sends 50, cost 50
+//	WholeGarrison, GarrisonCostNeeded  sends 50, cost 11
 func (a *HeuristicV2Agent) fleet(needed, available int) (ships, cost int) {
 	switch {
 	case !a.config.WholeGarrison:
@@ -419,13 +509,25 @@ func (a *HeuristicV2Agent) fleet(needed, available int) (ships, cost int) {
 // the target, fighting alongside every other fleet predicted to land by then.
 // A bigger fleet can only do better, so a binary search finds it. Margin then
 // adds a fraction of that minimum, as far as available allows.
+//
+// Example: a neutral target with 10 ships, which never produces, and no other
+// fleet landing on it. A fleet must strictly outnumber the garrison to take
+// it, so 10 ships tie and leave it neutral, and 11 take it: the minimum is 11.
+// If an enemy fleet of 6 lands in the same segment, the two attacking fleets
+// fight first, so the minimum becomes 6 + 11 = 17.
+//
+// Margin covers small forecast errors: the result is the minimum plus
+// ceil(Margin × minimum), but never more than available.
 func (a *HeuristicV2Agent) price(player int, target body, incoming []arrival, segment, available int) (int, bool) {
+	// sort.Search tries fleets of i+1 = 1 … available ships and returns the
+	// first i whose fleet captures; it returns available when none does,
+	// which makes minimum = available + 1, too many.
 	minimum := 1 + sort.Search(available, func(i int) bool {
 		owner, _ := forecast(target, target.ships, incoming, arrival{owner: player, ships: i + 1, segment: segment}, segment)
 		return owner == player
 	})
 	if minimum > available {
-		return 0, false
+		return 0, false // out of reach of this force
 	}
 	return min(minimum+int(math.Ceil(a.config.Margin*float64(minimum))), available), true
 }
@@ -434,13 +536,27 @@ func (a *HeuristicV2Agent) price(player int, target body, incoming []arrival, se
 // fleet lands, minus cost, the ships the launch is counted as spending; both
 // are counts of ships. A comet produces only until it leaves the board, and
 // taking a player's body counts 1+EnemyBonus times.
+//
+// Example: 100 turns are left, the fleet lands in 4, the target produces 3
+// ships a turn, and the launch costs 11.
+//
+//	neutral target:  3 × (100 − 4) − 11           = 288 − 11 = 277
+//	enemy target:    3 × (100 − 4) × (1 + EnemyBonus) − 11
+//
+// An enemy body is worth more because taking it also stops its owner's
+// production. Near the end of the game the gain shrinks towards 0, so a
+// costly launch scores below 0 and the bot holds instead.
 func (a *HeuristicV2Agent) score(view View, target body, cost int, turns float64) float64 {
+	// Turns the captured body can still produce for: the rest of the game,
+	// or for a comet, until it leaves the board, if that is sooner.
 	left := float64(view.Config.MaxTurns - view.Turn)
 	for _, comet := range view.Comets {
 		if comet.ID == target.id {
 			left = min(left, float64(len(comet.Path)-1-comet.PathIndex))
 		}
 	}
+	// Production starts only once the fleet has landed, and a fleet landing
+	// after the last productive turn gains nothing.
 	gain := float64(target.production) * max(left-turns, 0)
 	if target.ownerID != game.NeutralPlayer {
 		gain *= 1 + a.config.EnemyBonus
