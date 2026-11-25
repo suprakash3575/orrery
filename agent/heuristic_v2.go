@@ -468,7 +468,14 @@ func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, sour
 		}
 		// Fleets leave from the source's edge and land on the target's
 		// edge, so the gap between the two edges is the distance flown.
-		// A bigger fleet is slower, so the speed is that of available ships.
+		//
+		// The estimate flies every available ship. Bigger fleets fly faster,
+		// up to a top speed (see game.FleetSpeed), so this is the fastest
+		// fleet the source can send and the earliest it could arrive. The
+		// fleet v2 actually sends is usually smaller, so slower: it lands
+		// later, when the target may have produced more ships, and aim
+		// re-prices it at that real arrival. With WholeGarrison the fleet
+		// is every available ship, so the estimate's speed is the real one.
 		distance := max(source.position.Distance(target.position)-source.radius-target.radius, 0)
 		turns := distance / view.FleetSpeed(available)
 		needed, ok := a.price(source.ownerID, target, arrivals[target.id], int(turns), available)
@@ -521,15 +528,18 @@ func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, sour
 }
 
 // aim aims one candidate ahead and re-prices it at the arrival time that
-// reports. A fleet's speed depends on its size, so if the real arrival needs
-// more ships than the estimate, it aims once more with that many and accepts
-// only if they then suffice.
+// reports. A fleet's speed depends on its size: bigger fleets fly faster (see
+// game.FleetSpeed). The estimate assumed every available ship, the fastest
+// fleet, so the smaller fleet actually sent lands later and may need more
+// ships by then. If so, it aims once more with that many and accepts only if
+// they then suffice.
 //
 // With WholeGarrison the fleet is already every available ship, and price
 // never asks for more than available, so the first attempt always suffices:
 // the fleet is never resized. Only its cost is re-priced at the real arrival.
 //
-// Example: the straight-line estimate said 11 ships, landing in 4 turns. The
+// Example: the straight-line estimate said 11 ships, landing in 4 turns. But
+// 11 ships fly slower than the whole force the estimate assumed, and the
 // target moves, so the real flight is longer:
 //
 //	attempt 1: aim 11 ships → lands in 6 turns; by then 13 are needed
