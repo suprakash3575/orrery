@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"slices"
 )
 
@@ -233,13 +234,19 @@ func heuristicV2SpecParameters(config HeuristicV2Config, randomMove RandomConfig
 // Spec returns the canonical validated configuration.
 func (factory *HeuristicV2Factory) Spec() Spec { return factory.spec }
 
-// New constructs a per-match heuristic-v2 agent. It keeps no state between
-// turns.
-func (factory *HeuristicV2Factory) New(ctx context.Context, _ AgentInit) (Agent, error) {
+// New constructs a per-match heuristic-v2 agent. Without Epsilon it keeps no
+// state between turns. With Epsilon it keeps a private random source, seeded
+// from init.AgentSeed, so concurrent matches can't disturb one another's draws
+// and every game replays exactly.
+func (factory *HeuristicV2Factory) New(ctx context.Context, init AgentInit) (Agent, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &HeuristicV2Agent{config: factory.config}, nil
+	agent := &HeuristicV2Agent{config: factory.config, randomMove: factory.randomMove}
+	if factory.config.Epsilon > 0 {
+		agent.rng = rand.New(rand.NewSource(init.AgentSeed))
+	}
+	return agent, nil
 }
 
 // heuristicV2Weights are the parameters every heuristic-v2 spec must name.

@@ -4,14 +4,15 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"sort"
 
 	"orrery/game"
 )
 
 // heuristic-v2's turn policy. Like v1 it sees only its View, uses no
-// randomness, and takes bodies in ID order, so one board always gives the
-// same moves. Unlike v1 it asks the engine's prediction helpers (see
+// randomness unless Epsilon is set, and takes bodies in ID order, so one board
+// always gives the same moves. Unlike v1 it asks the engine's prediction helpers (see
 // game.NewPredictor) where fleets will go:
 //
 //  1. Look ahead: predict where every fleet in flight lands, and when.
@@ -65,6 +66,12 @@ import (
 //     straight when it can't aim ahead, instead of skipping the target.
 //   - NoAimCheck (stages 4 and 5): choose the target from the straight-line
 //     estimate alone, then aim it, so an aim result can't change the choice.
+//   - Epsilon (before stage 2): a dial that makes v2 weaker on purpose.
+//     Every turn, before planning a planet it owns, v2 rolls a die. With
+//     chance Epsilon, that planet makes a random move (random-v1's rule)
+//     instead of v2's planned one. For example, Epsilon 0.25 means about one
+//     planet in four moves randomly each turn. 0 is normal v2, and 1 is fully
+//     random. It makes opponents that sit between random-v1 and normal v2.
 
 // HeuristicV2 is the stable identity of the prediction-based strategy.
 const HeuristicV2 = "heuristic-v2"
@@ -79,6 +86,13 @@ const heuristicV2LookAhead = 100
 // prediction helpers.
 type HeuristicV2Agent struct {
 	config HeuristicV2Config
+	// randomMove is the random-v1 rule Epsilon's random moves use (see
+	// HeuristicV2Factory.randomMove).
+	randomMove RandomConfig
+	// rng is this match's private random source, seeded from
+	// AgentInit.AgentSeed so a game replays exactly. It exists only when
+	// Epsilon is above 0; otherwise it is nil and v2 draws nothing.
+	rng *rand.Rand
 }
 
 // ID returns the versioned agent identity.
@@ -172,6 +186,16 @@ func (a *HeuristicV2Agent) Decide(ctx context.Context, request TurnRequest) (Dec
 		if source.ownerID != request.PlayerID || source.ships <= 0 {
 			continue
 		}
+		// Epsilon: roll the die for this planet. If it says "random", make
+		// random-v1's move here and skip v2's planning. A random launch
+		// doesn't mark its target as taken, so v2's other planets may still
+		// attack that target.
+		if a.randomTurn() {
+			if action, ok := randomMove(a.rng, a.randomMove, request.PlayerID, source); ok {
+				actions = append(actions, action)
+			}
+			continue
+		}
 		// Stage 2: defend. Launches leave before this turn's production, so
 		// only ships beyond the reserve may go.
 		kept := reserve(source, arrivals[source.id])
@@ -204,6 +228,38 @@ func (a *HeuristicV2Agent) Decide(ctx context.Context, request TurnRequest) (Dec
 		})
 	}
 	return Decision{Actions: actions}, nil
+}
+
+// randomTurn rolls the Epsilon die for one planet: true means this planet
+// makes a random move this turn.
+//
+// A random move is random-v1's move (see randomMove): no targets, no
+// planning. With the epsilon_* settings at their defaults it usually holds,
+// and sometimes sends a random share of the planet's ships in a random
+// direction, where they may hit nothing, a neutral planet or the sun. For a
+// planet with 100 ships, that might be "hold" this turn and "45 ships towards
+// 210°" the next.
+//
+// The die is a random number from 0 to 1, and the answer is "random" when it
+// is below Epsilon. With Epsilon 0.25, a roll of 0.1 says random and a roll of
+// 0.7 says plan as v2.
+//
+// It rolls once for every planet it is asked about, whatever the answer. So
+// which planets move randomly depends only on the seed, never on what v2
+// decided, and a game replays exactly.
+//
+// At Epsilon 0 and 1 the answer is always the same, so it doesn't roll. That
+// keeps Epsilon 1 exactly random-v1: random-v1 makes no such roll, so the
+// two draw the same numbers in the same order and make the same moves.
+func (a *HeuristicV2Agent) randomTurn() bool {
+	switch {
+	case a.config.Epsilon <= 0:
+		return false
+	case a.config.Epsilon >= 1:
+		return true
+	default:
+		return a.rng.Float64() < a.config.Epsilon
+	}
 }
 
 // predictedArrivals groups the landings that hand ships to a body by that

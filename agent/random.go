@@ -116,28 +116,42 @@ func (a *RandomAgent) Decide(ctx context.Context, request TurnRequest) (Decision
 		if source.ownerID != request.PlayerID || source.ships <= 0 {
 			continue
 		}
-		if a.rng.Float64() >= a.config.LaunchProbability {
-			continue
+		if action, ok := randomMove(a.rng, a.config, request.PlayerID, source); ok {
+			actions = append(actions, action)
 		}
-
-		fraction := a.config.MinFraction
-		if a.config.MinFraction < a.config.MaxFraction {
-			fraction += a.rng.Float64() * (a.config.MaxFraction - a.config.MinFraction)
-		}
-		ships := int(math.Round(fraction * float64(source.ships)))
-		if ships <= 0 {
-			continue
-		}
-		if ships > source.ships {
-			ships = source.ships
-		}
-
-		actions = append(actions, game.Action{
-			PlayerID: request.PlayerID,
-			PlanetID: source.id,
-			Ships:    ships,
-			Angle:    a.rng.Float64() * 2 * math.Pi,
-		})
 	}
 	return Decision{Actions: actions}, nil
+}
+
+// randomMove applies random-v1's rule to one owned source with ships, and
+// returns its launch, or false when it holds. heuristic-v2's Epsilon uses it
+// too, so a random move there is exactly random-v1's move.
+//
+// The draws come from rng in a fixed order, which is part of random-v1's
+// replay behaviour: the launch roll; then, only when launching, the fraction
+// roll (skipped when the fraction is fixed) and the angle roll (skipped when
+// the fraction rounds to zero ships).
+func randomMove(rng *rand.Rand, config RandomConfig, player int, source body) (game.Action, bool) {
+	if rng.Float64() >= config.LaunchProbability {
+		return game.Action{}, false
+	}
+
+	fraction := config.MinFraction
+	if config.MinFraction < config.MaxFraction {
+		fraction += rng.Float64() * (config.MaxFraction - config.MinFraction)
+	}
+	ships := int(math.Round(fraction * float64(source.ships)))
+	if ships <= 0 {
+		return game.Action{}, false
+	}
+	if ships > source.ships {
+		ships = source.ships
+	}
+
+	return game.Action{
+		PlayerID: player,
+		PlanetID: source.id,
+		Ships:    ships,
+		Angle:    rng.Float64() * 2 * math.Pi,
+	}, true
 }
