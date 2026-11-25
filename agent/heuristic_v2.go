@@ -45,8 +45,8 @@ import (
 //
 //   - WholeGarrison (stages 2, 3 and 5): a body sends every ship or none.
 //     Reserve says whether a body that needs defenders holds, and
-//     GarrisonCost whether the score charges every ship sent or only those
-//     the capture needs.
+//     GarrisonCost whether the score subtracts every ship sent as the
+//     launch's cost, or only those the capture needs.
 
 // HeuristicV2 is the stable identity of the prediction-based strategy.
 const HeuristicV2 = "heuristic-v2"
@@ -81,7 +81,7 @@ type arrival struct {
 type launchOption struct {
 	target body
 	ships  int // fleet size to send
-	// cost is the ships the score charges for this launch. It equals ships,
+	// cost is the ships the score subtracts for this launch. It equals ships,
 	// except with WholeGarrison and GarrisonCostNeeded, where it is only the
 	// ships the capture needs (see fleet).
 	cost  int
@@ -378,8 +378,9 @@ func (a *HeuristicV2Agent) aim(view View, predictor *game.Predictor, source body
 			return launchOption{}, false
 		}
 		if needed <= ships {
-			// v2 sends and charges the fleet it aimed, which may be more than
-			// needed. A whole-garrison fleet is charged as fleet says.
+			// v2 sends the fleet it aimed, which may be more than needed, and
+			// that whole fleet is the cost. A whole-garrison fleet's cost
+			// comes from fleet.
 			cost := ships
 			if a.config.WholeGarrison {
 				ships, cost = a.fleet(needed, available)
@@ -391,13 +392,14 @@ func (a *HeuristicV2Agent) aim(view View, predictor *game.Predictor, source body
 	return launchOption{}, false
 }
 
-// fleet is the launch for a capture priced at needed ships from a source
-// that can send available: the ships sent, and the ships the score charges.
+// fleet returns the ships to send for a capture priced at needed ships, from
+// a source that can send available, and the cost: the ships the score
+// subtracts for this launch.
 //
-// v2 sends and charges exactly what the capture needs. WholeGarrison sends
-// every available ship. It charges them all with GarrisonCostSent, or only
-// those needed with GarrisonCostNeeded, because the rest land on the captured
-// body as its new garrison and are not spent.
+// v2 sends exactly what the capture needs, and that is the cost.
+// WholeGarrison sends every available ship. With GarrisonCostSent the cost is
+// every ship sent; with GarrisonCostNeeded it is only those needed, because
+// the rest land on the captured body as its new garrison and are not spent.
 func (a *HeuristicV2Agent) fleet(needed, available int) (ships, cost int) {
 	switch {
 	case !a.config.WholeGarrison:
@@ -429,9 +431,9 @@ func (a *HeuristicV2Agent) price(player int, target body, incoming []arrival, se
 }
 
 // score is the production a capture gains over the turns left after the
-// fleet lands, minus cost, the ships it is charged for; both are counts of
-// ships. A comet produces only until it leaves the board, and taking a
-// player's body counts 1+EnemyBonus times.
+// fleet lands, minus cost, the ships the launch is counted as spending; both
+// are counts of ships. A comet produces only until it leaves the board, and
+// taking a player's body counts 1+EnemyBonus times.
 func (a *HeuristicV2Agent) score(view View, target body, cost int, turns float64) float64 {
 	left := float64(view.Config.MaxTurns - view.Turn)
 	for _, comet := range view.Comets {

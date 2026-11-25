@@ -26,16 +26,17 @@ var heuristicV2DefaultRandomMove = RandomConfig{
 	MaxFraction:       0.8,
 }
 
-// GarrisonCost says which ships a whole-garrison launch is charged for when
-// heuristic-v2 scores it. It matters only with WholeGarrison.
+// GarrisonCost says which ships of a whole-garrison launch heuristic-v2's
+// score subtracts as the launch's cost. It matters only with WholeGarrison.
 type GarrisonCost int
 
 const (
-	// GarrisonCostSent charges every ship sent, as heuristic-v2 always has.
+	// GarrisonCostSent counts every ship sent as the cost, as heuristic-v2
+	// always has.
 	GarrisonCostSent GarrisonCost = iota
-	// GarrisonCostNeeded charges only the ships the capture needs, margin
-	// included. The rest land on the captured body and become its garrison,
-	// so they are not lost.
+	// GarrisonCostNeeded counts only the ships the capture needs, margin
+	// included, as the cost. The rest land on the captured body and become
+	// its garrison, so they are not lost.
 	GarrisonCostNeeded
 )
 
@@ -99,8 +100,9 @@ type HeuristicV2Config struct {
 	// learner's decoder does. The bot can still hold. False sends v2's own
 	// priced fleet.
 	WholeGarrison bool
-	// GarrisonCost is which ships a whole-garrison launch is charged for in
-	// its score. It must be GarrisonCostSent unless WholeGarrison is set.
+	// GarrisonCost is which ships of a whole-garrison launch its score
+	// subtracts as the cost. It must be GarrisonCostSent unless WholeGarrison
+	// is set.
 	GarrisonCost GarrisonCost
 	// Reserve is what a whole-garrison bot does when the forecast says a
 	// body needs defenders. It must be ReserveHold unless WholeGarrison is
