@@ -8,8 +8,17 @@ import (
 	"strings"
 )
 
-// testerOrder is the order testers are listed in, everywhere.
+// testerOrder is the fixed testers -testers accepts, in the order they are
+// listed everywhere.
 var testerOrder = []string{"heuristic", "idle", "random", "diag-direct", "diag-lead"}
+
+// specTester is the tester name recorded for the -tester-spec agent. It is
+// not one of testerOrder, so -testers cannot ask for it.
+const specTester = "spec"
+
+// reportOrder is every tester a run can record, in report order. A
+// -tester-spec run plays only specTester, so it never mixes with the others.
+var reportOrder = append(slices.Clone(testerOrder), specTester)
 
 // testerSummary is one tester's results over the games it completed.
 type testerSummary struct {
@@ -54,11 +63,11 @@ type calibration struct {
 	TiedSeeds  int          `json:"tied_seeds"`
 }
 
-// summarize builds one testerSummary per tester, in testerOrder, from every
+// summarize builds one testerSummary per tester, in reportOrder, from every
 // game record, including the games that did not complete.
 func summarize(records []gameRecord, planned map[string]int) []testerSummary {
 	var summaries []testerSummary
-	for _, tester := range testerOrder {
+	for _, tester := range reportOrder {
 		if planned[tester] == 0 {
 			continue
 		}
@@ -125,13 +134,15 @@ func percentile(values []int, fraction float64) int {
 	return sorted[max(rank, 0)]
 }
 
-// checkCalibration applies the exact calibration rule to the heuristic
-// tester's completed games. Seeds missing any of their four seat runs are
-// skipped, and only a complete run gives a verdict anyway.
-func checkCalibration(records []gameRecord) calibration {
+// checkCalibration applies the exact calibration rule to the named tester's
+// completed games: the heuristic tester, or the -tester-spec agent when it is
+// the opponent spec (see matchConfig.calibrationTester). An empty name checks
+// nothing. Seeds missing any of their four seat runs are skipped, and only a
+// complete run gives a verdict anyway.
+func checkCalibration(records []gameRecord, tester string) calibration {
 	bySeed := map[int64][]gameRecord{}
 	for _, r := range records {
-		if r.Tester == "heuristic" && r.Status == statusCompleted {
+		if tester != "" && r.Tester == tester && r.Status == statusCompleted {
 			bySeed[r.Seed] = append(bySeed[r.Seed], r)
 		}
 	}
@@ -194,6 +205,11 @@ func verdict(meta runMeta, complete bool, summaries []testerSummary, c calibrati
 	if !complete {
 		return "no verdict: the run is incomplete", nil
 	}
+	// The criteria were fixed for the fixed testers only. A -tester-spec run
+	// measures some other agent, so its results are reported but not judged.
+	if meta.TesterSpec != "" {
+		return "no verdict: a -tester-spec run measures its tester but gives no verdict", nil
+	}
 	if !slices.Contains(agreedOpponents, meta.Opponent) || meta.Random != defaultRandom || meta.LaunchProbability != defaultLaunchProbability {
 		return fmt.Sprintf("no verdict: the decision criteria apply only to the agreed configuration (opponent one of %q, random tester %q, p = %g); this run used opponent %q, random tester %q, p = %g",
 			agreedOpponents, defaultRandom, defaultLaunchProbability, meta.Opponent, meta.Random, meta.LaunchProbability), nil
@@ -240,6 +256,9 @@ func markdownSummary(meta runMeta, summaries []testerSummary, c calibration, dec
 	}
 	if len(notes) > 0 {
 		b.WriteString("\n")
+	}
+	if meta.TesterSpec != "" {
+		fmt.Fprintf(&b, "Tester `%s` is `%s`. ", specTester, meta.TesterSpec)
 	}
 	fmt.Fprintf(&b, "Seeds %d to %d, every seat, against three `%s` opponents. ", meta.SeedStart, meta.SeedStart+int64(meta.Seeds)-1, meta.Opponent)
 	fmt.Fprintf(&b, "%d of %d games completed in %.0f s on %d workers.\n\n", meta.Completed, meta.Planned, meta.ElapsedSeconds, meta.Workers)

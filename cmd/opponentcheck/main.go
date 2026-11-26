@@ -4,6 +4,9 @@
 // the tested player in every seat in turn. It runs entirely in Go: no model,
 // no Python, no GPU.
 //
+// With -tester-spec, any agent spec plays the tested seat instead of the
+// fixed testers. Such a run only measures; it gives no verdict.
+//
 // Each game is appended to games.jsonl as soon as it finishes, so an
 // interrupted run keeps its completed work. At the end it writes the sorted
 // games.csv, summary.json and summary.md. A run with any failed or unplayed
@@ -60,7 +63,12 @@ var agreedOpponents = []string{defaultOpponent, agent.HeuristicV2Default}
 
 // options are the parsed command-line settings.
 type options struct {
-	testers           []string
+	// testers are the fixed testers to play, or just specTester when
+	// testerSpec is set.
+	testers []string
+	// testerSpec is the agent spec for the tested seat, as typed; empty means
+	// the fixed testers are played.
+	testerSpec        string
 	seedStart         int64
 	seeds             int
 	launchProbability float64
@@ -72,20 +80,23 @@ type options struct {
 
 // runMeta records how a run was made and how it ended.
 type runMeta struct {
-	Command           []string `json:"command"`
-	Commit            string   `json:"commit"`
-	GoVersion         string   `json:"go_version"`
-	Status            string   `json:"status"`
-	Testers           []string `json:"testers"`
-	SeedStart         int64    `json:"seed_start"`
-	Seeds             int      `json:"seeds"`
-	Opponent          string   `json:"opponent"`
-	Random            string   `json:"random"`
-	LaunchProbability float64  `json:"launch_probability"`
-	Workers           int      `json:"workers"`
-	Planned           int      `json:"planned"`
-	Completed         int      `json:"completed"`
-	ElapsedSeconds    float64  `json:"elapsed_seconds"`
+	Command   []string `json:"command"`
+	Commit    string   `json:"commit"`
+	GoVersion string   `json:"go_version"`
+	Status    string   `json:"status"`
+	Testers   []string `json:"testers"`
+	// TesterSpec is the -tester-spec agent, left out of the JSON when the
+	// fixed testers were played, so those runs' summaries are unchanged.
+	TesterSpec        string  `json:"tester_spec,omitempty"`
+	SeedStart         int64   `json:"seed_start"`
+	Seeds             int     `json:"seeds"`
+	Opponent          string  `json:"opponent"`
+	Random            string  `json:"random"`
+	LaunchProbability float64 `json:"launch_probability"`
+	Workers           int     `json:"workers"`
+	Planned           int     `json:"planned"`
+	Completed         int     `json:"completed"`
+	ElapsedSeconds    float64 `json:"elapsed_seconds"`
 }
 
 func main() {
@@ -114,6 +125,7 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	flags.SetOutput(stderr)
 	testers := flags.String("testers", strings.Join(testerOrder, ","), "comma-separated testers: "+strings.Join(testerOrder, ", ")+
 		" (heuristic is the -opponent agent playing itself, the calibration)")
+	testerSpec := flags.String("tester-spec", "", "agent spec for the tested seat instead of the fixed testers; cannot be combined with -testers")
 	seedStart := flags.Int64("seed-start", 1_000_000, "first scenario seed (the reusable validation range starts at 1000000)")
 	seeds := flags.Int("seeds", 25, "number of consecutive seeds; each is played from every seat")
 	probability := flags.Float64("launch-probability", defaultLaunchProbability, "diagnostic agents' chance to launch from each source each turn")
@@ -128,16 +140,28 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 		return options{}, fmt.Errorf("unexpected arguments: %v", flags.Args())
 	}
 	opts := options{
-		seedStart: *seedStart, seeds: *seeds, launchProbability: *probability,
+		testerSpec: strings.TrimSpace(*testerSpec),
+		seedStart:  *seedStart, seeds: *seeds, launchProbability: *probability,
 		workers: *workers, opponent: *opponent, random: *random, out: *out,
 	}
-	for _, name := range strings.Split(*testers, ",") {
-		name = strings.TrimSpace(name)
-		if !slices.Contains(testerOrder, name) {
-			return options{}, fmt.Errorf("%w %q; want some of %s", errUnknownTester, name, strings.Join(testerOrder, ", "))
-		}
-		if !slices.Contains(opts.testers, name) {
-			opts.testers = append(opts.testers, name)
+	// -testers has a default, so only flags.Visit (which sees just the flags
+	// actually given) can tell whether it was typed alongside -tester-spec.
+	testersGiven := false
+	flags.Visit(func(f *flag.Flag) { testersGiven = testersGiven || f.Name == "testers" })
+	switch {
+	case opts.testerSpec != "" && testersGiven:
+		return options{}, errors.New("-tester-spec cannot be combined with -testers")
+	case opts.testerSpec != "":
+		opts.testers = []string{specTester}
+	default:
+		for _, name := range strings.Split(*testers, ",") {
+			name = strings.TrimSpace(name)
+			if !slices.Contains(testerOrder, name) {
+				return options{}, fmt.Errorf("%w %q; want some of %s", errUnknownTester, name, strings.Join(testerOrder, ", "))
+			}
+			if !slices.Contains(opts.testers, name) {
+				opts.testers = append(opts.testers, name)
+			}
 		}
 	}
 	switch {
@@ -168,7 +192,13 @@ func run(ctx context.Context, opts options, console io.Writer) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("-random: %w", err)
 	}
-	return runWith(ctx, opts, matchConfig{opponent: opponent, random: random, launchProbability: opts.launchProbability}, console)
+	config := matchConfig{opponent: opponent, random: random, launchProbability: opts.launchProbability}
+	if opts.testerSpec != "" {
+		if config.tester, err = agent.ParseFactory(opts.testerSpec); err != nil {
+			return false, fmt.Errorf("-tester-spec: %w", err)
+		}
+	}
+	return runWith(ctx, opts, config, console)
 }
 
 // runWith is run with a ready matchConfig, so tests can inject agents.
@@ -224,7 +254,7 @@ func runWith(ctx context.Context, opts options, config matchConfig, console io.W
 	complete := completed == len(jobs)
 	meta := runMeta{
 		Command: os.Args, Commit: buildCommit(), GoVersion: runtime.Version(),
-		Status: "complete", Testers: opts.testers, SeedStart: opts.seedStart, Seeds: opts.seeds,
+		Status: "complete", Testers: opts.testers, TesterSpec: opts.testerSpec, SeedStart: opts.seedStart, Seeds: opts.seeds,
 		Opponent: opts.opponent, Random: opts.random, LaunchProbability: opts.launchProbability,
 		Workers: opts.workers, Planned: len(jobs), Completed: completed,
 		ElapsedSeconds: time.Since(started).Seconds(),
@@ -233,7 +263,7 @@ func runWith(ctx context.Context, opts options, config matchConfig, console io.W
 		meta.Status = fmt.Sprintf("incomplete (%d of %d games completed)", completed, len(jobs))
 	}
 	summaries := summarize(records, planned)
-	calib := checkCalibration(records)
+	calib := checkCalibration(records, config.calibrationTester())
 	decision, notes := verdict(meta, complete, summaries, calib)
 
 	if err := writeCSV(filepath.Join(opts.out, "games.csv"), records); err != nil {
@@ -378,7 +408,7 @@ func buildCommit() string {
 	return revision
 }
 
-// testerIndex is a tester's position in testerOrder, for sorting records.
+// testerIndex is a tester's position in reportOrder, for sorting records.
 func testerIndex(name string) int {
-	return slices.Index(testerOrder, name)
+	return slices.Index(reportOrder, name)
 }

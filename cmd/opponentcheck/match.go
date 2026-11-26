@@ -71,8 +71,11 @@ type gameRecord struct {
 
 // matchConfig is what every game of a run shares.
 type matchConfig struct {
-	opponent          agent.Factory
-	random            agent.Factory
+	opponent agent.Factory
+	random   agent.Factory
+	// tester is the -tester-spec agent, played as specTester; nil when the
+	// fixed testers are played.
+	tester            agent.Factory
 	launchProbability float64
 	// newTester overrides how a tester's agent is built; tests use it to
 	// inject a failing agent. Nil uses buildTester.
@@ -215,8 +218,35 @@ func (config matchConfig) buildTester(ctx context.Context, j job, live *game.Gam
 		return newDiagAgent(false, live, config.launchProbability, j.seed, j.seat), nil
 	case "diag-lead":
 		return newDiagAgent(true, live, config.launchProbability, j.seed, j.seat), nil
+	case specTester:
+		if config.tester == nil {
+			return nil, errors.New("no -tester-spec agent configured")
+		}
+		// Seeded exactly as the heuristic tester is, so a tester spec equal
+		// to the opponent spec plays the same games as the calibration.
+		init.AgentSeed = arena.DeriveAgentSeed(j.seed, init.ContestantID, config.tester.Spec())
+		return config.tester.New(ctx, init)
 	default:
 		return nil, fmt.Errorf("unknown tester %q", j.tester)
+	}
+}
+
+// calibrationTester names the tester whose games the calibration checks:
+// "heuristic" for the fixed testers, and specTester when the -tester-spec
+// agent is the opponent spec itself (same canonical form), so every seat
+// plays the same agent. Any other tester spec has no calibration: "".
+//
+// The check expects the four seat runs of a seed to be one identical game,
+// which holds only for an agent with no randomness in play, such as
+// heuristic-v1 or heuristic-v2 with epsilon=0.
+func (config matchConfig) calibrationTester() string {
+	switch {
+	case config.tester == nil:
+		return "heuristic"
+	case config.tester.Spec().String() == config.opponent.Spec().String():
+		return specTester
+	default:
+		return ""
 	}
 }
 
