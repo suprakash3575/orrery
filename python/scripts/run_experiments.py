@@ -629,6 +629,11 @@ class Runner:
         except Exception as error:  # recorded, so one broken job can't stop the session
             failed = f"{type(error).__name__}: {error}"
         record.update(finished=now(), seconds=round(time.monotonic() - started, 1))
+        if failed and self.stopping:
+            # Stopped by Ctrl-C, not failed: leave the folder without a result,
+            # so status shows it unfinished and the next run sets it aside and
+            # runs the job again.
+            return "unfinished"
         if failed:
             write_json(folder / "failed.json", {**record, "error": failed, "log": "log.txt"})
             return "failed"
@@ -787,33 +792,41 @@ def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
     save()
 
     runner = Runner(plan, out, tool)
+    # Each lane sets its event when it has finished, including after Ctrl-C.
+    # The main thread waits on these events rather than Thread.join: in
+    # CPython a join interrupted by Ctrl-C can make a later join return
+    # before the thread has really ended, and the session would then be
+    # recorded while a lane is still writing its last job.
+    finished = {name: threading.Event() for name in (GPU_LANE, CPU_LANE)}
 
     def lane(name: str) -> None:
-        for job in (job for job in jobs if job.lane == name):
-            # After Ctrl-C, start nothing new: the remaining jobs stay
-            # waiting for the next run.
-            if runner.stopping:
-                return
-            if job_state(out, job) == "done":
-                continue
-            print(f"[{name}] start {job.id}", flush=True)
-            save(job, "running")
-            state = runner.run_job(job)
-            save(job, state)
-            print(f"[{name}] {state} {job.id}", flush=True)
+        try:
+            for job in (job for job in jobs if job.lane == name):
+                # After Ctrl-C, start nothing new: the remaining jobs stay
+                # waiting for the next run.
+                if runner.stopping:
+                    return
+                if job_state(out, job) == "done":
+                    continue
+                print(f"[{name}] start {job.id}", flush=True)
+                save(job, "running")
+                state = runner.run_job(job)
+                save(job, state)
+                print(f"[{name}] {state} {job.id}", flush=True)
+        finally:
+            finished[name].set()
 
-    threads = [threading.Thread(target=lane, args=(name,), daemon=True) for name in (GPU_LANE, CPU_LANE)]
-    for thread in threads:
-        thread.start()
+    for name in finished:
+        threading.Thread(target=lane, args=(name,), daemon=True).start()
     try:
-        for thread in threads:
-            while thread.is_alive():
-                thread.join(timeout=1)
+        for event in finished.values():
+            while not event.wait(timeout=1):
+                pass
     except KeyboardInterrupt:
         print("interrupted: stopping running jobs; run the same command again to resume", flush=True)
         runner.stop()
-        for thread in threads:
-            thread.join()
+        for event in finished.values():
+            event.wait()
         for job in jobs:
             record["jobs"][job.id] = job_state(out, job)
         record["runs"][-1]["finished"] = now()
