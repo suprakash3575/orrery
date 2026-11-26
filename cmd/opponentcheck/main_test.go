@@ -212,6 +212,28 @@ func TestVerdictAppliesOnlyToTheAgreedConfiguration(t *testing.T) {
 	})
 }
 
+// TestParseOptionsRefusesConflictingFlags checks that flag combinations that
+// cannot both be honoured are refused before anything runs.
+func TestParseOptionsRefusesConflictingFlags(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		// -tester-spec replaces the fixed testers, so naming both is a mistake.
+		{name: "tester spec with testers", args: []string{"-tester-spec", "idle-v1", "-testers", "idle"}, wantErr: "-tester-spec cannot be combined with -testers"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			args := append(test.args, "-out", filepath.Join(t.TempDir(), "out"))
+			_, err := parseOptions(args, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("parseOptions(%q) error = %v, want one containing %q", test.args, err, test.wantErr)
+			}
+		})
+	}
+}
+
 // failOnTurn is a tester that plays idle until its chosen turn, then fails.
 type failOnTurn struct{ turn int }
 
