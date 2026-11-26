@@ -608,6 +608,64 @@ func TestHeuristicV2Reports(t *testing.T) {
 		}
 	})
 
+	// Both "All three" testers in experiment 1 take the no_aim_check path,
+	// which aims and counts on its own. One bot plays two boards in turn:
+	// first one where aiming ahead works, then the sun board, where it fails
+	// and the launch goes straight.
+	t.Run("no_aim_check counts a successful aim and a straight launch", func(t *testing.T) {
+		reachable := smallV2Board(t, []game.Planet{
+			{ID: 3, OwnerID: 0, Ships: 50, Production: 1, Position: game.Vec2{X: 20, Y: 20}},
+			{ID: 4, OwnerID: game.NeutralPlayer, Ships: 10, Production: 3, Position: game.Vec2{X: 30, Y: 20}},
+		}, nil)
+		for _, cost := range []string{"", ",garrison_cost=needed"} {
+			factory, err := ParseFactory(HeuristicV2Default + cost + ",learner_aim=1,no_aim_check=1,whole_garrison=1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := factory.New(context.Background(), AgentInit{AgentSeed: 7})
+			if err != nil {
+				t.Fatal(err)
+			}
+			bot := created.(*HeuristicV2Agent)
+			steps := []struct {
+				board       *game.Game
+				wantStats   AimStats
+				wantChoices []LaunchChoice
+			}{
+				// Aims ahead at planet 4 and launches all 50 ships.
+				{reachable, AimStats{AimAheadAttempts: 1, Launches: 1}, []LaunchChoice{{Source: 3, Target: 4}}},
+				// Can't aim ahead at planet 2, so aims straight; counts add up.
+				{g, AimStats{AimAheadAttempts: 2, AimAheadFailed: 1, AimedStraight: 1, Launches: 2}, []LaunchChoice{{Source: 1, Target: 2}}},
+			}
+			for i, step := range steps {
+				if _, err := bot.Decide(context.Background(), TurnRequest{PlayerID: 0, View: NewView(step.board)}); err != nil {
+					t.Fatal(err)
+				}
+				if got := bot.AimStats(); got != step.wantStats {
+					t.Errorf("spec %q, board %d: AimStats = %+v, want %+v", cost, i+1, got, step.wantStats)
+				}
+				if got := bot.LastChoices(); !reflect.DeepEqual(got, step.wantChoices) {
+					t.Errorf("spec %q, board %d: LastChoices = %v, want %v", cost, i+1, got, step.wantChoices)
+				}
+			}
+		}
+	})
+
+	t.Run("a cancelled call leaves no choices from the turn before", func(t *testing.T) {
+		bot := decide(t, ",learner_aim=1", 1)
+		if len(bot.LastChoices()) != 1 {
+			t.Fatalf("setup: LastChoices = %v, want one launch", bot.LastChoices())
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := bot.Decide(ctx, TurnRequest{PlayerID: 0, View: NewView(g)}); err == nil {
+			t.Fatal("Decide with a cancelled context returned no error")
+		}
+		if got := bot.LastChoices(); len(got) != 0 {
+			t.Errorf("after a cancelled call, LastChoices = %v, want none", got)
+		}
+	})
+
 	t.Run("LastChoices returns a copy", func(t *testing.T) {
 		bot := decide(t, ",learner_aim=1", 1)
 		bot.LastChoices()[0].Target = 99
