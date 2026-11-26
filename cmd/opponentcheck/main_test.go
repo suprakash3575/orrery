@@ -295,6 +295,37 @@ func TestBuildAgentsSeatsLineupByRole(t *testing.T) {
 	}
 }
 
+// TestSummarizeCountsRates checks the counts summary on hand-made records:
+// totals and rates add up across games, a rate with nothing to divide by is
+// undefined (nil) rather than 0, and records without counts give no summary.
+func TestSummarizeCountsRates(t *testing.T) {
+	counted := []gameRecord{
+		{Launches: 10, TesterCounts: &TesterCounts{AimAttempts: 8, AimFailures: 2, FallbackLaunches: 2, RandomMoves: 3, DecodeCheckedLaunches: 10}},
+		{Launches: 30, TesterCounts: &TesterCounts{AimAttempts: 12, AimFailures: 3, FallbackLaunches: 3, RandomMoves: 5, DecodeCheckedLaunches: 30}},
+	}
+	c := summarizeCounts(counted)
+	if c == nil {
+		t.Fatal("summarizeCounts = nil, want totals")
+	}
+	// 5 failures in 20 attempts; 5 fallbacks in 40 launches; 8 random moves in 2 games.
+	if c.AimAttempts != 20 || c.AimFailures != 5 || c.FallbackLaunches != 5 || c.RandomMoves != 8 || c.DecodeCheckedLaunches != 40 {
+		t.Fatalf("totals = %+v, want 20 attempts, 5 failures, 5 fallbacks, 8 random moves, 40 checked", *c)
+	}
+	if c.AimFailureRate == nil || *c.AimFailureRate != 0.25 || c.FallbackRate == nil || *c.FallbackRate != 0.125 || c.RandomMovesPerGame != 4 {
+		t.Fatalf("rates = %v, %v, %v; want 0.25, 0.125, 4", c.AimFailureRate, c.FallbackRate, c.RandomMovesPerGame)
+	}
+
+	// A bot that never aimed ahead or launched: both rates are undefined.
+	idle := summarizeCounts([]gameRecord{{TesterCounts: &TesterCounts{RandomMoves: 6}}})
+	if idle == nil || idle.AimFailureRate != nil || idle.FallbackRate != nil {
+		t.Fatalf("summary = %+v, want both rates undefined (nil)", idle)
+	}
+
+	if got := summarizeCounts([]gameRecord{{Launches: 5}}); got != nil {
+		t.Fatalf("summarizeCounts of records without counts = %+v, want nil", *got)
+	}
+}
+
 // TestParseOptionsRefusesConflictingFlags checks that flag combinations that
 // cannot both be honoured are refused before anything runs.
 func TestParseOptionsRefusesConflictingFlags(t *testing.T) {
