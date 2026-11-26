@@ -254,6 +254,47 @@ func TestCalibrationPassesForRandomSelfPlay(t *testing.T) {
 	}
 }
 
+// TestBuildAgentsSeatsLineupByRole gives -opponent a lineup of three
+// different agents and checks, for every tested seat, that each opponent
+// seat gets the entry for its board role: entry 0 clockwise of the tested
+// seat, entry 1 opposite, entry 2 counter-clockwise. Going clockwise around
+// the sun the seats run 0 → 1 → 3 → 2, written out here rather than taken
+// from SeatFrame, so the test doesn't share the code it checks.
+func TestBuildAgentsSeatsLineupByRole(t *testing.T) {
+	const seed = 1_000_000
+	lineup, err := mlenv.ParseLineup("idle-v1|"+defaultRandom+"|"+defaultOpponent, agent.ParseFactory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []string{"idle-v1", "random-v1", "heuristic-v1"}
+	clockwise := []int{0, 1, 3, 2}
+
+	config := testConfig(t)
+	config.opponents = lineup
+	for i, tested := range clockwise {
+		g, err := scenario.GeneratorV2{FourPlayer: true}.New(seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frame, err := mlenv.NewSeatFrame(g, tested)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agents, err := buildAgents(context.Background(), config, job{tester: "idle", seed: seed, seat: tested}, g, frame)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Steps 1, 2 and 3 round the circle from the tested seat are its
+		// clockwise, opposite and counter-clockwise neighbours.
+		for step, want := range entries {
+			seat := clockwise[(i+1+step)%players]
+			if got := agents[seat].ID(); got != want {
+				t.Errorf("tested seat %d: seat %d plays %s, want %s (lineup entry %d)", tested, seat, got, want, step)
+			}
+		}
+	}
+}
+
 // TestParseOptionsRefusesConflictingFlags checks that flag combinations that
 // cannot both be honoured are refused before anything runs.
 func TestParseOptionsRefusesConflictingFlags(t *testing.T) {
