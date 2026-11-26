@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 
 	"orrery/agent"
@@ -130,9 +131,18 @@ func checkDecode(live *game.Game, frame mlenv.SeatFrame, choices []agent.LaunchC
 		return fmt.Errorf("decoder made %d launches from %d choices", len(decoded), len(got))
 	}
 	for i := range got {
-		if got[i] != decoded[i] {
+		if !sameLaunch(got[i], decoded[i]) {
 			return fmt.Errorf("body %d: bot launched %+v, decoder made %+v", got[i].PlanetID, got[i], decoded[i])
 		}
 	}
 	return nil
+}
+
+// sameLaunch reports whether two launches are identical, the angle bit for
+// bit. Comparing the structs with == isn't enough: Go's float == treats +0
+// and −0 as equal although their bits differ, and an angle of exactly 0 can
+// come out with either sign (math.Atan2(−0, 1) is −0).
+func sameLaunch(a, b game.Action) bool {
+	return a.PlayerID == b.PlayerID && a.PlanetID == b.PlanetID && a.Ships == b.Ships &&
+		math.Float64bits(a.Angle) == math.Float64bits(b.Angle)
 }

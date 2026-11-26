@@ -108,6 +108,21 @@ func TestCheckDecodeCatchesAlteredLaunch(t *testing.T) {
 	}
 }
 
+// TestSameLaunchComparesAngleBits checks that launches are compared bit for
+// bit: angles of +0 and −0 are equal to Go's ==, but their bits differ, so
+// they are different launches.
+func TestSameLaunchComparesAngleBits(t *testing.T) {
+	launch := game.Action{PlayerID: 1, PlanetID: 7, Ships: 12, Angle: 0}
+	if !sameLaunch(launch, launch) {
+		t.Fatalf("sameLaunch(%+v, itself) = false, want true", launch)
+	}
+	negativeZero := launch
+	negativeZero.Angle = math.Copysign(0, -1)
+	if sameLaunch(launch, negativeZero) {
+		t.Fatal("sameLaunch treats angles +0 and −0 as the same, want different")
+	}
+}
+
 // alteredAngle is the restricted bot with its first launch of each turn
 // turned by the smallest possible step. LastChoices still comes from the
 // bot, so the choices are learner moves but the launch no longer matches.
