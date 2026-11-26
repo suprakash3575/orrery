@@ -1571,6 +1571,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.untrained and arguments.no_games:
         parser.error("--untrained chooses the model that plays; it has no effect with --no-games")
 
+    # Check the boards before anything is written. The training chart is
+    # drawn before the games are chosen, so a refused --seeds or --seed-start
+    # found later would leave a non-empty --out, and the corrected command
+    # would then be refused for reusing it. diagnose_games checks the range
+    # again for its own callers.
+    if not arguments.no_games:
+        run_config = run_config_from_mapping(
+            read_json_object(arguments.run_dir / "run-config.json", "run configuration")
+        )
+        try:
+            diagnosis_seed_range(run_config, arguments.seeds, arguments.seed_start)
+        except ValueError as error:
+            parser.error(str(error))
+
     # Each run gets its own folder, so an earlier report is never mixed with or
     # replaced by a new one.
     out = arguments.out

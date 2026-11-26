@@ -113,6 +113,21 @@ func TestHeuristicV2Price(t *testing.T) {
 			}
 		})
 	}
+
+	// Margin is capped at the ships available, however large it is. A
+	// neutral 10-ship planet needs 11; margin 0.5 adds ceil(5.5) = 6, so 17;
+	// a margin far beyond what an int holds must still give exactly the 40
+	// available, never an overflowed count.
+	target := body{id: 2, ownerID: game.NeutralPlayer, ships: 10}
+	for _, tt := range []struct {
+		margin float64
+		want   int
+	}{{0.5, 17}, {1e100, 40}} {
+		bot := &HeuristicV2Agent{config: HeuristicV2Config{Margin: tt.margin, EnemyBonus: 1, Candidates: 4}}
+		if got, ok := bot.price(0, target, nil, 1, 40); !ok || got != tt.want {
+			t.Fatalf("margin %g: price = %d, %v; want %d, true", tt.margin, got, ok, tt.want)
+		}
+	}
 }
 
 // TestLaunchOptionBeats checks the final choice between launches: a higher

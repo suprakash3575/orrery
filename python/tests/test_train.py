@@ -1801,6 +1801,59 @@ def test_rejected_rollout_stops_before_the_ppo_update(
     assert not (tmp_path / "rejected" / "metrics.csv").exists()
 
 
+def test_a_new_run_refused_by_go_says_to_remove_its_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A new run whose opponent Go echoes differently names its directory.
+
+    The run directory exists before Go checks the configuration, so a
+    corrected retry into it would be refused. The error keeps its message
+    and adds a note saying to remove the directory or choose another.
+    """
+
+    config = _test_config(environment_count=1, rollout_steps=1, minibatch_size=1, ppo_epochs=1)
+
+    class CanonicalisingEnvironment:
+        """Echo the opponent as Go would if the config spelled it another way."""
+
+        error_count = 0
+        cursor = 0
+
+        def __init__(self, _command: object, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> CanonicalisingEnvironment:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def create(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            return {
+                "v": config.protocol_version,
+                "engine": "abc123",
+                "schema": "obs-v2",
+                "generator": "generator-v2",
+                "opponent": "canonical-spelling-differs",
+                "schedule": "train-v2",
+                "seed_range": [0, 1_000_000],
+                "dimensions": OBSERVATION_DIMENSIONS,
+            }
+
+    monkeypatch.setattr(training, "EnvClient", CanonicalisingEnvironment)
+    run_directory = tmp_path / "misspelled"
+
+    with pytest.raises(ValueError, match="rejected the configured training contract") as raised:
+        run_training(config, run_directory, max_updates=1)
+
+    assert run_directory.exists()
+    assert any(
+        str(run_directory) in note and "remove that directory" in note
+        for note in raised.value.__notes__
+    )
+
+
 def test_command_loads_the_config_and_starts_the_training_driver(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

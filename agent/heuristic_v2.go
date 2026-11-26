@@ -813,7 +813,14 @@ func (a *HeuristicV2Agent) price(player int, target body, incoming []arrival, se
 	if minimum > available {
 		return 0, false // out of reach of this force
 	}
-	return min(minimum+int(math.Ceil(a.config.Margin*float64(minimum))), available), true
+	// Cap while still a float64, then convert. Margin is any finite
+	// non-negative number, so Margin × minimum can be far beyond what an int
+	// holds (margin=1e100), and converting it first would give a garbage,
+	// even negative, ship count before min could cap it. A value at most
+	// available always fits. Small whole numbers are exact in a float64, so
+	// ordinary margins give the same counts as plain int arithmetic.
+	extra := math.Ceil(a.config.Margin * float64(minimum))
+	return int(min(float64(minimum)+extra, float64(available))), true
 }
 
 // score is the production a capture gains over the turns left after the

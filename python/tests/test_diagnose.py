@@ -33,6 +33,7 @@ from scripts.diagnose import (
     diagnose_games,
     diagnosis_seed_range,
     game_measurements,
+    main,
 )
 
 # A complete opponent spec that differs from the four-player run's
@@ -223,6 +224,22 @@ def test_seed_start_reaches_the_runner_and_the_report(tmp_path: Path) -> None:
     assert (seeds.start, seeds.end) == (1_005_000, 1_005_002)
     assert calls[0]["expected_metadata"]["seed_range"] == [1_005_000, 1_005_002]
     assert report["seeds"] == [1_005_000, 1_005_002]
+
+
+def test_a_refused_seed_start_writes_nothing(tmp_path: Path) -> None:
+    """A refused --seed-start stops before --out is created, so the corrected
+    command can reuse the same --out. Without the early check the training
+    chart would already be written, and the retry refused as non-empty.
+    """
+
+    run, _checkpoint, _state = _run(tmp_path)
+    out = tmp_path / "diagnosis"
+
+    with pytest.raises(SystemExit) as raised:
+        main(["--run-dir", str(run), "--seeds", "1", "--seed-start", "1010000", "--out", str(out)])
+
+    assert raised.value.code == 2
+    assert not out.exists()
 
 
 def test_untrained_baseline_rebuilds_identically_from_its_learner_seed() -> None:
