@@ -326,6 +326,50 @@ func TestSummarizeCountsRates(t *testing.T) {
 	}
 }
 
+// TestCanonicalForms checks that -canonical rewrites each spelling of a spec
+// to the one canonical form, and that bad inputs give no forms at all and an
+// error naming every one of them.
+func TestCanonicalForms(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "already canonical", input: agent.HeuristicV2Default, want: agent.HeuristicV2Default},
+		{name: "parameters out of order", input: "heuristic-v2:margin=0.1,candidates=4,enemy_bonus=1", want: agent.HeuristicV2Default},
+		{name: "a setting at its default", input: agent.HeuristicV2Default + ",learner_aim=0", want: agent.HeuristicV2Default},
+		{name: "a number with a trailing zero", input: agent.HeuristicV2Default + ",epsilon=0.50", want: "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.5,margin=0.1"},
+		{name: "a lineup of three identical entries", input: "idle-v1|idle-v1|idle-v1", want: "idle-v1"},
+	}
+	inputs := make([]string, len(tests))
+	for i, test := range tests {
+		inputs[i] = test.input
+	}
+	forms, err := canonicalForms(inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, test := range tests {
+		if forms[i] != test.want {
+			t.Errorf("%s: canonical form of %q = %q, want %q", test.name, test.input, forms[i], test.want)
+		}
+	}
+
+	t.Run("bad inputs", func(t *testing.T) {
+		misspelled := agent.HeuristicV2Default + ",whole_garison=1"
+		tooShort := "idle-v1|idle-v1"
+		forms, err := canonicalForms([]string{misspelled, "idle-v1", tooShort})
+		if forms != nil || err == nil {
+			t.Fatalf("forms = %q, err = %v; want no forms and an error", forms, err)
+		}
+		for _, bad := range []string{misspelled, tooShort} {
+			if !strings.Contains(err.Error(), bad) {
+				t.Errorf("error %q does not name the bad input %q", err, bad)
+			}
+		}
+	})
+}
+
 // TestParseOptionsRefusesConflictingFlags checks that flag combinations that
 // cannot both be honoured are refused before anything runs.
 func TestParseOptionsRefusesConflictingFlags(t *testing.T) {
@@ -336,6 +380,9 @@ func TestParseOptionsRefusesConflictingFlags(t *testing.T) {
 	}{
 		// -tester-spec replaces the fixed testers, so naming both is a mistake.
 		{name: "tester spec with testers", args: []string{"-tester-spec", "idle-v1", "-testers", "idle"}, wantErr: "-tester-spec cannot be combined with -testers"},
+		// -canonical plays nothing, so a flag that shapes a run means the
+		// command was put together by mistake.
+		{name: "canonical with seeds", args: []string{"-canonical", "-seeds", "3", "idle-v1"}, wantErr: "-canonical cannot be combined with other flags"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
