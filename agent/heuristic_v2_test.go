@@ -599,7 +599,7 @@ func TestHeuristicV2Reports(t *testing.T) {
 		// epsilon=1 makes every move random, and epsilon_launch_probability=1
 		// makes planet 1's 50 ships always launch.
 		bot := decide(t, ",epsilon=1,epsilon_launch_probability=1", 1)
-		want := AimStats{Launches: 1, RandomMoves: 1}
+		want := AimStats{Launches: 1, RandomLaunches: 1, RandomMoves: 1}
 		if got := bot.AimStats(); got != want {
 			t.Errorf("AimStats = %+v, want %+v", got, want)
 		}
@@ -633,9 +633,9 @@ func TestHeuristicV2Reports(t *testing.T) {
 				wantChoices []LaunchChoice
 			}{
 				// Aims ahead at planet 4 and launches all 50 ships.
-				{reachable, AimStats{AimAheadAttempts: 1, Launches: 1}, []LaunchChoice{{Source: 3, Target: 4}}},
+				{reachable, AimStats{AimAheadAttempts: 1, Launches: 1, AimedAhead: 1}, []LaunchChoice{{Source: 3, Target: 4}}},
 				// Can't aim ahead at planet 2, so aims straight; counts add up.
-				{g, AimStats{AimAheadAttempts: 2, AimAheadFailed: 1, AimedStraight: 1, Launches: 2}, []LaunchChoice{{Source: 1, Target: 2}}},
+				{g, AimStats{AimAheadAttempts: 2, AimAheadFailed: 1, Launches: 2, AimedAhead: 1, AimedStraight: 1}, []LaunchChoice{{Source: 1, Target: 2}}},
 			}
 			for i, step := range steps {
 				if _, err := bot.Decide(context.Background(), TurnRequest{PlayerID: 0, View: NewView(step.board)}); err != nil {
@@ -648,6 +648,50 @@ func TestHeuristicV2Reports(t *testing.T) {
 					t.Errorf("spec %q, board %d: LastChoices = %v, want %v", cost, i+1, got, step.wantChoices)
 				}
 			}
+		}
+	})
+
+	// Over a real game, with learner_aim and epsilon both on, the bot makes
+	// all three kinds of launch, and every launch must be in exactly one.
+	t.Run("every launch is counted once: aimed ahead, aimed straight or random", func(t *testing.T) {
+		factory, err := ParseFactory(HeuristicV2Default + ",epsilon=0.5,learner_aim=1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		created, err := factory.New(context.Background(), AgentInit{AgentSeed: 7})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bot := created.(*HeuristicV2Agent)
+		match, err := scenario.GeneratorV2{FourPlayer: true}.New(1000000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		launches := 0
+		for !match.Finished() && match.Turn < 150 {
+			decision, err := bot.Decide(context.Background(), TurnRequest{PlayerID: 0, View: NewView(match)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			launches += len(decision.Actions)
+			if err := match.AdvanceTurn(decision.Actions); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		s := bot.AimStats()
+		if s.Launches != launches {
+			t.Errorf("Launches = %d, but the bot made %d", s.Launches, launches)
+		}
+		if sum := s.AimedAhead + s.AimedStraight + s.RandomLaunches; sum != s.Launches {
+			t.Errorf("AimedAhead %d + AimedStraight %d + RandomLaunches %d = %d, want Launches %d",
+				s.AimedAhead, s.AimedStraight, s.RandomLaunches, sum, s.Launches)
+		}
+		if s.RandomLaunches > s.RandomMoves {
+			t.Errorf("RandomLaunches %d is more than RandomMoves %d", s.RandomLaunches, s.RandomMoves)
+		}
+		if s.AimedAhead == 0 || s.AimedStraight == 0 || s.RandomLaunches == 0 {
+			t.Errorf("stats %+v: the game should include all three kinds of launch", s)
 		}
 	})
 
