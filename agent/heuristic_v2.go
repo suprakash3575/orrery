@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"sort"
 
 	"orrery/game"
@@ -93,10 +94,76 @@ type HeuristicV2Agent struct {
 	// AgentInit.AgentSeed so a game replays exactly. It exists only when
 	// Epsilon is above 0; otherwise it is nil and v2 draws nothing.
 	rng *rand.Rand
+
+	// stats adds up what the bot did over the whole match (see AimStats).
+	// Nothing reads it while deciding, so it never changes a move.
+	stats AimStats
+	// lastChoices is the most recent Decide call's launches as source and
+	// target, in the order they were emitted (see LastChoices). Each Decide
+	// call starts it afresh.
+	lastChoices []LaunchChoice
 }
+
+// AimStats counts what one heuristic-v2 agent did over a match, for reports.
+// The counts only grow, and reading them never changes the bot's moves.
+//
+// Example, for a bot with LearnerAim over a whole game: AimAheadAttempts 300,
+// AimAheadFailed 60 and AimedStraight 40 would mean 1 in 5 attempts to aim
+// ahead found no way, and 40 launches went straight at their target instead.
+type AimStats struct {
+	// AimAheadAttempts is how many times the bot tried to aim ahead, counting
+	// targets it considered but didn't launch at.
+	AimAheadAttempts int
+	// AimAheadFailed is how many of those attempts found no way to the
+	// target, for example because the path crossed the sun.
+	AimAheadFailed int
+	// AimedStraight is how many launches were aimed straight because aiming
+	// ahead failed. Only LearnerAim does this; normal v2 skips such targets.
+	AimedStraight int
+	// Launches is every launch the bot made, planned or random.
+	Launches int
+	// RandomMoves is how many times a planet made a random move because of
+	// Epsilon, whether it launched or held.
+	RandomMoves int
+}
+
+// LaunchChoice is one launch the bot made, as the learner would choose it:
+// which planet launched, and at which target. The runner rebuilds the launch
+// from this with the learner's decoder (mlenv.Decode), to check the bot only
+// made moves the learner could make.
+type LaunchChoice struct {
+	// Source is the ID of the planet or comet that launched.
+	Source int
+	// Target is the ID of the body it launched at, or NoTarget for a random
+	// move, which flies in a random direction rather than at a body.
+	Target int
+}
+
+// NoTarget is LaunchChoice.Target for a random move, which has no target.
+// Body IDs are never negative, so it can't be mistaken for one.
+const NoTarget = -1
 
 // ID returns the versioned agent identity.
 func (*HeuristicV2Agent) ID() string { return HeuristicV2 }
+
+// AimStats returns the counts so far in this match.
+func (a *HeuristicV2Agent) AimStats() AimStats { return a.stats }
+
+// LastChoices returns the previous Decide call's launches, in the same order
+// as its actions, so LastChoices()[i] describes Decision.Actions[i]. It is a
+// copy in its own memory, so the caller may keep or change it without
+// touching the bot's own list.
+func (a *HeuristicV2Agent) LastChoices() []LaunchChoice {
+	return slices.Clone(a.lastChoices)
+}
+
+// countAimAhead records one attempt to aim ahead, and whether it found a way.
+func (a *HeuristicV2Agent) countAimAhead(found bool) {
+	a.stats.AimAheadAttempts++
+	if !found {
+		a.stats.AimAheadFailed++
+	}
+}
 
 // arrival is one predicted fleet landing on a body.
 type arrival struct {
@@ -119,6 +186,9 @@ type launchOption struct {
 	cost  int
 	aim   game.Aim
 	score float64
+	// straight is true when aiming ahead failed and aim points straight at
+	// where the target is now. Only LearnerAim launches such an option.
+	straight bool
 }
 
 // beats reports whether o is a better launch than other: a higher score, or
@@ -136,6 +206,9 @@ func (a *HeuristicV2Agent) Decide(ctx context.Context, request TurnRequest) (Dec
 	if err := ctx.Err(); err != nil {
 		return Decision{}, err
 	}
+	// This turn's launches replace the previous turn's, so LastChoices never
+	// mixes two turns, even if this call fails part-way.
+	a.lastChoices = nil
 	view := request.View
 	bodies := sortedBodies(view)
 
@@ -191,8 +264,11 @@ func (a *HeuristicV2Agent) Decide(ctx context.Context, request TurnRequest) (Dec
 		// doesn't mark its target as taken, so v2's other planets may still
 		// attack that target.
 		if a.randomTurn() {
+			a.stats.RandomMoves++
 			if action, ok := randomMove(a.rng, a.randomMove, request.PlayerID, source); ok {
 				actions = append(actions, action)
+				a.stats.Launches++
+				a.lastChoices = append(a.lastChoices, LaunchChoice{Source: source.id, Target: NoTarget})
 			}
 			continue
 		}
@@ -226,6 +302,12 @@ func (a *HeuristicV2Agent) Decide(ctx context.Context, request TurnRequest) (Dec
 			Ships:    best.ships,
 			Angle:    best.aim.Angle,
 		})
+		// Report it: one more launch, and whether it was aimed straight.
+		a.stats.Launches++
+		if best.straight {
+			a.stats.AimedStraight++
+		}
+		a.lastChoices = append(a.lastChoices, LaunchChoice{Source: source.id, Target: best.target.id})
 	}
 	return Decision{Actions: actions}, nil
 }
@@ -501,7 +583,10 @@ func (a *HeuristicV2Agent) bestTarget(view View, predictor *game.Predictor, sour
 			return launchOption{}, false
 		}
 		chosen := candidates[0]
-		chosen.aim, _ = aimAheadOrStraight(predictor, source, chosen.target, chosen.ships)
+		var aimedAhead bool
+		chosen.aim, aimedAhead = aimAheadOrStraight(predictor, source, chosen.target, chosen.ships)
+		a.countAimAhead(aimedAhead)
+		chosen.straight = !aimedAhead
 		return chosen, true
 	}
 
@@ -559,6 +644,7 @@ func (a *HeuristicV2Agent) aim(view View, predictor *game.Predictor, source body
 		// Aim ahead, for a fleet of exactly this size. If it can't aim
 		// ahead, v2 skips the target.
 		aim, ok := predictor.LeadAim(source.id, c.target.id, ships)
+		a.countAimAhead(ok)
 		if !ok {
 			return launchOption{}, false
 		}
@@ -606,10 +692,12 @@ func (a *HeuristicV2Agent) aim(view View, predictor *game.Predictor, source body
 // ahead at (see aim).
 func (a *HeuristicV2Agent) learnerAim(view View, predictor *game.Predictor, source body, available int, c launchOption, incoming []arrival) (launchOption, bool) {
 	aim, aimedAhead := aimAheadOrStraight(predictor, source, c.target, c.ships)
+	a.countAimAhead(aimedAhead)
 	if !aimedAhead {
 		// Aiming straight simulates no flight, so there is no real arrival
 		// time to re-price at: keep pass 1's estimated price and score.
 		c.aim = aim
+		c.straight = true
 		return c, true
 	}
 	// Re-price at the real arrival. Aim.Turns' whole part is the turn it
