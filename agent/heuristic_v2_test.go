@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"math"
+	"math/rand"
 	"reflect"
 	"testing"
 
@@ -246,11 +247,591 @@ func TestHeuristicV2DecisionsOnSmallBoards(t *testing.T) {
 			// Every launch is aimed exactly as the engine's LeadAim aims it.
 			for _, action := range decision.Actions {
 				if !aimedByLeadAim(g, action) {
-					t.Errorf("launch %+v is not a verified LeadAim heading", action)
+					t.Errorf("launch %+v is not aimed ahead as the engine's LeadAim aims it", action)
 				}
 			}
 		})
 	}
+}
+
+// TestHeuristicV2WholeGarrison checks whole_garrison, and the reserve and
+// garrison_cost settings that refine it, on small boards built like
+// TestHeuristicV2DecisionsOnSmallBoards's.
+func TestHeuristicV2WholeGarrison(t *testing.T) {
+	mine := func(id int, x, y float64, ships int) game.Planet {
+		return game.Planet{ID: id, OwnerID: 0, Ships: ships, Production: 1, Position: game.Vec2{X: x, Y: y}}
+	}
+	neutral := func(id int, x, y float64, ships int) game.Planet {
+		return game.Planet{ID: id, OwnerID: game.NeutralPlayer, Ships: ships, Production: 3, Position: game.Vec2{X: x, Y: y}}
+	}
+	// plain is a board where planet 1 can take planet 2 with 11 ships.
+	plain := func(ships int) []game.Planet {
+		return []game.Planet{mine(1, 20, 20, ships), neutral(2, 30, 20, 10)}
+	}
+	// threatened is planet 1 with 30 ships, and 28 enemy ships landing on it
+	// in its sixth turn, so normal v2 keeps 22 of them at home.
+	threatened := []game.Planet{mine(1, 20, 20, 30), neutral(2, 20, 40, 10)}
+	threat := []game.Fleet{{ID: 10, OwnerID: 1, Ships: 28, Position: game.Vec2{X: 35, Y: 20},
+		Velocity: game.Vec2{X: -game.FleetSpeed(28, 6)}, Angle: math.Pi, LaunchTurn: -1}}
+
+	whole := func(reserve ReserveRule, cost GarrisonCost) HeuristicV2Config {
+		return HeuristicV2Config{Margin: 0, EnemyBonus: 1, Candidates: 4, WholeGarrison: true, Reserve: reserve, GarrisonCost: cost}
+	}
+	tests := []struct {
+		name    string
+		config  HeuristicV2Config
+		planets []game.Planet
+		fleets  []game.Fleet
+		// turn is how many of the board's 500 turns are already played.
+		turn int
+		// want lists the expected launches as source → ships, in order.
+		want [][2]int
+	}{
+		{
+			name:    "sends every ship, not only the 11 needed",
+			config:  whole(ReserveHold, GarrisonCostSent),
+			planets: plain(50),
+			want:    [][2]int{{1, 50}},
+		},
+		{
+			name:    "reserve=hold holds a body that needs defenders",
+			config:  whole(ReserveHold, GarrisonCostSent),
+			planets: threatened,
+			fleets:  threat,
+		},
+		{
+			name:    "reserve=ignore launches every ship anyway",
+			config:  whole(ReserveIgnore, GarrisonCostSent),
+			planets: threatened,
+			fleets:  threat,
+			want:    [][2]int{{1, 30}},
+		},
+		{
+			// With 20 turns left, planet 2's production gains more than the
+			// 11 ships the capture needs, but less than the 100 sent.
+			name:    "garrison_cost=sent holds when the ships sent outweigh the gain",
+			config:  whole(ReserveHold, GarrisonCostSent),
+			planets: plain(100),
+			turn:    480,
+		},
+		{
+			name:    "garrison_cost=needed launches when only the ships needed count",
+			config:  whole(ReserveHold, GarrisonCostNeeded),
+			planets: plain(100),
+			turn:    480,
+			want:    [][2]int{{1, 100}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			factory, err := NewHeuristicV2Factory(tt.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			g := smallV2Board(t, tt.planets, tt.fleets)
+			g.Turn = tt.turn
+			decision := decideV2(t, factory, g, 0)
+
+			var got [][2]int
+			for _, action := range decision.Actions {
+				got = append(got, [2]int{action.PlanetID, action.Ships})
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("launches (source, ships) = %v, want %v", got, tt.want)
+			}
+			// The whole garrison is aimed as the engine's LeadAim aims it.
+			for _, action := range decision.Actions {
+				if !aimedByLeadAim(g, action) {
+					t.Errorf("launch %+v is not aimed ahead as the engine's LeadAim aims it", action)
+				}
+			}
+		})
+	}
+}
+
+// TestHeuristicV2LearnerAim checks learner_aim and no_aim_check on a board
+// where aiming ahead fails: the straight path from planet 1 at (20, 50) to
+// planet 2 at (80, 50) crosses the sun, so game.LeadAim finds no way there.
+// Normal v2 skips such a target; the learner, and v2 with its aim, aim
+// straight instead.
+func TestHeuristicV2LearnerAim(t *testing.T) {
+	planets := func(ships int) []game.Planet {
+		return []game.Planet{
+			{ID: 1, OwnerID: 0, Ships: ships, Production: 1, Position: game.Vec2{X: 20, Y: 50}},
+			{ID: 2, OwnerID: game.NeutralPlayer, Ships: 10, Production: 3, Position: game.Vec2{X: 80, Y: 50}},
+		}
+	}
+	// Aiming straight from (20, 50) at (80, 50) points along +x: angle 0.
+	straight := math.Atan2(50-50, 80-20)
+
+	base := HeuristicV2Config{Margin: 0, EnemyBonus: 1, Candidates: 4}
+	learnerAim := base
+	learnerAim.LearnerAim = true
+	noAimCheck := learnerAim
+	noAimCheck.NoAimCheck = true
+	wholeLearnerAim := learnerAim
+	wholeLearnerAim.WholeGarrison = true
+
+	tests := []struct {
+		name   string
+		config HeuristicV2Config
+		// want lists the expected launches as source → ships, in order.
+		want [][2]int
+	}{
+		{name: "normal v2 skips a target it can't aim ahead at", config: base},
+		{name: "learner_aim aims straight instead", config: learnerAim, want: [][2]int{{1, 11}}},
+		{name: "no_aim_check launches the top target, aimed straight", config: noAimCheck, want: [][2]int{{1, 11}}},
+		{name: "with whole_garrison, every ship goes, aimed straight", config: wholeLearnerAim, want: [][2]int{{1, 50}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			factory, err := NewHeuristicV2Factory(tt.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			g := smallV2Board(t, planets(50), nil)
+			decision := decideV2(t, factory, g, 0)
+
+			var got [][2]int
+			for _, action := range decision.Actions {
+				got = append(got, [2]int{action.PlanetID, action.Ships})
+				if action.Angle != straight {
+					t.Errorf("launch %+v: angle %v, want %v (aimed straight)", action, action.Angle, straight)
+				}
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("launches (source, ships) = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHeuristicV2Epsilon checks the epsilon dial: at 1 v2 plays exactly like
+// random-v1, at 0 it never rolls the die, and in between a game replays
+// exactly from its seed.
+func TestHeuristicV2Epsilon(t *testing.T) {
+	v2 := func(t *testing.T, spec string) Factory {
+		t.Helper()
+		factory, err := ParseFactory(HeuristicV2Default + spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return factory
+	}
+
+	t.Run("epsilon=1 plays exactly like random-v1 with the same settings and seed", func(t *testing.T) {
+		pairs := []struct{ v2, random string }{
+			// The epsilon_* defaults are the pinned random-v1 settings.
+			{",epsilon=1", "random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2"},
+			// Custom epsilon_* settings become random-v1's settings.
+			{",epsilon=1,epsilon_launch_probability=1,epsilon_min_fraction=0.5", "random-v1:launch_probability=1,max_fraction=0.8,min_fraction=0.5"},
+		}
+		for _, pair := range pairs {
+			random, err := ParseFactory(pair.random)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// random-v1 plays seat 0, and the epsilon=1 v2 is asked on the
+			// same boards with the same seed: every decision must match.
+			want := playSeatZero(t, random, 7, nil)
+			got := playSeatZero(t, random, 7, v2(t, pair.v2))
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s decided differently from %s", pair.v2, pair.random)
+			}
+			if countLaunches(want) == 0 {
+				t.Fatalf("%s never launched, so the comparison proves nothing", pair.random)
+			}
+		}
+	})
+
+	t.Run("epsilon=0 never rolls the die", func(t *testing.T) {
+		for _, tt := range []struct {
+			spec    string
+			wantRNG bool
+		}{{"", false}, {",epsilon=0.5", true}} {
+			created, err := v2(t, tt.spec).New(context.Background(), AgentInit{AgentSeed: 7})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hasRNG := created.(*HeuristicV2Agent).rng != nil; hasRNG != tt.wantRNG {
+				t.Errorf("spec %q: has a random source = %v, want %v", tt.spec, hasRNG, tt.wantRNG)
+			}
+		}
+	})
+
+	// Which planets move randomly must follow the epsilon actually set, not
+	// just "some". On epsilonBoard, every planet would launch under plain v2,
+	// so a planet that holds proves its random move skipped v2's planning.
+	// Each seed below gives a mix of v2 moves, random launches and random
+	// holds, and a different mix from the other two settings, so a dial
+	// stuck at one value would fail.
+	t.Run("each planet follows the die at epsilon 0.25, 0.5 and 0.75", func(t *testing.T) {
+		g := epsilonBoard(t)
+		plain, err := NewHeuristicV2Factory(HeuristicV2Config{Margin: 0, EnemyBonus: 1, Candidates: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if launches := len(decideV2(t, plain, g, 0).Actions); launches != 6 {
+			t.Fatalf("plain v2 launched from %d planets, want all 6", launches)
+		}
+		kinds := func(moves []epsilonMove) []string {
+			var k []string
+			for _, m := range moves {
+				k = append(k, m.kind)
+			}
+			return k
+		}
+		settings := []struct {
+			epsilon float64
+			seed    int64
+		}{{0.25, 7}, {0.5, 1}, {0.75, 4}}
+		for _, s := range settings {
+			want := predictEpsilon(t, g, s.epsilon, s.seed)
+			// The seed still gives the intended mix and pattern.
+			seen := map[string]bool{}
+			for _, m := range want {
+				seen[m.kind] = true
+			}
+			if !seen["v2"] || !seen["random launch"] || !seen["random hold"] {
+				t.Fatalf("epsilon %v seed %d: kinds %v lack a v2 move, a random launch or a random hold", s.epsilon, s.seed, kinds(want))
+			}
+			for _, other := range settings {
+				if other.epsilon != s.epsilon && reflect.DeepEqual(kinds(predictEpsilon(t, g, other.epsilon, s.seed)), kinds(want)) {
+					t.Fatalf("epsilon %v seed %d: same pattern as epsilon %v, so it can't tell them apart", s.epsilon, s.seed, other.epsilon)
+				}
+			}
+
+			factory, err := NewHeuristicV2Factory(HeuristicV2Config{Margin: 0, EnemyBonus: 1, Candidates: 4, Epsilon: s.epsilon})
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := factory.New(context.Background(), AgentInit{AgentSeed: s.seed})
+			if err != nil {
+				t.Fatal(err)
+			}
+			decision, err := created.Decide(context.Background(), TurnRequest{PlayerID: 0, View: NewView(g)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wantActions []game.Action
+			for _, m := range want {
+				if m.kind != "random hold" {
+					wantActions = append(wantActions, m.action)
+				}
+			}
+			if !reflect.DeepEqual(decision.Actions, wantActions) {
+				t.Errorf("epsilon %v seed %d (%v):\n got %v\nwant %v", s.epsilon, s.seed, kinds(want), decision.Actions, wantActions)
+			}
+		}
+	})
+
+	t.Run("epsilon=0.5 replays from its seed", func(t *testing.T) {
+		half := v2(t, ",epsilon=0.5")
+		first := playSeatZero(t, half, 7, nil)
+		if again := playSeatZero(t, half, 7, nil); !reflect.DeepEqual(again, first) {
+			t.Fatal("the same seed played a different game")
+		}
+		if other := playSeatZero(t, half, 8, nil); reflect.DeepEqual(other, first) {
+			t.Fatal("seeds 7 and 8 played the same game, so the seed isn't used")
+		}
+		if countLaunches(first) == 0 {
+			t.Fatal("epsilon=0.5 never launched")
+		}
+	})
+}
+
+// TestHeuristicV2Reports checks AimStats and LastChoices, the read-only
+// reports the bot-only runner uses, on the board where the path from planet 1
+// to planet 2 crosses the sun, so aiming ahead fails.
+func TestHeuristicV2Reports(t *testing.T) {
+	g := smallV2Board(t, []game.Planet{
+		{ID: 1, OwnerID: 0, Ships: 50, Production: 1, Position: game.Vec2{X: 20, Y: 50}},
+		{ID: 2, OwnerID: game.NeutralPlayer, Ships: 10, Production: 3, Position: game.Vec2{X: 80, Y: 50}},
+	}, nil)
+	// decide makes a bot from spec and lets it decide on g once per turn,
+	// turns times, always on the same board.
+	decide := func(t *testing.T, spec string, turns int) *HeuristicV2Agent {
+		t.Helper()
+		factory, err := ParseFactory(HeuristicV2Default + spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		created, err := factory.New(context.Background(), AgentInit{AgentSeed: 7})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bot := created.(*HeuristicV2Agent)
+		for range turns {
+			if _, err := bot.Decide(context.Background(), TurnRequest{PlayerID: 0, View: NewView(g)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return bot
+	}
+
+	t.Run("learner_aim counts a failed aim and a straight launch", func(t *testing.T) {
+		// Each turn: one target, one attempt to aim ahead that fails, and
+		// one launch aimed straight at planet 2. Two turns add up.
+		bot := decide(t, ",learner_aim=1", 2)
+		want := AimStats{AimAheadAttempts: 2, AimAheadFailed: 2, AimedStraight: 2, Launches: 2}
+		if got := bot.AimStats(); got != want {
+			t.Errorf("AimStats = %+v, want %+v", got, want)
+		}
+		// LastChoices holds only the latest turn's launch, not both turns'.
+		if got, want := bot.LastChoices(), []LaunchChoice{{Source: 1, Target: 2}}; !reflect.DeepEqual(got, want) {
+			t.Errorf("LastChoices = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("normal v2 counts the failed aim but doesn't launch", func(t *testing.T) {
+		bot := decide(t, "", 1)
+		want := AimStats{AimAheadAttempts: 1, AimAheadFailed: 1}
+		if got := bot.AimStats(); got != want {
+			t.Errorf("AimStats = %+v, want %+v", got, want)
+		}
+		if got := bot.LastChoices(); len(got) != 0 {
+			t.Errorf("LastChoices = %v, want none", got)
+		}
+	})
+
+	t.Run("a random launch has no target", func(t *testing.T) {
+		// epsilon=1 makes every move random, and epsilon_launch_probability=1
+		// makes planet 1's 50 ships always launch.
+		bot := decide(t, ",epsilon=1,epsilon_launch_probability=1", 1)
+		want := AimStats{Launches: 1, RandomLaunches: 1, RandomMoves: 1}
+		if got := bot.AimStats(); got != want {
+			t.Errorf("AimStats = %+v, want %+v", got, want)
+		}
+		if got, want := bot.LastChoices(), []LaunchChoice{{Source: 1, Target: NoTarget}}; !reflect.DeepEqual(got, want) {
+			t.Errorf("LastChoices = %v, want %v", got, want)
+		}
+	})
+
+	// Both "All three" testers in experiment 1 take the no_aim_check path,
+	// which aims and counts on its own. One bot plays two boards in turn:
+	// first one where aiming ahead works, then the sun board, where it fails
+	// and the launch goes straight.
+	t.Run("no_aim_check counts a successful aim and a straight launch", func(t *testing.T) {
+		reachable := smallV2Board(t, []game.Planet{
+			{ID: 3, OwnerID: 0, Ships: 50, Production: 1, Position: game.Vec2{X: 20, Y: 20}},
+			{ID: 4, OwnerID: game.NeutralPlayer, Ships: 10, Production: 3, Position: game.Vec2{X: 30, Y: 20}},
+		}, nil)
+		for _, cost := range []string{"", ",garrison_cost=needed"} {
+			factory, err := ParseFactory(HeuristicV2Default + cost + ",learner_aim=1,no_aim_check=1,whole_garrison=1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := factory.New(context.Background(), AgentInit{AgentSeed: 7})
+			if err != nil {
+				t.Fatal(err)
+			}
+			bot := created.(*HeuristicV2Agent)
+			steps := []struct {
+				board       *game.Game
+				wantStats   AimStats
+				wantChoices []LaunchChoice
+			}{
+				// Aims ahead at planet 4 and launches all 50 ships.
+				{reachable, AimStats{AimAheadAttempts: 1, Launches: 1, AimedAhead: 1}, []LaunchChoice{{Source: 3, Target: 4}}},
+				// Can't aim ahead at planet 2, so aims straight; counts add up.
+				{g, AimStats{AimAheadAttempts: 2, AimAheadFailed: 1, Launches: 2, AimedAhead: 1, AimedStraight: 1}, []LaunchChoice{{Source: 1, Target: 2}}},
+			}
+			for i, step := range steps {
+				if _, err := bot.Decide(context.Background(), TurnRequest{PlayerID: 0, View: NewView(step.board)}); err != nil {
+					t.Fatal(err)
+				}
+				if got := bot.AimStats(); got != step.wantStats {
+					t.Errorf("spec %q, board %d: AimStats = %+v, want %+v", cost, i+1, got, step.wantStats)
+				}
+				if got := bot.LastChoices(); !reflect.DeepEqual(got, step.wantChoices) {
+					t.Errorf("spec %q, board %d: LastChoices = %v, want %v", cost, i+1, got, step.wantChoices)
+				}
+			}
+		}
+	})
+
+	// Over a real game, with learner_aim and epsilon both on, the bot makes
+	// all three kinds of launch, and every launch must be in exactly one.
+	t.Run("every launch is counted once: aimed ahead, aimed straight or random", func(t *testing.T) {
+		factory, err := ParseFactory(HeuristicV2Default + ",epsilon=0.5,learner_aim=1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		created, err := factory.New(context.Background(), AgentInit{AgentSeed: 7})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bot := created.(*HeuristicV2Agent)
+		match, err := scenario.GeneratorV2{FourPlayer: true}.New(1000000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		launches := 0
+		for !match.Finished() && match.Turn < 150 {
+			decision, err := bot.Decide(context.Background(), TurnRequest{PlayerID: 0, View: NewView(match)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			launches += len(decision.Actions)
+			if err := match.AdvanceTurn(decision.Actions); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		s := bot.AimStats()
+		if s.Launches != launches {
+			t.Errorf("Launches = %d, but the bot made %d", s.Launches, launches)
+		}
+		if sum := s.AimedAhead + s.AimedStraight + s.RandomLaunches; sum != s.Launches {
+			t.Errorf("AimedAhead %d + AimedStraight %d + RandomLaunches %d = %d, want Launches %d",
+				s.AimedAhead, s.AimedStraight, s.RandomLaunches, sum, s.Launches)
+		}
+		if s.RandomLaunches > s.RandomMoves {
+			t.Errorf("RandomLaunches %d is more than RandomMoves %d", s.RandomLaunches, s.RandomMoves)
+		}
+		if s.AimedAhead == 0 || s.AimedStraight == 0 || s.RandomLaunches == 0 {
+			t.Errorf("stats %+v: the game should include all three kinds of launch", s)
+		}
+	})
+
+	t.Run("a cancelled call leaves no choices from the turn before", func(t *testing.T) {
+		bot := decide(t, ",learner_aim=1", 1)
+		if len(bot.LastChoices()) != 1 {
+			t.Fatalf("setup: LastChoices = %v, want one launch", bot.LastChoices())
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := bot.Decide(ctx, TurnRequest{PlayerID: 0, View: NewView(g)}); err == nil {
+			t.Fatal("Decide with a cancelled context returned no error")
+		}
+		if got := bot.LastChoices(); len(got) != 0 {
+			t.Errorf("after a cancelled call, LastChoices = %v, want none", got)
+		}
+	})
+
+	t.Run("LastChoices returns a copy", func(t *testing.T) {
+		bot := decide(t, ",learner_aim=1", 1)
+		bot.LastChoices()[0].Target = 99
+		if got := bot.LastChoices()[0].Target; got != 2 {
+			t.Errorf("changing the returned list changed the bot's: target %d, want 2", got)
+		}
+	})
+}
+
+// epsilonBoard is six owned planets, each with 50 ships and its own neutral
+// target 10 units away, far from the others. Each planet's best target is its
+// own, so v2's choice for one planet never depends on another's, and the
+// planets can be checked one by one.
+func epsilonBoard(t *testing.T) *game.Game {
+	t.Helper()
+	pairs := [][4]float64{
+		{15, 15, 25, 15}, {85, 15, 75, 15}, {15, 85, 25, 85},
+		{85, 85, 75, 85}, {10, 50, 20, 50}, {90, 50, 80, 50},
+	}
+	var planets []game.Planet
+	for i, p := range pairs {
+		planets = append(planets,
+			game.Planet{ID: i + 1, OwnerID: 0, Ships: 50, Production: 1, Position: game.Vec2{X: p[0], Y: p[1]}},
+			game.Planet{ID: i + 11, OwnerID: game.NeutralPlayer, Ships: 10, Production: 3, Position: game.Vec2{X: p[2], Y: p[3]}})
+	}
+	return smallV2Board(t, planets, nil)
+}
+
+// epsilonMove is what one owned planet should do in one turn.
+type epsilonMove struct {
+	kind   string // "v2", "random launch" or "random hold"
+	action game.Action
+}
+
+// predictEpsilon works out, independently of the agent, what a v2 with this
+// epsilon and seed should do on g this turn. It replays the agent's random
+// source draw by draw: one die roll per owned planet with ships, in ID order,
+// and, after a roll below epsilon, random-v1's draws for that planet. A planet
+// whose roll says random makes random-v1's move, launch or hold; every other
+// planet makes the move a v2 without epsilon plans for it.
+func predictEpsilon(t *testing.T, g *game.Game, epsilon float64, seed int64) []epsilonMove {
+	t.Helper()
+	plain, err := NewHeuristicV2Factory(HeuristicV2Config{Margin: 0, EnemyBonus: 1, Candidates: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned := map[int]game.Action{}
+	for _, action := range decideV2(t, plain, g, 0).Actions {
+		planned[action.PlanetID] = action
+	}
+
+	rng := rand.New(rand.NewSource(seed))
+	var moves []epsilonMove
+	for _, source := range sortedBodies(NewView(g)) {
+		if source.ownerID != 0 || source.ships <= 0 {
+			continue
+		}
+		if rng.Float64() >= epsilon {
+			moves = append(moves, epsilonMove{kind: "v2", action: planned[source.id]})
+			continue
+		}
+		if action, ok := randomMove(rng, heuristicV2DefaultRandomMove, 0, source); ok {
+			moves = append(moves, epsilonMove{kind: "random launch", action: action})
+		} else {
+			moves = append(moves, epsilonMove{kind: "random hold"})
+		}
+	}
+	return moves
+}
+
+// playSeatZero plays the first 60 turns of a four-player game in which seat 0
+// is played by player, seeded with seed, and the other seats hold. It returns
+// seat 0's moves, turn by turn. When shadow is set, a second agent with the
+// same seed is asked on each of the same boards, and its moves are returned
+// instead; the game itself still follows player's moves.
+func playSeatZero(t *testing.T, player Factory, seed int64, shadow Factory) [][]game.Action {
+	t.Helper()
+	ctx := context.Background()
+	g, err := scenario.GeneratorV2{FourPlayer: true}.New(1000000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAgent := func(factory Factory) Agent {
+		created, err := factory.New(ctx, AgentInit{PlayerID: 0, AgentSeed: seed})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return created
+	}
+	playing := newAgent(player)
+	asked := playing
+	if shadow != nil {
+		asked = newAgent(shadow)
+	}
+
+	var moves [][]game.Action
+	for !g.Finished() && g.Turn < 60 {
+		decision, err := playing.Decide(ctx, TurnRequest{PlayerID: 0, View: NewView(g)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorded := decision
+		if shadow != nil {
+			if recorded, err = asked.Decide(ctx, TurnRequest{PlayerID: 0, View: NewView(g)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		moves = append(moves, recorded.Actions)
+		if err := g.AdvanceTurn(decision.Actions); err != nil {
+			t.Fatalf("turn %d: the engine rejected the moves: %v", g.Turn, err)
+		}
+	}
+	return moves
+}
+
+// countLaunches is the number of launches in a game's moves.
+func countLaunches(moves [][]game.Action) int {
+	launches := 0
+	for _, turn := range moves {
+		launches += len(turn)
+	}
+	return launches
 }
 
 // TestHeuristicV2IsDeterministicAndLegal plays whole four-player games with
@@ -313,8 +894,9 @@ func decideV2(t *testing.T, factory Factory, g *game.Game, player int) Decision 
 	return decision
 }
 
-// aimedByLeadAim reports whether action's angle is the live game's verified
-// LeadAim heading for that source, target and fleet size, for some target.
+// aimedByLeadAim reports whether action is aimed ahead: whether its angle is
+// the live game's LeadAim direction for that source and fleet size, for some
+// target.
 func aimedByLeadAim(g *game.Game, action game.Action) bool {
 	for _, p := range g.Planets {
 		if aim, ok := g.LeadAim(action.PlanetID, p.ID, action.Ships); ok && aim.Angle == action.Angle {

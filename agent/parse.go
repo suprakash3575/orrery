@@ -2,7 +2,6 @@ package agent
 
 import (
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 )
@@ -54,65 +53,34 @@ func ParseFactory(input string) (Factory, error) {
 		if !hasParameters {
 			return nil, fmt.Errorf("%s requires parameters", HeuristicV2)
 		}
-		parameters, err := parseFloatParameters(rawParameters, "margin", "enemy_bonus", "candidates")
+		config, err := parseHeuristicV2Config(rawParameters)
 		if err != nil {
 			return nil, fmt.Errorf("parse %s: %w", HeuristicV2, err)
 		}
-		// candidates is a count, so it must be a whole number; 4.5 is
-		// rejected rather than rounded, so a spec means exactly one thing.
-		candidates := parameters["candidates"]
-		if candidates != math.Trunc(candidates) || candidates < 1 || candidates > math.MaxInt32 {
-			return nil, fmt.Errorf("parse %s: candidates must be a whole number of at least 1", HeuristicV2)
-		}
-		return NewHeuristicV2Factory(HeuristicV2Config{
-			Margin:     parameters["margin"],
-			EnemyBonus: parameters["enemy_bonus"],
-			Candidates: int(candidates),
-		})
+		return NewHeuristicV2Factory(config)
 	default:
 		return nil, fmt.Errorf("unknown agent type %q", id)
 	}
 }
 
+// parseNumber reads one numeric parameter value.
+func parseNumber(name, valueText string) (float64, error) {
+	value, err := strconv.ParseFloat(valueText, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parameter %q: %w", name, err)
+	}
+	return value, nil
+}
+
 func parseFloatParameters(input string, requiredNames ...string) (map[string]float64, error) {
-	if input == "" {
-		return nil, fmt.Errorf("parameter list must not be empty")
-	}
-	required := make(map[string]bool, len(requiredNames))
-	for _, name := range requiredNames {
-		required[name] = true
-	}
-
 	parameters := make(map[string]float64, len(requiredNames))
-	remaining := input
-	for {
-		// Cut consumes one assignment without allocating a slice for every
-		// comma-separated parameter. Processing a final empty assignment also
-		// preserves the existing rejection of a trailing comma.
-		assignment, rest, hasNext := strings.Cut(remaining, ",")
-		name, valueText, hasValue := strings.Cut(assignment, "=")
-		if !hasValue || strings.Contains(valueText, "=") {
-			return nil, fmt.Errorf("parameter %q must use key=value", assignment)
-		}
-		if name == "" || valueText == "" {
-			return nil, fmt.Errorf("parameter %q must have a name and value", assignment)
-		}
-		if !required[name] {
-			return nil, fmt.Errorf("unknown parameter %q", name)
-		}
-		if _, exists := parameters[name]; exists {
-			return nil, fmt.Errorf("duplicate parameter %q", name)
-		}
-		value, err := strconv.ParseFloat(valueText, 64)
-		if err != nil {
-			return nil, fmt.Errorf("parameter %q: %w", name, err)
-		}
+	err := scanParameters(input, requiredNames, func(name, valueText string) error {
+		value, err := parseNumber(name, valueText)
 		parameters[name] = value
-
-		if !hasNext {
-			break
-		}
-		remaining = rest
+		return err
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	for _, name := range requiredNames {
@@ -121,4 +89,51 @@ func parseFloatParameters(input string, requiredNames ...string) (map[string]flo
 		}
 	}
 	return parameters, nil
+}
+
+// scanParameters walks a comma-separated key=value list in input order. It
+// refuses malformed, unknown and duplicate entries itself, and hands each
+// value's text to visit, which converts it to that parameter's type.
+// Converting inside the walk keeps errors in input order, whatever type each
+// parameter has. visit's error stops the walk and is returned as it is.
+func scanParameters(input string, allowed []string, visit func(name, valueText string) error) error {
+	if input == "" {
+		return fmt.Errorf("parameter list must not be empty")
+	}
+	known := make(map[string]bool, len(allowed))
+	for _, name := range allowed {
+		known[name] = true
+	}
+
+	seen := make(map[string]bool, len(allowed))
+	remaining := input
+	for {
+		// Cut consumes one assignment without allocating a slice for every
+		// comma-separated parameter. Processing a final empty assignment also
+		// preserves the existing rejection of a trailing comma.
+		assignment, rest, hasNext := strings.Cut(remaining, ",")
+		name, valueText, hasValue := strings.Cut(assignment, "=")
+		if !hasValue || strings.Contains(valueText, "=") {
+			return fmt.Errorf("parameter %q must use key=value", assignment)
+		}
+		if name == "" || valueText == "" {
+			return fmt.Errorf("parameter %q must have a name and value", assignment)
+		}
+		if !known[name] {
+			return fmt.Errorf("unknown parameter %q", name)
+		}
+		if seen[name] {
+			return fmt.Errorf("duplicate parameter %q", name)
+		}
+		seen[name] = true
+		if err := visit(name, valueText); err != nil {
+			return err
+		}
+
+		if !hasNext {
+			break
+		}
+		remaining = rest
+	}
+	return nil
 }

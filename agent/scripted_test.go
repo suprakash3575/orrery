@@ -138,6 +138,93 @@ func TestRandomAgentIsDeterministicAndLegalAcrossRandomViews(t *testing.T) {
 	}
 }
 
+// TestRandomAgentMatchesRecordedMoves pins random-v1's exact moves: ships and
+// direction, for a fixed board and seed, four turns in a row. The expected
+// values were recorded with random-v1's code from before its per-planet rule
+// moved into randomMove, so any later change to its draw order, rounding or
+// zero-ship holds fails here. heuristic-v2's epsilon parity test can't catch
+// that alone, because both sides of it share randomMove.
+//
+// The board covers each case: planet 1 has 100 ships, planet 2 has 1 (which
+// can round to zero ships and hold, skipping the direction roll), planet 3
+// has 7, and planet 4 belongs to another player and is never moved.
+func TestRandomAgentMatchesRecordedMoves(t *testing.T) {
+	g := smallV2Board(t, []game.Planet{
+		{ID: 1, OwnerID: 0, Ships: 100, Production: 1, Position: game.Vec2{X: 20, Y: 20}},
+		{ID: 2, OwnerID: 0, Ships: 1, Production: 1, Position: game.Vec2{X: 80, Y: 20}},
+		{ID: 3, OwnerID: 0, Ships: 7, Production: 1, Position: game.Vec2{X: 20, Y: 80}},
+		{ID: 4, OwnerID: 1, Ships: 40, Production: 1, Position: game.Vec2{X: 80, Y: 80}},
+	}, nil)
+	// move is one recorded launch: the turn, the planet, the ships sent and
+	// the direction in radians.
+	type move struct {
+		turn, planet, ships int
+		angle               float64
+	}
+	tests := []struct {
+		spec string
+		want []move
+	}{
+		{
+			// The pinned opponent: launches rarely, a random share of ships.
+			spec: "random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2",
+			want: []move{
+				{0, 2, 1, 1.3120466068973313},
+				{0, 3, 3, 5.10745767698228},
+				{2, 3, 4, 2.9292437433643927},
+			},
+		},
+		{
+			// A fixed share: no fraction roll, so only launch and direction.
+			spec: "random-v1:launch_probability=1,max_fraction=0.5,min_fraction=0.5",
+			want: []move{
+				{0, 1, 50, 0.4146933517195851}, {0, 2, 1, 1.3120466068973313}, {0, 3, 4, 2.407674511881994},
+				{1, 1, 50, 2.415544515777209}, {1, 2, 1, 4.061302389034717}, {1, 3, 4, 1.3693672991971373},
+				{2, 1, 50, 0.7617614223624619}, {2, 2, 1, 2.9292437433643927}, {2, 3, 4, 4.498170566190589},
+				{3, 1, 50, 6.0995945195167}, {3, 2, 1, 2.13733189828558}, {3, 3, 4, 1.4270510592489858},
+			},
+		},
+		{
+			// The full range: planet 2's single ship keeps rounding to zero,
+			// so it always holds.
+			spec: "random-v1:launch_probability=1,max_fraction=1,min_fraction=0",
+			want: []move{
+				{0, 1, 7, 3.7956336122707857}, {0, 3, 6, 2.415544515777209},
+				{1, 1, 65, 4.622095318172554}, {1, 3, 5, 2.9292437433643927},
+				{2, 1, 72, 5.916694739469041}, {2, 3, 2, 1.4270510592489858},
+				{3, 1, 4, 5.823183456332798}, {3, 3, 3, 4.534651357437451},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.spec, func(t *testing.T) {
+			factory, err := ParseFactory(tt.spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := factory.New(context.Background(), AgentInit{AgentSeed: 42})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The same agent decides four times on the same board, so its
+			// random source carries on from one turn to the next.
+			var got []move
+			for turn := range 4 {
+				decision, err := created.Decide(context.Background(), TurnRequest{PlayerID: 0, View: NewView(g)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, action := range decision.Actions {
+					got = append(got, move{turn, action.PlanetID, action.Ships, action.Angle})
+				}
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("moves differ from the recorded ones:\n got %v\nwant %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRandomAgentUsesGlobalBodyIDOrder(t *testing.T) {
 	factory, err := NewRandomFactory(RandomConfig{LaunchProbability: 1, MinFraction: 0.5, MaxFraction: 0.5})
 	if err != nil {
