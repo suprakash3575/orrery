@@ -260,7 +260,11 @@ func markdownSummary(meta runMeta, summaries []testerSummary, c calibration, dec
 	if meta.TesterSpec != "" {
 		fmt.Fprintf(&b, "Tester `%s` is `%s`. ", specTester, meta.TesterSpec)
 	}
-	fmt.Fprintf(&b, "Seeds %d to %d, every seat, against three `%s` opponents. ", meta.SeedStart, meta.SeedStart+int64(meta.Seeds)-1, meta.Opponent)
+	against := fmt.Sprintf("three `%s` opponents", meta.Opponent)
+	if strings.Contains(meta.Opponent, "|") {
+		against = fmt.Sprintf("the lineup `%s` (clockwise | opposite | counter-clockwise of the tester)", meta.Opponent)
+	}
+	fmt.Fprintf(&b, "Seeds %d to %d, every seat, against %s. ", meta.SeedStart, meta.SeedStart+int64(meta.Seeds)-1, against)
 	fmt.Fprintf(&b, "%d of %d games completed in %.0f s on %d workers.\n\n", meta.Completed, meta.Planned, meta.ElapsedSeconds, meta.Workers)
 
 	b.WriteString("| Tester | Completed | Wins | Losses | Draws | Win rate | Seat 0 | Seat 1 | Seat 2 | Seat 3 | Eliminated | Launches/game | Zero-launch games | Length p10/p50/p90 |\n")

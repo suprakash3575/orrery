@@ -16,6 +16,7 @@ import (
 
 	"orrery/agent"
 	"orrery/game"
+	"orrery/mlenv"
 	"orrery/scenario"
 )
 
@@ -30,7 +31,7 @@ func testConfig(t *testing.T) matchConfig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return matchConfig{opponent: opponent, random: random, launchProbability: 0.42}
+	return matchConfig{opponents: mlenv.SingleOpponent(opponent), random: random, launchProbability: 0.42}
 }
 
 // testOptions is a one-tester, one-seed run into a fresh directory.

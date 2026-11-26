@@ -5,7 +5,9 @@
 // no Python, no GPU.
 //
 // With -tester-spec, any agent spec plays the tested seat instead of the
-// fixed testers. Such a run only measures; it gives no verdict.
+// fixed testers. Such a run only measures; it gives no verdict. -opponent
+// also takes a lineup of three specs joined by "|", seated by board role
+// from the tested seat, as mlenv seats training opponents.
 //
 // Each game is appended to games.jsonl as soon as it finishes, so an
 // interrupted run keeps its completed work. At the end it writes the sorted
@@ -35,6 +37,7 @@ import (
 	"time"
 
 	"orrery/agent"
+	"orrery/mlenv"
 )
 
 const (
@@ -130,7 +133,7 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	seeds := flags.Int("seeds", 25, "number of consecutive seeds; each is played from every seat")
 	probability := flags.Float64("launch-probability", defaultLaunchProbability, "diagnostic agents' chance to launch from each source each turn")
 	workers := flags.Int("workers", runtime.GOMAXPROCS(0), "games played at once")
-	opponent := flags.String("opponent", defaultOpponent, "agent spec for the three opponent seats")
+	opponent := flags.String("opponent", defaultOpponent, "agent spec for the three opponent seats, or three specs joined by | for the seats clockwise, opposite and counter-clockwise of the tested seat")
 	random := flags.String("random", defaultRandom, "agent spec for the random tester")
 	out := flags.String("out", "", "new directory for the results (required; never overwritten)")
 	if err := flags.Parse(args); err != nil {
@@ -184,15 +187,26 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 // the games on a fixed pool of workers, appending each to games.jsonl as it
 // finishes; then sort everything and write the summaries.
 func run(ctx context.Context, opts options, console io.Writer) (bool, error) {
-	opponent, err := agent.ParseFactory(opts.opponent)
+	// -opponent is read exactly as mlenv reads a training opponent: one spec
+	// for every opponent seat, or three joined by "|", one per board role.
+	opponents, err := mlenv.ParseLineup(opts.opponent, agent.ParseFactory)
+	if err == nil {
+		err = opponents.ValidateFor(players)
+	}
 	if err != nil {
 		return false, fmt.Errorf("-opponent: %w", err)
+	}
+	// The heuristic tester is "the opponent playing itself", which only means
+	// something when every opponent seat plays one agent. A lineup's
+	// canonical form keeps the separator only when its entries differ.
+	if strings.Contains(opponents.String(), mlenv.LineupSeparator) && slices.Contains(opts.testers, "heuristic") {
+		return false, errors.New("-opponent: the heuristic tester needs one agent in every opponent seat; leave it out of -testers when the lineup is mixed")
 	}
 	random, err := agent.ParseFactory(opts.random)
 	if err != nil {
 		return false, fmt.Errorf("-random: %w", err)
 	}
-	config := matchConfig{opponent: opponent, random: random, launchProbability: opts.launchProbability}
+	config := matchConfig{opponents: opponents, random: random, launchProbability: opts.launchProbability}
 	if opts.testerSpec != "" {
 		if config.tester, err = agent.ParseFactory(opts.testerSpec); err != nil {
 			return false, fmt.Errorf("-tester-spec: %w", err)

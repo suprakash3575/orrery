@@ -10,6 +10,7 @@ import (
 	"orrery/agent"
 	"orrery/arena"
 	"orrery/game"
+	"orrery/mlenv"
 	"orrery/scenario"
 )
 
@@ -71,8 +72,10 @@ type gameRecord struct {
 
 // matchConfig is what every game of a run shares.
 type matchConfig struct {
-	opponent agent.Factory
-	random   agent.Factory
+	// opponents is the -opponent lineup: one agent for every opponent seat,
+	// or one per board role from the tested seat (see mlenv.Lineup).
+	opponents mlenv.Lineup
+	random    agent.Factory
 	// tester is the -tester-spec agent, played as specTester; nil when the
 	// fixed testers are played.
 	tester            agent.Factory
@@ -169,11 +172,19 @@ func matchID(j job) string {
 }
 
 // buildAgents creates one agent per seat. The tested seat gets the tester;
-// every other seat gets the opponent, built exactly as mlenv builds training
-// opponents: contestant ID "opponent-seat-<n>" and a seed from
-// arena.DeriveAgentSeed, so they behave as they do in training.
+// every other seat gets its opponent, chosen and built exactly as mlenv
+// builds training opponents: the lineup entry for the seat's board role as
+// seen from the tested seat, contestant ID "opponent-seat-<n>", and a seed
+// from arena.DeriveAgentSeed, so they behave as they do in training.
 func buildAgents(ctx context.Context, config matchConfig, j job, live *game.Game) ([]agent.Agent, error) {
 	agents := make([]agent.Agent, 0, players)
+	// The tested seat's frame says which seat is clockwise, opposite and
+	// counter-clockwise of it. NewSeatFrame needs the starting board, which
+	// live still is: no turn has been played yet.
+	frame, err := mlenv.NewSeatFrame(live, j.seat)
+	if err != nil {
+		return agents, err
+	}
 	for seat := range players {
 		var a agent.Agent
 		var err error
@@ -184,10 +195,14 @@ func buildAgents(ctx context.Context, config matchConfig, j job, live *game.Game
 			}
 			a, err = build(ctx, j, live)
 		} else {
+			// Every seat of a generator-v2-4p map is seated, so RoleOf always
+			// finds a role here.
+			role, _ := frame.RoleOf(seat)
+			factory := config.opponents.ForRole(role)
 			contestant := fmt.Sprintf("opponent-seat-%d", seat)
-			a, err = config.opponent.New(ctx, agent.AgentInit{
+			a, err = factory.New(ctx, agent.AgentInit{
 				MatchID: matchID(j), ScenarioSeed: j.seed, ContestantID: contestant, PlayerID: seat,
-				AgentSeed: arena.DeriveAgentSeed(j.seed, contestant, config.opponent.Spec()),
+				AgentSeed: arena.DeriveAgentSeed(j.seed, contestant, factory.Spec()),
 			})
 		}
 		if err != nil {
@@ -206,9 +221,12 @@ func (config matchConfig) buildTester(ctx context.Context, j job, live *game.Gam
 	switch j.tester {
 	case "heuristic":
 		// The calibration tester is the configured opponent playing itself:
-		// heuristic-v1 by default, whatever -opponent names otherwise.
-		init.AgentSeed = arena.DeriveAgentSeed(j.seed, init.ContestantID, config.opponent.Spec())
-		return config.opponent.New(ctx, init)
+		// heuristic-v1 by default, whatever -opponent names otherwise. run
+		// refuses this tester with a mixed lineup, so every role holds the
+		// same agent and any role's entry is it.
+		opponent := config.opponents.ForRole(mlenv.RoleCW)
+		init.AgentSeed = arena.DeriveAgentSeed(j.seed, init.ContestantID, opponent.Spec())
+		return opponent.New(ctx, init)
 	case "idle":
 		return agent.IdleFactory{}.New(ctx, init)
 	case "random":
@@ -234,7 +252,9 @@ func (config matchConfig) buildTester(ctx context.Context, j job, live *game.Gam
 // calibrationTester names the tester whose games the calibration checks:
 // "heuristic" for the fixed testers, and specTester when the -tester-spec
 // agent is the opponent spec itself (same canonical form), so every seat
-// plays the same agent. Any other tester spec has no calibration: "".
+// plays the same agent. A lineup whose three entries are all that spec
+// counts too: its canonical form is the one spec. Any other tester spec has
+// no calibration: "".
 //
 // The check expects the four seat runs of a seed to be one identical game,
 // which holds only for an agent with no randomness in play, such as
@@ -243,7 +263,7 @@ func (config matchConfig) calibrationTester() string {
 	switch {
 	case config.tester == nil:
 		return "heuristic"
-	case config.tester.Spec().String() == config.opponent.Spec().String():
+	case config.tester.Spec().String() == config.opponents.String():
 		return specTester
 	default:
 		return ""
