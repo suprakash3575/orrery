@@ -31,6 +31,7 @@ from scripts.diagnose import (
     GameDiagnosis,
     TurnSummary,
     diagnose_games,
+    diagnosis_seed_range,
     game_measurements,
 )
 
@@ -165,6 +166,63 @@ def test_explicit_opponent_reaches_the_runner_and_the_report(tmp_path: Path) -> 
     assert calls[0]["expected_metadata"]["opponent"] == RANDOM_OPPONENT
     assert report["opponent"] == RANDOM_OPPONENT
     assert (run / "run-config.json").read_bytes() == saved_config
+
+
+@pytest.mark.parametrize(
+    ("seed_start", "expected"),
+    [
+        (None, (1_000_000, 1_000_100)),
+        (1_005_000, (1_005_000, 1_005_100)),
+        (1_009_900, (1_009_900, 1_010_000)),
+        (999_999, "not inside the reusable validation seeds"),
+        (1_009_950, "not inside the reusable validation seeds"),
+        (1_010_000, "not inside the reusable validation seeds"),
+    ],
+    ids=[
+        "default: first validation seeds", "fresh maps", "last full range",
+        "starts in training maps", "runs past the end", "starts in evaluation pool 1",
+    ],
+)
+def test_diagnosis_seed_range(seed_start: int | None, expected: tuple[int, int] | str) -> None:
+    """100 boards stay inside the validation seeds [1,000,000, 1,010,000).
+
+    Training maps lie below them and the protected evaluation pools right
+    above, so a range touching either is refused.
+    """
+
+    config = load_run_config(Path(__file__).resolve().parents[2] / "configs" / "rl-v2-4p.toml")
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=expected):
+            diagnosis_seed_range(config, 100, seed_start)
+    else:
+        seed_range = diagnosis_seed_range(config, 100, seed_start)
+        assert (seed_range.start, seed_range.end) == expected
+
+
+def test_seed_start_reaches_the_runner_and_the_report(tmp_path: Path) -> None:
+    """--seed-start moves the games to fresh boards, and the report says which."""
+
+    run, checkpoint, state = _run(tmp_path)
+    calls = []
+    runner = _fake_runner(calls, start_planets=1, final_planets=1, turns=1, end_reason=END_GAME_FINISHED)
+
+    report, _charted = diagnose_games(
+        checkpoint=checkpoint,
+        seeds=2,
+        device="cpu",
+        out=tmp_path / "diagnosis",
+        charts=False,
+        game_charts=0,
+        traced_wins=0,
+        seed_start=1_005_000,
+        runner=runner,
+        loader_options={"loader": lambda _path, **_kwargs: state, "policy_factory": _Policy},
+    )
+
+    seeds = calls[0]["seeds"]
+    assert (seeds.start, seeds.end) == (1_005_000, 1_005_002)
+    assert calls[0]["expected_metadata"]["seed_range"] == [1_005_000, 1_005_002]
+    assert report["seeds"] == [1_005_000, 1_005_002]
 
 
 def test_untrained_baseline_rebuilds_identically_from_its_learner_seed() -> None:
