@@ -150,9 +150,9 @@ func (*HeuristicV2Agent) ID() string { return HeuristicV2 }
 func (a *HeuristicV2Agent) AimStats() AimStats { return a.stats }
 
 // LastChoices returns the previous Decide call's launches, in the same order
-// as its actions, so LastChoices()[i] describes Decision.Actions[i]. It is a
-// copy in its own memory, so the caller may keep or change it without
-// touching the bot's own list.
+// as its actions, so LastChoices()[i] describes Decision.Actions[i]. If that
+// call was cancelled or failed, it is empty. It is a copy in its own memory,
+// so the caller may keep or change it without touching the bot's own list.
 func (a *HeuristicV2Agent) LastChoices() []LaunchChoice {
 	return slices.Clone(a.lastChoices)
 }
@@ -203,12 +203,13 @@ func (o launchOption) beats(other launchOption) bool {
 
 // Decide emits at most one launch per owned body.
 func (a *HeuristicV2Agent) Decide(ctx context.Context, request TurnRequest) (Decision, error) {
+	// This turn's launches replace the previous turn's, first of all, so
+	// LastChoices never shows an earlier turn's launches, however this call
+	// ends: cancelled, failed part-way, or finished.
+	a.lastChoices = nil
 	if err := ctx.Err(); err != nil {
 		return Decision{}, err
 	}
-	// This turn's launches replace the previous turn's, so LastChoices never
-	// mixes two turns, even if this call fails part-way.
-	a.lastChoices = nil
 	view := request.View
 	bodies := sortedBodies(view)
 
