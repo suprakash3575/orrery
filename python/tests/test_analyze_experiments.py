@@ -6,7 +6,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.analyze_experiments import analyze, markdown
+from scripts.run_experiments import Runner, parse_plan
 
 V2 = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
 LIMITED = "heuristic-v2:candidates=4,enemy_bonus=1,garrison_cost=needed,learner_aim=1,margin=0.1,no_aim_check=1,whole_garrison=1"
@@ -61,6 +64,71 @@ def _bot_job(out: Path, label: str, winners: dict[int, int], calibration_seeds: 
         }],
     }))
     (folder / "done.json").write_text("{}")
+
+
+TRAIN_EXPERIMENT = f"""
+[session]
+name = "train-only"
+maps = {{ start = 1000000, count = 2 }}
+device = "cpu"
+cpu_workers = 2
+
+[[train]]
+name = "train"
+base_config = "configs/rl-v2-4p.toml"
+init_from = ["runs/b-s1/checkpoints/update-000153.pt"]
+max_updates = 2
+checkpoint_every_updates = 1
+progress_min_runs = 1
+training_opponents = {{ weak = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.75,margin=0.1" }}
+diagnose_against = {{ v2 = "{V2}" }}
+"""
+
+
+def test_a_train_job_trains_diagnoses_every_checkpoint_and_is_analysed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A train job writes its config, trains, then diagnoses each checkpoint.
+
+    Training and diagnosis are replaced by fakes that write what the real
+    commands write. Training wins 1 of 4 games in update 1 and 3 of 4 in
+    update 2, so its win rate is 25% then 75% and it rose. The diagnoses win
+    0 of 8 at checkpoint 1 and 1 of 8 at checkpoint 2, above 0%, which is
+    experiment 4's "first real progress".
+    """
+
+    plan = parse_plan(TRAIN_EXPERIMENT)
+    (job,) = plan.jobs
+    diagnosis_wins = iter([0, 1])
+
+    def fake_command(self, arguments, log, *, cwd, gomaxprocs):
+        if "orrery.train" in arguments:
+            run = Path(arguments[arguments.index("--run-dir") + 1])
+            (run / "checkpoints").mkdir(parents=True)
+            for update in (1, 2):
+                (run / "checkpoints" / f"update-{update:06d}.pt").write_bytes(b"weights")
+            (run / "metrics.csv").write_text("update,wins,losses,draws\n1,1,3,0\n2,3,1,0\n")
+            assert "--init-from" in arguments and gomaxprocs == plan.session.gomaxprocs
+        else:
+            out = Path(arguments[arguments.index("--out") + 1])
+            out.mkdir(parents=True)
+            report = {"games": {"measurements": {"games": 8, "wins": next(diagnosis_wins)}}}
+            (out / "report.json").write_text(json.dumps(report))
+        return 0
+
+    monkeypatch.setattr(Runner, "command", fake_command)
+    assert Runner(plan, tmp_path, Path("opponentcheck")).run_job(job) == "done"
+    folder = tmp_path / job.experiment / job.label
+    assert 'training_opponent = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.75,margin=0.1"' in (
+        folder / "config.toml"
+    ).read_text()
+
+    (tmp_path / "session.json").write_text(json.dumps({"experiment_text": TRAIN_EXPERIMENT, "runs": []}))
+    run = analyze(tmp_path)["train"]["train"]["runs"][0]
+    assert [c["training_win_rate"] for c in run["checkpoints"]] == [0.25, 0.75]
+    assert [c["diagnosis_win_rates"]["v2"] for c in run["checkpoints"]] == [0.0, 0.125]
+    assert run["training_rose"] is True
+    assert analyze(tmp_path)["train"]["train"]["answer"].startswith("First real progress")
 
 
 def test_bot_results_compare_and_answer_as_worked_out_by_hand(tmp_path: Path) -> None:
