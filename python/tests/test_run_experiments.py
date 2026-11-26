@@ -90,6 +90,12 @@ def test_a_small_file_expands_into_one_job_per_combination() -> None:
     assert specs_of(plan.jobs) == [V2, WEAK]
     with pytest.raises(PlanError, match="not a bot job"):
         parse_plan(SMALL.replace('candidate = "bots/weak"', 'candidate = "bots/missing"'))
+    # A progress threshold of 0 would count a run that did no better than
+    # its start, or need no run at all.
+    with pytest.raises(PlanError, match="progress_min_extra_wins must be at least 1, got 0"):
+        parse_plan(SMALL.replace("progress_min_extra_wins = 1", "progress_min_extra_wins = 0"))
+    with pytest.raises(PlanError, match="progress_min_runs must be at least 1, got 0"):
+        parse_plan(SMALL.replace("progress_min_extra_wins = 1", "progress_min_extra_wins = 1\nprogress_min_runs = 0"))
 
 
 def test_preflight_refuses_a_missing_checkpoint_and_a_non_canonical_spec() -> None:
@@ -99,7 +105,13 @@ def test_preflight_refuses_a_missing_checkpoint_and_a_non_canonical_spec() -> No
     plan = parse_plan(SMALL)
     missing = file_problems(plan, [job for job in plan.jobs if job.kind == "diagnose"])
     assert len(missing) == 4
-    assert "checkpoints/update-000030.pt does not exist" in missing[0]
+    # Every file diagnosing the checkpoint reads is checked, the two files
+    # beside the checkpoint and its run's files included.
+    assert missing[0] == (
+        "probe/v2__b-s1__u000030: these files do not exist: runs/b-s1/checkpoints/update-000030.pt, "
+        "runs/b-s1/checkpoints/update-000030.pt.sha256, runs/b-s1/checkpoints/update-000030.pt.metadata.json, "
+        "runs/b-s1/run-config.json, runs/b-s1/manifest.json, runs/b-s1/metrics.csv"
+    )
 
     def fake_opponentcheck(arguments, **_kwargs):
         forms = [V2 if spec.startswith("heuristic-v2:margin") else spec for spec in arguments[2:]]

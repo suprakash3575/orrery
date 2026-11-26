@@ -52,7 +52,13 @@ from typing import Any
 
 import numpy as np
 
-from scripts.compare_diagnoses import DEFAULT_RESAMPLES, bootstrap_range
+from scripts.compare_diagnoses import (
+    DEFAULT_RESAMPLES,
+    bootstrap_range,
+    load_report,
+    require_comparable,
+    require_valid,
+)
 from scripts.run_experiments import Job, Plan, job_state, parse_plan
 
 # Experiment 1's thresholds, as win-rate differences (a difference of -0.03
@@ -84,6 +90,13 @@ def points(value: float | None) -> str:
     -0.125 → "-12.5 pts", 0.05 → "+5.0 pts"."""
 
     return "undefined" if value is None else f"{100 * value:+.1f} pts"
+
+
+def diagnosis_cell(rate: float | None) -> str:
+    """A checkpoint's diagnosis win rate as a table cell; "missing" when the
+    checkpoint has no diagnosis report."""
+
+    return "missing" if rate is None else percent(rate)
 
 
 def job_folder(out: Path, job: Job) -> Path:
@@ -164,21 +177,27 @@ def bot_summary(out: Path, job: Job) -> dict[str, Any]:
     }
 
 
-def diagnosis_win_rate(report_path: Path) -> float:
-    """A diagnosis's win rate, from its report.json: wins ÷ games."""
-
-    games = json.loads(report_path.read_text())["games"]["measurements"]
-    return games["wins"] / games["games"]
-
-
 def diagnosis_wins(report_path: Path) -> dict[str, int] | None:
     """A diagnosis's wins and games, from its report.json; None when the
-    diagnosis is missing. Example: {"wins": 3, "games": 400}."""
+    diagnosis is missing. Example: {"wins": 3, "games": 400}.
+
+    Every diagnosis is read through this one function, so a missing report
+    is handled the same way everywhere: a training run that stopped early,
+    say, is reported as missing, never a crash.
+    """
 
     if not report_path.is_file():
         return None
     games = json.loads(report_path.read_text())["games"]["measurements"]
     return {"wins": games["wins"], "games": games["games"]}
+
+
+def diagnosis_win_rate(report_path: Path) -> float | None:
+    """A diagnosis's win rate, wins ÷ games; None when it is missing.
+    Example: 3 wins of 400 games gives 0.0075."""
+
+    result = diagnosis_wins(report_path)
+    return None if result is None else result["wins"] / result["games"]
 
 
 def training_win_rates(metrics_path: Path) -> list[tuple[int, int, int]]:
@@ -507,56 +526,114 @@ def train_progress(folder: Path, job: Job) -> dict[str, Any]:
     minus its starting checkpoint's wins, against the first
     diagnose_against opponent (full v2 in Stage 1).
 
-    Both diagnoses play the same maps, seats and opponent, so the difference
-    is what training added. The final checkpoint is the one at max_updates,
-    the update the experiment file asked for. extra_wins is None (the run is
-    pending) when either diagnosis is missing, for example because training
-    stopped early and never saved that checkpoint.
+    The difference only means "what training added" if both diagnoses are
+    clean and played the same games, so both are checked first (see
+    comparison_problem). The final checkpoint is the one at max_updates, the
+    update the experiment file asked for.
+
+    extra_wins is None when there is nothing to subtract:
+    - either diagnosis is missing (training stopped early and never saved
+      that checkpoint, say): the run is pending;
+    - the two fail the checks: ``invalid`` says why.
 
     Example: the start wins 1 of 400 games and the final checkpoint 6 of
-    400, so extra_wins is 5.
+    the same 400, so extra_wins is 5.
     """
 
-    against = next(iter(job.settings["diagnose_against"]))
+    against, spec = next(iter(job.settings["diagnose_against"].items()))
     final_update = job.settings["max_updates"]
-    start = diagnosis_wins(folder / "diagnoses" / f"start__{against}" / "report.json")
-    final = diagnosis_wins(folder / "diagnoses" / f"update-{final_update:06d}__{against}" / "report.json")
-    # Wins only compare if both played the same number of games, which they
-    # do when both ran in this session.
-    comparable = start is not None and final is not None and start["games"] == final["games"]
+    start_folder = folder / "diagnoses" / f"start__{against}"
+    final_folder = folder / "diagnoses" / f"update-{final_update:06d}__{against}"
+    start = diagnosis_wins(start_folder / "report.json")
+    final = diagnosis_wins(final_folder / "report.json")
+    invalid = None
+    if start is not None and final is not None:
+        invalid = comparison_problem(start_folder, final_folder, spec)
+    usable = start is not None and final is not None and invalid is None
     return {
         "against": against,
         "final_update": final_update,
         "start": start,
         "final": final,
-        "extra_wins": final["wins"] - start["wins"] if comparable else None,
+        "invalid": invalid,
+        "extra_wins": final["wins"] - start["wins"] if usable else None,
     }
 
 
-def train_answer(runs: Sequence[Mapping[str, Any]], min_runs: int, min_extra_wins: int) -> str:
-    """Experiment 4: progress if, for some training opponent, at least
-    min_runs runs' final checkpoints win at least min_extra_wins more games
-    than their starting checkpoints against the full opponent.
+def comparison_problem(start_folder: Path, final_folder: Path, opponent: str) -> str | None:
+    """Why two diagnoses can't be subtracted, or None when they can.
 
-    The four answers, checked in this order:
+    It reuses compare_diagnoses.py's checks, which every comparison of two
+    diagnoses must pass:
+    - each report is clean on its own (require_valid): every map seed
+      played from every seat exactly once, and no learner action rejected,
+      since a rejected action is a turn the model didn't really play;
+    - the two played the same games the same way (require_comparable): the
+      same opponent, map seeds, map-and-seat assignments, engine and
+      evaluation settings, so the model is the only difference.
+    Both must also have played the diagnose_against opponent the file asked
+    for, not some other one.
 
-    1. **Pending**: some run isn't done, or has no final-versus-start result
+    Example: a start that played seeds 1,000,000 to 1,000,099 and a final
+    that played 1,000,100 to 1,000,199 fail, because the two played
+    different maps.
+    """
+
+    try:
+        start, final = load_report(start_folder), load_report(final_folder)
+        require_valid(start, "start")
+        require_valid(final, "final")
+        require_comparable(start, final)
+    except ValueError as error:
+        return str(error)
+    except KeyError as error:
+        # A report from an older or broken diagnose, missing a field the
+        # checks read.
+        return f"a report is missing the field {error}"
+    for name, report in (("start", start), ("final", final)):
+        if report["games"]["opponent"] != opponent:
+            return f"the {name} report played {report['games']['opponent']!r}, not {opponent!r}"
+    return None
+
+
+def train_answer(runs: Sequence[Mapping[str, Any]], min_runs: int, min_extra_wins: int | None) -> str:
+    """Experiment 4's answer. Training made progress if, for some training
+    opponent, the final checkpoint won at least min_extra_wins more games
+    than its starting checkpoint against the full opponent, in at least
+    min_runs runs.
+
+    The answers, checked in this order:
+
+    1. **Unavailable**: min_extra_wins is None, because the session was made
+       before progress_min_extra_wins existed. There is no threshold to
+       judge by, so no verdict; its tables are still shown.
+    2. **Invalid evidence**: some run's start and final diagnoses fail the
+       checks in comparison_problem. Waiting won't fix that, so it comes
+       before pending, and no verdict is given.
+    3. **Pending**: some run isn't done, or has no final-versus-start result
        (see train_progress). No verdict is given on part of the evidence.
-    2. **Observed progress**: for one training opponent, at least min_runs
+    4. **Observed progress**: for one training opponent, at least min_runs
        runs reached min_extra_wins extra wins. It is called "observed"
        because the threshold is a screening rule on one set of maps, not a
        statistical test. Training on a weakened opponent is then a route
        forward.
-    3. **Partial**: no such progress, but the training win rate rose in at
+    5. **Partial**: no such progress, but the training win rate rose in at
        least min_runs runs: the model improves against the weakened
        opponent, yet that doesn't carry over to the full one.
-    4. **Not working**: neither.
+    6. **Not working**: neither.
 
     Example, min_runs 2 and min_extra_wins 4: three runs against one
     training opponent have 5, 4 and 0 extra wins. Two reach 4, so the
     answer is observed progress.
     """
 
+    if min_extra_wins is None:
+        return ("Unavailable: this session was made before progress_min_extra_wins existed, so there is no "
+                "progress threshold to judge its training by.")
+    invalid = [f"{run['job']} ({run['progress']['invalid']})" for run in runs
+               if run["done"] and run["progress"]["invalid"]]
+    if invalid:
+        return f"Invalid evidence: the start and final diagnoses can't be compared for {'; '.join(invalid)}."
     pending = [run["job"] for run in runs if not run["done"] or run["progress"]["extra_wins"] is None]
     if pending:
         return f"Pending: no final-versus-start result yet for {', '.join(pending)}."
@@ -690,7 +767,9 @@ def markdown(analysis: Mapping[str, Any]) -> str:
                 continue
             labels = list(run["checkpoints"][0]["diagnosis_win_rates"]) if run["checkpoints"] else []
             progress = run["progress"]
-            if progress["extra_wins"] is None:
+            if progress["invalid"]:
+                versus = f"Against {progress['against']}: invalid evidence ({progress['invalid']})."
+            elif progress["extra_wins"] is None:
                 versus = (f"Against {progress['against']}: pending (no start or update-{progress['final_update']} "
                           "diagnosis to compare).")
             else:
@@ -706,7 +785,8 @@ def markdown(analysis: Mapping[str, Any]) -> str:
                       "|---|---|" + "---|" * len(labels)]
             for checkpoint in run["checkpoints"]:
                 lines.append(f"| {checkpoint['update']} | {percent(checkpoint['training_win_rate'])} | "
-                             + " | ".join(percent(checkpoint["diagnosis_win_rates"][label]) for label in labels) + " |")
+                             + " | ".join(diagnosis_cell(checkpoint["diagnosis_win_rates"][label]) for label in labels)
+                             + " |")
             lines.append("")
         lines += [f"**Answer:** {section['answer']}", ""]
     return "\n".join(lines)

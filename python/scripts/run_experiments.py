@@ -297,12 +297,24 @@ def parse_plan(text: str) -> Plan:
         jobs.extend(_train_jobs(table))
         answers[table["name"]] = {
             "progress_min_runs": _int(table, "progress_min_runs", "[[train]]", default=2),
-            # Required: how many more wins than its starting checkpoint a
-            # run's final checkpoint needs to count as progress. A fair
-            # threshold depends on how many games a diagnosis plays, so each
-            # file states its own.
-            "progress_min_extra_wins": _int(table, "progress_min_extra_wins", "[[train]]"),
+            # How many more wins than its starting checkpoint a run's final
+            # checkpoint needs to count as progress. A fair threshold
+            # depends on how many games a diagnosis plays, so each file
+            # states its own. Reading accepts it missing (as None), because
+            # status and the analysis also read sessions saved before the
+            # setting existed; preflight still refuses a new run without it
+            # (setting_problems).
+            "progress_min_extra_wins": (
+                _int(table, "progress_min_extra_wins", "[[train]]")
+                if "progress_min_extra_wins" in table else None
+            ),
         }
+        # Both thresholds must be at least 1. With 0 extra wins, a run whose
+        # final checkpoint did no better than its start would count as
+        # progress; with 0 runs, progress would need no run at all.
+        for key, value in answers[table["name"]].items():
+            if value is not None and value < 1:
+                raise PlanError(f"[[train]] {table['name']}: {key} must be at least 1, got {value}")
 
     # Step 3: check the jobs fit together. Experiment names group jobs into
     # folders, so two sections may not share one, and job ids must be
@@ -612,8 +624,9 @@ def repository_path(path: str) -> Path:
 
 
 def checkpoint_file(run_dir: str, update: int) -> str:
-    """The checkpoint for one update, written as the experiment file writes
-    paths. Example: update 153 of runs/x is runs/x/checkpoints/update-000153.pt."""
+    """The checkpoint for one update, as a path from the repository root, the
+    way the experiment file writes paths. Example: update 153 of runs/x is
+    runs/x/checkpoints/update-000153.pt."""
 
     return (Path(run_dir) / "checkpoints" / f"update-{update:06d}.pt").as_posix()
 
@@ -625,11 +638,42 @@ def checkpoint_path(run_dir: str, update: int) -> Path:
 
 
 def start_run(init_from: str) -> str:
-    """The run that saved a starting checkpoint, written as the experiment
-    file writes paths. Example: runs/x/checkpoints/update-000153.pt gives
-    runs/x. Diagnosing the checkpoint needs its run's files."""
+    """The folder of the run that saved a starting checkpoint, as a path from
+    the repository root. Example: runs/x/checkpoints/update-000153.pt gives
+    runs/x. Diagnosing the checkpoint needs files from that folder."""
 
     return Path(init_from).parent.parent.as_posix()
+
+
+def diagnosis_inputs(run_dir: str, checkpoint: str) -> list[str]:
+    """Every file that diagnosing one checkpoint reads, as paths from the
+    repository root.
+
+    Preflight checks that each one exists, and the session fingerprint
+    hashes each one. Both use this list, so they always cover the same
+    files. The files are:
+    - the checkpoint, and the two files training writes beside it: .sha256
+      (its recorded hash, which must match the run's manifest) and
+      .metadata.json (the description checked before the checkpoint loads);
+    - from its run, run-config.json and manifest.json (the checkpoint is
+      checked against both) and metrics.csv (the run's training history).
+
+    Example: runs/x and runs/x/checkpoints/update-000153.pt give that .pt,
+    its .pt.sha256 and .pt.metadata.json, and runs/x/run-config.json,
+    runs/x/manifest.json and runs/x/metrics.csv.
+    """
+
+    return [
+        checkpoint, f"{checkpoint}.sha256", f"{checkpoint}.metadata.json",
+        *((Path(run_dir) / name).as_posix() for name in ("run-config.json", "manifest.json", "metrics.csv")),
+    ]
+
+
+def missing_files(names: Sequence[str]) -> list[str]:
+    """The files in ``names`` that don't exist. Each name is a path from the
+    repository root, such as runs/x/manifest.json."""
+
+    return [name for name in names if not repository_path(name).is_file()]
 
 
 def training_config(job: Job, session: Session) -> dict[str, Any]:
@@ -702,8 +746,12 @@ def canonical_problems(specs: Sequence[str], tool: Path,
 
 
 def file_problems(plan: Plan, jobs: Sequence[Job]) -> list[str]:
-    """Every missing checkpoint or run, and every train config that won't load.
+    """Every missing input file, and every train config that won't load.
 
+    A diagnose job needs every file that diagnosing its checkpoint reads.
+    A train job needs the same files for its starting checkpoint, because
+    it diagnoses that first (see diagnosis_inputs). Each job's missing
+    files are listed together on one line.
     Each train job's config is built and checked by the same code training
     uses (run_config_from_mapping), so a bad setting is found now, not when
     the job's turn comes hours later.
@@ -712,13 +760,15 @@ def file_problems(plan: Plan, jobs: Sequence[Job]) -> list[str]:
     problems = []
     for job in jobs:
         if job.kind == "diagnose":
-            path = checkpoint_path(job.settings["run_dir"], job.settings["update"])
-            if not path.is_file():
-                problems.append(f"{job.id}: checkpoint {path} does not exist")
+            run_dir = job.settings["run_dir"]
+            missing = missing_files(diagnosis_inputs(run_dir, checkpoint_file(run_dir, job.settings["update"])))
+            if missing:
+                problems.append(f"{job.id}: these files do not exist: {', '.join(missing)}")
         elif job.kind == "train":
-            start = repository_path(job.settings["init_from"])
-            if not start.is_file():
-                problems.append(f"{job.id}: starting checkpoint {start} does not exist")
+            start = job.settings["init_from"]
+            missing = missing_files(diagnosis_inputs(start_run(start), start))
+            if missing:
+                problems.append(f"{job.id}: these files of its starting checkpoint do not exist: {', '.join(missing)}")
             base = repository_path(job.settings["base_config"])
             if not base.is_file():
                 problems.append(f"{job.id}: base config {base} does not exist")
@@ -758,6 +808,24 @@ def describe(plan: Plan, jobs: Sequence[Job]) -> list[str]:
     return lines
 
 
+def setting_problems(plan: Plan, jobs: Sequence[Job]) -> list[str]:
+    """Settings a new run must have, even though reading the file lets them
+    be missing.
+
+    Reading the file accepts a missing progress_min_extra_wins, so that old
+    sessions saved before it existed stay readable (see parse_plan). A new
+    run without it would finish with no threshold to judge its training by,
+    so preflight refuses it.
+    """
+
+    trained = dict.fromkeys(job.experiment for job in jobs if job.kind == "train")
+    return [
+        f"[[train]] {experiment}: progress_min_extra_wins is required"
+        for experiment in trained
+        if plan.answers[experiment]["progress_min_extra_wins"] is None
+    ]
+
+
 def preflight(plan: Plan, jobs: Sequence[Job], bin_dir: Path) -> tuple[list[str], Path | None]:
     """Run every check. Returns the problems found and opponentcheck's path.
 
@@ -766,7 +834,7 @@ def preflight(plan: Plan, jobs: Sequence[Job], bin_dir: Path) -> tuple[list[str]
     fails there is no tool to check specs with, so that check is skipped.
     """
 
-    problems = file_problems(plan, jobs)
+    problems = setting_problems(plan, jobs) + file_problems(plan, jobs)
     try:
         tool = build_go_tools(bin_dir)
     except PlanError as error:
@@ -1096,14 +1164,14 @@ def versions() -> dict[str, Any]:
 # the file changes.
 # ---------------------------------------------------------------------------
 
-# The file git archive writes the commit into (see its own comments). It is
-# left out of the code hash: a Vast.ai bundle and a laptop checkout of the
-# same commit differ only in this file.
+# The file that git archive writes the commit into (see its own comments).
+# It is left out of the code hash, because a Vast.ai bundle and a laptop
+# checkout of the same commit differ only in this file.
 RELEASE_FILE = "cmd/env/release.go"
 
-# Top-level folders the search for Go code skips: run output, which can hold
-# many large files, and the Python side, whose files are listed separately.
-# Hidden folders (.git, .build) are skipped too.
+# Top-level folders skipped when searching for Go code: runs/, which holds
+# training output and can be large, and python/, whose files are listed
+# separately. Hidden folders (.git, .build) are skipped too.
 GO_SKIPPED = {"runs", "python"}
 
 
@@ -1167,9 +1235,8 @@ def code_fingerprint(root: Path = REPOSITORY_ROOT) -> dict[str, str | None]:
 
     digest = hashlib.sha256()
     for path in source_files(root):
-        # The "\0" and "\n" separate one file's name and hash from the next,
-        # so two different lists of files can't run together into the same
-        # text.
+        # "\0" ends each file's name and "\n" ends its hash, so two
+        # different lists of files can never give the same text to hash.
         digest.update(f"{path.relative_to(root).as_posix()}\0{file_sha256(path)}\n".encode())
     return {
         "source_sha256": digest.hexdigest(),
@@ -1181,34 +1248,31 @@ def code_fingerprint(root: Path = REPOSITORY_ROOT) -> dict[str, str | None]:
 
 
 def input_files(jobs: Sequence[Job]) -> list[str]:
-    """Every file the jobs read, as the experiment file writes paths, each
+    """Every file the jobs read, as paths from the repository root, each
     once and sorted.
 
-    Diagnosing a checkpoint reads the checkpoint, and from its run the
-    run-config.json and manifest.json (diagnose checks the checkpoint against
-    both) and metrics.csv (its training history). A diagnose job diagnoses
-    its checkpoint. A train job diagnoses its starting checkpoint and reads
-    its base config; its own settings are in the experiment file's text,
-    which a resume already compares. A bot job reads no files: its specs are
-    in that text too.
+    A diagnose job reads the files that diagnosing its checkpoint needs
+    (see diagnosis_inputs, the same list preflight checks). A train job
+    reads the same files for its starting checkpoint, which it diagnoses
+    first, plus its base config. Its own settings are in the experiment
+    file's text, which a resume already compares. A bot job reads no files:
+    its specs are in that text too.
     """
-
-    def run_files(run_dir: str) -> list[str]:
-        return [(Path(run_dir) / name).as_posix() for name in ("run-config.json", "manifest.json", "metrics.csv")]
 
     found: set[str] = set()
     for job in jobs:
         if job.kind == "diagnose":
-            found.add(checkpoint_file(job.settings["run_dir"], job.settings["update"]))
-            found.update(run_files(job.settings["run_dir"]))
+            run_dir = job.settings["run_dir"]
+            found.update(diagnosis_inputs(run_dir, checkpoint_file(run_dir, job.settings["update"])))
         elif job.kind == "train":
-            found.update((job.settings["init_from"], job.settings["base_config"]))
-            found.update(run_files(start_run(job.settings["init_from"])))
+            start = job.settings["init_from"]
+            found.update(diagnosis_inputs(start_run(start), start))
+            found.add(job.settings["base_config"])
     return sorted(found)
 
 
 def session_fingerprint(plan: Plan) -> dict[str, Any]:
-    """The code and every input file of the whole plan.
+    """The whole plan's fingerprint: its code and every input file.
 
     It covers every job in the file, not only the ones a run's --only picks:
     the analysis reads all finished jobs together, so all of them must come
@@ -1235,7 +1299,8 @@ def fingerprint_changes(saved: Mapping[str, Any] | None, current: Mapping[str, A
     changes = []
     for part in ("code", "inputs"):
         old, new = saved.get(part) or {}, current[part]
-        # Every key in either one, so a key only one of them has counts too.
+        # Look at every key either fingerprint has, so a key that only one
+        # of them has also counts as a change.
         for key in sorted(set(old) | set(new)):
             before, after = old.get(key), new.get(key)
             if before == after:

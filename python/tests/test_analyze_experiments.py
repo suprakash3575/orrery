@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from scripts.analyze_experiments import analyze, markdown, train_answer
-from scripts.run_experiments import Runner, parse_plan
+from scripts.analyze_experiments import analyze, markdown, train_answer, train_progress
+from scripts.run_experiments import Runner, parse_plan, print_status, setting_problems
 
 V2 = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
 LIMITED = "heuristic-v2:candidates=4,enemy_bonus=1,garrison_cost=needed,learner_aim=1,margin=0.1,no_aim_check=1,whole_garrison=1"
@@ -86,6 +86,23 @@ diagnose_against = {{ v2 = "{V2}" }}
 """
 
 
+def diagnosis_report(wins: int, *, seeds: tuple[int, int] = (1000000, 1000002), rejected: int = 0) -> dict:
+    """A clean diagnose report.json of 4 players against V2: every seed in
+    ``seeds`` from every seat once, ``wins`` of them won, and ``rejected``
+    learner actions refused by Go."""
+
+    results = [{"seed": seed, "seat": seat} for seed in range(*seeds) for seat in range(4)]
+    return {
+        "format": "diagnosis-v2",
+        "identity": {"players": 4, "contract": "rl-v2", "generator_version": "generator-v2-4p"},
+        "games": {
+            "seeds": list(seeds), "opponent": V2, "engine": "engine", "evaluation": {"device": "cpu"},
+            "rejected_actions": rejected, "game_results": results,
+            "measurements": {"games": len(results), "wins": wins},
+        },
+    }
+
+
 def test_a_train_job_trains_diagnoses_every_checkpoint_and_is_analysed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -115,8 +132,7 @@ def test_a_train_job_trains_diagnoses_every_checkpoint_and_is_analysed(
         else:
             out = Path(arguments[arguments.index("--out") + 1])
             out.mkdir(parents=True)
-            report = {"games": {"measurements": {"games": 8, "wins": next(diagnosis_wins)}}}
-            (out / "report.json").write_text(json.dumps(report))
+            (out / "report.json").write_text(json.dumps(diagnosis_report(next(diagnosis_wins))))
         return 0
 
     monkeypatch.setattr(Runner, "command", fake_command)
@@ -133,8 +149,18 @@ def test_a_train_job_trains_diagnoses_every_checkpoint_and_is_analysed(
     assert [c["diagnosis_win_rates"]["v2"] for c in run["checkpoints"]] == [0.0, 0.125]
     assert run["training_rose"] is True
     assert run["progress"] == {"against": "v2", "final_update": 2, "start": {"wins": 0, "games": 8},
-                               "final": {"wins": 1, "games": 8}, "extra_wins": 1}
+                               "final": {"wins": 1, "games": 8}, "invalid": None, "extra_wins": 1}
     assert analyze(tmp_path)["train"]["train"]["answer"].startswith("Observed progress")
+
+    # The final checkpoint's file is there but its report is not: the
+    # analysis must not crash, and the answer waits.
+    (folder / "diagnoses" / "update-000002__v2" / "report.json").unlink()
+    analysis = analyze(tmp_path)
+    run = analysis["train"]["train"]["runs"][0]
+    assert run["checkpoints"][1]["diagnosis_win_rates"]["v2"] is None
+    assert run["progress"]["extra_wins"] is None
+    assert analysis["train"]["train"]["answer"].startswith("Pending")
+    assert "| 2 | 75.0% | missing |" in markdown(analysis)
 
 
 def test_progress_needs_extra_wins_in_enough_runs_and_waits_for_every_result() -> None:
@@ -145,7 +171,7 @@ def test_progress_needs_extra_wins_in_enough_runs_and_waits_for_every_result() -
 
     def run(job: str, extra_wins: int | None) -> dict:
         return {"job": job, "done": True, "opponent": "weak", "training_rose": False,
-                "progress": {"against": "v2", "extra_wins": extra_wins}}
+                "progress": {"against": "v2", "invalid": None, "extra_wins": extra_wins}}
 
     runs = [run("train/weak__s1", 4), run("train/weak__s2", 4), run("train/weak__s3", 0)]
     assert train_answer(runs, min_runs=2, min_extra_wins=4).startswith("Observed progress")
@@ -153,6 +179,46 @@ def test_progress_needs_extra_wins_in_enough_runs_and_waits_for_every_result() -
     assert train_answer(runs, min_runs=2, min_extra_wins=4) == (
         "Pending: no final-versus-start result yet for train/weak__s2."
     )
+
+
+def test_a_session_saved_before_the_progress_threshold_stays_readable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A session.json saved before progress_min_extra_wins existed still
+    parses for status and the analysis, which give no progress verdict. A
+    new run of the same file is refused by preflight."""
+
+    old_text = TRAIN_EXPERIMENT.replace("progress_min_extra_wins = 1\n", "")
+    (tmp_path / "session.json").write_text(json.dumps({"experiment_text": old_text, "runs": []}))
+
+    assert print_status(tmp_path) == 0
+    assert "waiting    train/weak__b-s1" in capsys.readouterr().out
+    assert analyze(tmp_path)["train"]["train"]["answer"].startswith("Unavailable")
+    plan = parse_plan(old_text)
+    assert setting_problems(plan, plan.jobs) == ["[[train]] train: progress_min_extra_wins is required"]
+
+
+@pytest.mark.parametrize(("final", "reason"), [
+    (diagnosis_report(5, seeds=(1000002, 1000004)), "differ in: seeds, map-and-seat assignments"),
+    (diagnosis_report(5, rejected=1), "final report has 1 rejected actions"),
+])
+def test_progress_refuses_diagnoses_that_did_not_play_the_same_clean_games(
+    tmp_path: Path, final: dict, reason: str
+) -> None:
+    """The final checkpoint wins 5 more games than the start, but on other
+    maps, or with a turn the model didn't really play. Neither may count as
+    progress: the run is invalid evidence, with the reason."""
+
+    (job,) = parse_plan(TRAIN_EXPERIMENT).jobs
+    for name, report in (("start__v2", diagnosis_report(0)), ("update-000002__v2", final)):
+        (tmp_path / "diagnoses" / name).mkdir(parents=True)
+        (tmp_path / "diagnoses" / name / "report.json").write_text(json.dumps(report))
+
+    progress = train_progress(tmp_path, job)
+
+    assert progress["extra_wins"] is None and reason in progress["invalid"]
+    run = {"job": job.id, "done": True, "opponent": "weak", "training_rose": True, "progress": progress}
+    assert train_answer([run], min_runs=1, min_extra_wins=1).startswith("Invalid evidence")
 
 
 def test_bot_results_compare_and_answer_as_worked_out_by_hand(tmp_path: Path) -> None:
