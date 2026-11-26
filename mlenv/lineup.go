@@ -133,10 +133,11 @@ func (l Lineup) String() string {
 	return strings.Join(specs, LineupSeparator)
 }
 
-// validateFor checks that every factory is usable and that the lineup fits a
+// ValidateFor checks that every factory is usable and that the lineup fits a
 // map with this many players: one entry for every seat, or exactly one entry
-// per opponent seat.
-func (l Lineup) validateFor(players int) error {
+// per opponent seat. It is exported so other match runners, such as
+// cmd/opponentcheck, accept exactly the lineups a batch accepts.
+func (l Lineup) ValidateFor(players int) error {
 	if err := checkFactories(l.factories); err != nil {
 		return err
 	}
@@ -151,15 +152,17 @@ func (l Lineup) validateFor(players int) error {
 	}
 }
 
-// forRole returns the factory for the opponent seat holding role, as seen
-// from the learner. role is never RoleMe.
+// ForRole returns the factory for the opponent seat holding role, as seen
+// from the learner. role is never RoleMe. Callers must have checked the
+// lineup with ValidateFor first. It is exported so other match runners seat a
+// lineup exactly as a batch does.
 //
-// A one-entry lineup serves every role. Otherwise validateFor has already
+// A one-entry lineup serves every role. Otherwise ValidateFor has already
 // required one entry per opponent seat, which on a four-player map is three:
 // RoleCW, RoleOpposite, and RoleCCW are 1, 2, and 3, so role-1 indexes
 // entries 0, 1, and 2. A two-player map seats only RoleOpposite and takes a
 // one-entry lineup, so it never reaches the index.
-func (l Lineup) forRole(role Role) agent.Factory {
+func (l Lineup) ForRole(role Role) agent.Factory {
 	if len(l.factories) == 1 {
 		return l.factories[0]
 	}

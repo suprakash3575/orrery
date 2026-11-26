@@ -16,6 +16,7 @@ import (
 
 	"orrery/agent"
 	"orrery/game"
+	"orrery/mlenv"
 	"orrery/scenario"
 )
 
@@ -30,7 +31,7 @@ func testConfig(t *testing.T) matchConfig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return matchConfig{opponent: opponent, random: random, launchProbability: 0.42}
+	return matchConfig{opponents: mlenv.SingleOpponent(opponent), random: random, launchProbability: 0.42}
 }
 
 // testOptions is a one-tester, one-seed run into a fresh directory.
@@ -210,6 +211,202 @@ func TestVerdictAppliesOnlyToTheAgreedConfiguration(t *testing.T) {
 			t.Fatalf("verdict = %q, want no verdict naming opponent idle-v1", summary.Verdict)
 		}
 	})
+}
+
+// TestCalibrationPassesForRandomSelfPlay plays random-v1 against itself, so
+// every seat draws random numbers. Calibration must pass whether the
+// opponent plays itself as the heuristic tester or through -tester-spec: each
+// seat is seeded by its seat, so moving the "tested" label between seats
+// can't change the game.
+func TestCalibrationPassesForRandomSelfPlay(t *testing.T) {
+	tests := []struct {
+		name  string
+		flags []string
+	}{
+		{name: "heuristic tester", flags: []string{"-testers", "heuristic"}},
+		{name: "tester spec", flags: []string{"-tester-spec", defaultRandom}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "out")
+			args := append([]string{"-opponent", defaultRandom, "-seeds", "1", "-workers", "4", "-out", out}, test.flags...)
+			opts, err := parseOptions(args, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if complete, err := run(context.Background(), opts, io.Discard); err != nil || !complete {
+				t.Fatalf("complete = %v, err = %v; want a complete run", complete, err)
+			}
+			var summary struct {
+				Calibration calibration `json:"calibration"`
+			}
+			data, err := os.ReadFile(filepath.Join(out, "summary.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(data, &summary); err != nil {
+				t.Fatal(err)
+			}
+			if c := summary.Calibration; c.Seeds != 1 || !c.Passed {
+				t.Fatalf("calibration = %+v, want 1 seed checked and passed", c)
+			}
+		})
+	}
+}
+
+// TestBuildAgentsSeatsLineupByRole gives -opponent a lineup of three
+// different agents and checks, for every tested seat, that each opponent
+// seat gets the entry for its board role: entry 0 clockwise of the tested
+// seat, entry 1 opposite, entry 2 counter-clockwise. Going clockwise around
+// the sun the seats run 0 → 1 → 3 → 2, written out here rather than taken
+// from SeatFrame, so the test doesn't share the code it checks.
+func TestBuildAgentsSeatsLineupByRole(t *testing.T) {
+	const seed = 1_000_000
+	lineup, err := mlenv.ParseLineup("idle-v1|"+defaultRandom+"|"+defaultOpponent, agent.ParseFactory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []string{"idle-v1", "random-v1", "heuristic-v1"}
+	clockwise := []int{0, 1, 3, 2}
+
+	config := testConfig(t)
+	config.opponents = lineup
+	for i, tested := range clockwise {
+		g, err := scenario.GeneratorV2{FourPlayer: true}.New(seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frame, err := mlenv.NewSeatFrame(g, tested)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agents, err := buildAgents(context.Background(), config, job{tester: "idle", seed: seed, seat: tested}, g, frame)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Steps 1, 2 and 3 round the circle from the tested seat are its
+		// clockwise, opposite and counter-clockwise neighbours.
+		for step, want := range entries {
+			seat := clockwise[(i+1+step)%players]
+			if got := agents[seat].ID(); got != want {
+				t.Errorf("tested seat %d: seat %d plays %s, want %s (lineup entry %d)", tested, seat, got, want, step)
+			}
+		}
+	}
+}
+
+// TestSummarizeCountsRates checks the counts summary on hand-made records:
+// totals and rates add up across games and appear in summary.md, a rate with
+// nothing to divide by is undefined (nil) rather than 0, and records without
+// counts give no summary.
+func TestSummarizeCountsRates(t *testing.T) {
+	counted := []gameRecord{
+		{Launches: 10, TesterCounts: &TesterCounts{AimAttempts: 8, AimFailures: 2, FallbackLaunches: 2, RandomMoves: 3, DecodeCheckedLaunches: 10}},
+		{Launches: 30, TesterCounts: &TesterCounts{AimAttempts: 12, AimFailures: 3, FallbackLaunches: 3, RandomMoves: 5, DecodeCheckedLaunches: 30}},
+	}
+	c := summarizeCounts(counted)
+	if c == nil {
+		t.Fatal("summarizeCounts = nil, want totals")
+	}
+	// 5 failures in 20 attempts; 5 fallbacks in 40 launches; 8 random moves in 2 games.
+	if c.AimAttempts != 20 || c.AimFailures != 5 || c.FallbackLaunches != 5 || c.RandomMoves != 8 || c.DecodeCheckedLaunches != 40 {
+		t.Fatalf("totals = %+v, want 20 attempts, 5 failures, 5 fallbacks, 8 random moves, 40 checked", *c)
+	}
+	if c.AimFailureRate == nil || *c.AimFailureRate != 0.25 || c.FallbackRate == nil || *c.FallbackRate != 0.125 || c.RandomMovesPerGame != 4 {
+		t.Fatalf("rates = %v, %v, %v; want 0.25, 0.125, 4", c.AimFailureRate, c.FallbackRate, c.RandomMovesPerGame)
+	}
+
+	// summary.md shows every total, the random-move total included, next to
+	// the rates and the per-game average.
+	markdown := markdownSummary(runMeta{TesterSpec: "heuristic-v2"}, []testerSummary{{Tester: specTester, CounterSummary: c}}, calibration{}, "no verdict", nil)
+	if row := "| spec | 20 | 5 | 25.0% | 5 | 12.5% | 8 | 4.0 | 40 |"; !strings.Contains(markdown, row) {
+		t.Fatalf("summary.md has no counts row %q:\n%s", row, markdown)
+	}
+
+	// A bot that never aimed ahead or launched: both rates are undefined.
+	idle := summarizeCounts([]gameRecord{{TesterCounts: &TesterCounts{RandomMoves: 6}}})
+	if idle == nil || idle.AimFailureRate != nil || idle.FallbackRate != nil {
+		t.Fatalf("summary = %+v, want both rates undefined (nil)", idle)
+	}
+
+	if got := summarizeCounts([]gameRecord{{Launches: 5}}); got != nil {
+		t.Fatalf("summarizeCounts of records without counts = %+v, want nil", *got)
+	}
+}
+
+// TestCanonicalForms checks that -canonical rewrites each spelling of a spec
+// to the one canonical form, and that bad inputs give no forms at all and an
+// error naming every one of them.
+func TestCanonicalForms(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "already canonical", input: agent.HeuristicV2Default, want: agent.HeuristicV2Default},
+		{name: "parameters out of order", input: "heuristic-v2:margin=0.1,candidates=4,enemy_bonus=1", want: agent.HeuristicV2Default},
+		{name: "a setting at its default", input: agent.HeuristicV2Default + ",learner_aim=0", want: agent.HeuristicV2Default},
+		{name: "a number with a trailing zero", input: agent.HeuristicV2Default + ",epsilon=0.50", want: "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.5,margin=0.1"},
+		{name: "a lineup of three identical entries", input: "idle-v1|idle-v1|idle-v1", want: "idle-v1"},
+	}
+	inputs := make([]string, len(tests))
+	for i, test := range tests {
+		inputs[i] = test.input
+	}
+	forms, err := canonicalForms(inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, test := range tests {
+		if forms[i] != test.want {
+			t.Errorf("%s: canonical form of %q = %q, want %q", test.name, test.input, forms[i], test.want)
+		}
+	}
+
+	t.Run("bad inputs", func(t *testing.T) {
+		misspelled := agent.HeuristicV2Default + ",whole_garison=1"
+		tooShort := "idle-v1|idle-v1"
+		forms, err := canonicalForms([]string{misspelled, "idle-v1", tooShort})
+		if forms != nil || err == nil {
+			t.Fatalf("forms = %q, err = %v; want no forms and an error", forms, err)
+		}
+		for _, bad := range []string{misspelled, tooShort} {
+			if !strings.Contains(err.Error(), bad) {
+				t.Errorf("error %q does not name the bad input %q", err, bad)
+			}
+		}
+	})
+}
+
+// TestParseOptionsRefusesBadFlags checks that a flag given a value that means
+// nothing, or flags that cannot both be honoured, are refused before
+// anything runs.
+func TestParseOptionsRefusesBadFlags(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		// -tester-spec replaces the fixed testers, so naming both is a mistake.
+		{name: "tester spec with testers", args: []string{"-tester-spec", "idle-v1", "-testers", "idle"}, wantErr: "-tester-spec cannot be combined with -testers"},
+		// A blank -tester-spec, such as an unset variable in a script, must
+		// not fall back to the fixed testers, alone or next to -testers.
+		{name: "empty tester spec", args: []string{"-tester-spec", ""}, wantErr: "-tester-spec must not be empty"},
+		{name: "whitespace tester spec", args: []string{"-tester-spec", "  "}, wantErr: "-tester-spec must not be empty"},
+		{name: "empty tester spec with testers", args: []string{"-tester-spec", "", "-testers", "idle"}, wantErr: "-tester-spec must not be empty"},
+		// -canonical plays nothing, so a flag that shapes a run means the
+		// command was put together by mistake.
+		{name: "canonical with seeds", args: []string{"-canonical", "-seeds", "3", "idle-v1"}, wantErr: "-canonical cannot be combined with other flags"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			args := append(test.args, "-out", filepath.Join(t.TempDir(), "out"))
+			_, err := parseOptions(args, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("parseOptions(%q) error = %v, want one containing %q", test.args, err, test.wantErr)
+			}
+		})
+	}
 }
 
 // failOnTurn is a tester that plays idle until its chosen turn, then fails.

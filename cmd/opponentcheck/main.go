@@ -4,6 +4,14 @@
 // the tested player in every seat in turn. It runs entirely in Go: no model,
 // no Python, no GPU.
 //
+// With -tester-spec, any agent spec plays the tested seat instead of the
+// fixed testers. Such a run only measures; it gives no verdict. -opponent
+// also takes a lineup of three specs joined by "|", seated by board role
+// from the tested seat, as mlenv seats training opponents. -check-decode
+// proves a restricted heuristic-v2 tester made only the learner's moves.
+// -canonical prints specs in canonical form and plays nothing, so a run
+// script can check its specs before starting.
+//
 // Each game is appended to games.jsonl as soon as it finishes, so an
 // interrupted run keeps its completed work. At the end it writes the sorted
 // games.csv, summary.json and summary.md. A run with any failed or unplayed
@@ -32,6 +40,7 @@ import (
 	"time"
 
 	"orrery/agent"
+	"orrery/mlenv"
 )
 
 const (
@@ -60,7 +69,17 @@ var agreedOpponents = []string{defaultOpponent, agent.HeuristicV2Default}
 
 // options are the parsed command-line settings.
 type options struct {
-	testers           []string
+	// testers are the fixed testers to play, or just specTester when
+	// testerSpec is set.
+	testers []string
+	// testerSpec is the agent spec for the tested seat, as typed; empty means
+	// the fixed testers are played.
+	testerSpec string
+	// checkDecode turns on the decode check (see decodecheck.go).
+	checkDecode bool
+	// canonical holds the specs to print in canonical form (-canonical).
+	// When it is set, no other option is, and nothing is played.
+	canonical         []string
 	seedStart         int64
 	seeds             int
 	launchProbability float64
@@ -72,20 +91,26 @@ type options struct {
 
 // runMeta records how a run was made and how it ended.
 type runMeta struct {
-	Command           []string `json:"command"`
-	Commit            string   `json:"commit"`
-	GoVersion         string   `json:"go_version"`
-	Status            string   `json:"status"`
-	Testers           []string `json:"testers"`
-	SeedStart         int64    `json:"seed_start"`
-	Seeds             int      `json:"seeds"`
-	Opponent          string   `json:"opponent"`
-	Random            string   `json:"random"`
-	LaunchProbability float64  `json:"launch_probability"`
-	Workers           int      `json:"workers"`
-	Planned           int      `json:"planned"`
-	Completed         int      `json:"completed"`
-	ElapsedSeconds    float64  `json:"elapsed_seconds"`
+	Command   []string `json:"command"`
+	Commit    string   `json:"commit"`
+	GoVersion string   `json:"go_version"`
+	Status    string   `json:"status"`
+	Testers   []string `json:"testers"`
+	// TesterSpec is the -tester-spec agent, left out of the JSON when the
+	// fixed testers were played, so those runs' summaries are unchanged.
+	TesterSpec string `json:"tester_spec,omitempty"`
+	// CheckDecode records that the decode check ran on every tested turn;
+	// left out when it didn't, so other runs' summaries are unchanged.
+	CheckDecode       bool    `json:"check_decode,omitempty"`
+	SeedStart         int64   `json:"seed_start"`
+	Seeds             int     `json:"seeds"`
+	Opponent          string  `json:"opponent"`
+	Random            string  `json:"random"`
+	LaunchProbability float64 `json:"launch_probability"`
+	Workers           int     `json:"workers"`
+	Planned           int     `json:"planned"`
+	Completed         int     `json:"completed"`
+	ElapsedSeconds    float64 `json:"elapsed_seconds"`
 }
 
 func main() {
@@ -96,6 +121,17 @@ func main() {
 		}
 		fmt.Fprintln(os.Stderr, "opponentcheck:", err)
 		os.Exit(2)
+	}
+	if opts.canonical != nil {
+		forms, err := canonicalForms(opts.canonical)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "opponentcheck:", err)
+			os.Exit(1)
+		}
+		for _, form := range forms {
+			fmt.Println(form)
+		}
+		return
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -114,30 +150,71 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	flags.SetOutput(stderr)
 	testers := flags.String("testers", strings.Join(testerOrder, ","), "comma-separated testers: "+strings.Join(testerOrder, ", ")+
 		" (heuristic is the -opponent agent playing itself, the calibration)")
+	testerSpec := flags.String("tester-spec", "", "agent spec for the tested seat instead of the fixed testers; cannot be combined with -testers")
+	checkDecode := flags.Bool("check-decode", false, "fail any game in which the tester makes a launch the learner's decoder would not make the same way; "+
+		"needs a -tester-spec of heuristic-v2 with whole_garrison=1, learner_aim=1, no_aim_check=1 and no epsilon")
 	seedStart := flags.Int64("seed-start", 1_000_000, "first scenario seed (the reusable validation range starts at 1000000)")
 	seeds := flags.Int("seeds", 25, "number of consecutive seeds; each is played from every seat")
 	probability := flags.Float64("launch-probability", defaultLaunchProbability, "diagnostic agents' chance to launch from each source each turn")
 	workers := flags.Int("workers", runtime.GOMAXPROCS(0), "games played at once")
-	opponent := flags.String("opponent", defaultOpponent, "agent spec for the three opponent seats")
+	opponent := flags.String("opponent", defaultOpponent, "agent spec for the three opponent seats, or three specs joined by | for the seats clockwise, opposite and counter-clockwise of the tested seat")
 	random := flags.String("random", defaultRandom, "agent spec for the random tester")
 	out := flags.String("out", "", "new directory for the results (required; never overwritten)")
+	canonical := flags.Bool("canonical", false, "print the canonical form of each spec or lineup given as an argument, one per line, and exit; plays nothing")
 	if err := flags.Parse(args); err != nil {
 		return options{}, err
+	}
+	// -canonical is a separate mode: it takes specs as arguments and plays
+	// nothing, so no other flag applies and -out isn't needed.
+	if *canonical {
+		others := 0
+		flags.Visit(func(f *flag.Flag) {
+			if f.Name != "canonical" {
+				others++
+			}
+		})
+		switch {
+		case others > 0:
+			return options{}, errors.New("-canonical cannot be combined with other flags")
+		case flags.NArg() == 0:
+			return options{}, errors.New("-canonical needs at least one spec")
+		}
+		return options{canonical: flags.Args()}, nil
 	}
 	if flags.NArg() != 0 {
 		return options{}, fmt.Errorf("unexpected arguments: %v", flags.Args())
 	}
 	opts := options{
+		testerSpec: strings.TrimSpace(*testerSpec), checkDecode: *checkDecode,
 		seedStart: *seedStart, seeds: *seeds, launchProbability: *probability,
 		workers: *workers, opponent: *opponent, random: *random, out: *out,
 	}
-	for _, name := range strings.Split(*testers, ",") {
-		name = strings.TrimSpace(name)
-		if !slices.Contains(testerOrder, name) {
-			return options{}, fmt.Errorf("%w %q; want some of %s", errUnknownTester, name, strings.Join(testerOrder, ", "))
-		}
-		if !slices.Contains(opts.testers, name) {
-			opts.testers = append(opts.testers, name)
+	// Whether a flag was typed is asked of flags.Visit (which sees just the
+	// flags actually given), never of its value. -testers has a default, so
+	// its value can't tell; and -tester-spec typed with an empty value, say
+	// from an unset variable in a script, must not quietly fall back to the
+	// fixed testers.
+	testersGiven, testerSpecGiven := false, false
+	flags.Visit(func(f *flag.Flag) {
+		testersGiven = testersGiven || f.Name == "testers"
+		testerSpecGiven = testerSpecGiven || f.Name == "tester-spec"
+	})
+	switch {
+	case testerSpecGiven && opts.testerSpec == "":
+		return options{}, errors.New("-tester-spec must not be empty")
+	case testerSpecGiven && testersGiven:
+		return options{}, errors.New("-tester-spec cannot be combined with -testers")
+	case testerSpecGiven:
+		opts.testers = []string{specTester}
+	default:
+		for _, name := range strings.Split(*testers, ",") {
+			name = strings.TrimSpace(name)
+			if !slices.Contains(testerOrder, name) {
+				return options{}, fmt.Errorf("%w %q; want some of %s", errUnknownTester, name, strings.Join(testerOrder, ", "))
+			}
+			if !slices.Contains(opts.testers, name) {
+				opts.testers = append(opts.testers, name)
+			}
 		}
 	}
 	switch {
@@ -153,6 +230,37 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	return opts, nil
 }
 
+// canonicalForms returns the canonical form of each input, in input order.
+// Each is read exactly as -opponent reads it: one agent spec, or a lineup of
+// three joined by "|", parsed and checked by mlenv.Lineup. So a lineup of
+// three identical entries comes back as that one spec, which is the only
+// spelling training accepts for it.
+//
+// A caller checks a spec by comparing it with its canonical form: any
+// difference (parameter order, a setting written at its default, 0.50 for
+// 0.5) means the spelling isn't canonical. If any input doesn't parse, it
+// returns no forms and an error naming every bad input, so a caller never
+// pairs a form with the wrong input.
+func canonicalForms(inputs []string) ([]string, error) {
+	forms := make([]string, 0, len(inputs))
+	var errs []error
+	for _, input := range inputs {
+		lineup, err := mlenv.ParseLineup(input, agent.ParseFactory)
+		if err == nil {
+			err = lineup.ValidateFor(players)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%q: %w", input, err))
+			continue
+		}
+		forms = append(forms, lineup.String())
+	}
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	return forms, nil
+}
+
 // run plays every job and writes the results. It returns whether every game
 // completed; an error means the run could not be set up or written at all.
 //
@@ -160,15 +268,39 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 // the games on a fixed pool of workers, appending each to games.jsonl as it
 // finishes; then sort everything and write the summaries.
 func run(ctx context.Context, opts options, console io.Writer) (bool, error) {
-	opponent, err := agent.ParseFactory(opts.opponent)
+	// -opponent is read exactly as mlenv reads a training opponent: one spec
+	// for every opponent seat, or three joined by "|", one per board role.
+	opponents, err := mlenv.ParseLineup(opts.opponent, agent.ParseFactory)
+	if err == nil {
+		err = opponents.ValidateFor(players)
+	}
 	if err != nil {
 		return false, fmt.Errorf("-opponent: %w", err)
+	}
+	// The heuristic tester is "the opponent playing itself", which only means
+	// something when every opponent seat plays one agent. A lineup's
+	// canonical form keeps the separator only when its entries differ.
+	if strings.Contains(opponents.String(), mlenv.LineupSeparator) && slices.Contains(opts.testers, "heuristic") {
+		return false, errors.New("-opponent: the heuristic tester needs one agent in every opponent seat; leave it out of -testers when the lineup is mixed")
 	}
 	random, err := agent.ParseFactory(opts.random)
 	if err != nil {
 		return false, fmt.Errorf("-random: %w", err)
 	}
-	return runWith(ctx, opts, matchConfig{opponent: opponent, random: random, launchProbability: opts.launchProbability}, console)
+	config := matchConfig{opponents: opponents, random: random, launchProbability: opts.launchProbability, checkDecode: opts.checkDecode}
+	if opts.testerSpec != "" {
+		if config.tester, err = agent.ParseFactory(opts.testerSpec); err != nil {
+			return false, fmt.Errorf("-tester-spec: %w", err)
+		}
+	}
+	// Checked here, not in parseOptions, because only the parsed tester's
+	// canonical spec says which settings are on.
+	if opts.checkDecode {
+		if err := checkDecodeAllowed(config.tester); err != nil {
+			return false, err
+		}
+	}
+	return runWith(ctx, opts, config, console)
 }
 
 // runWith is run with a ready matchConfig, so tests can inject agents.
@@ -224,7 +356,7 @@ func runWith(ctx context.Context, opts options, config matchConfig, console io.W
 	complete := completed == len(jobs)
 	meta := runMeta{
 		Command: os.Args, Commit: buildCommit(), GoVersion: runtime.Version(),
-		Status: "complete", Testers: opts.testers, SeedStart: opts.seedStart, Seeds: opts.seeds,
+		Status: "complete", Testers: opts.testers, TesterSpec: opts.testerSpec, CheckDecode: opts.checkDecode, SeedStart: opts.seedStart, Seeds: opts.seeds,
 		Opponent: opts.opponent, Random: opts.random, LaunchProbability: opts.launchProbability,
 		Workers: opts.workers, Planned: len(jobs), Completed: completed,
 		ElapsedSeconds: time.Since(started).Seconds(),
@@ -233,7 +365,7 @@ func runWith(ctx context.Context, opts options, config matchConfig, console io.W
 		meta.Status = fmt.Sprintf("incomplete (%d of %d games completed)", completed, len(jobs))
 	}
 	summaries := summarize(records, planned)
-	calib := checkCalibration(records)
+	calib := checkCalibration(records, config.calibrationTester())
 	decision, notes := verdict(meta, complete, summaries, calib)
 
 	if err := writeCSV(filepath.Join(opts.out, "games.csv"), records); err != nil {
@@ -378,7 +510,7 @@ func buildCommit() string {
 	return revision
 }
 
-// testerIndex is a tester's position in testerOrder, for sorting records.
+// testerIndex is a tester's position in reportOrder, for sorting records.
 func testerIndex(name string) int {
-	return slices.Index(testerOrder, name)
+	return slices.Index(reportOrder, name)
 }

@@ -8,8 +8,17 @@ import (
 	"strings"
 )
 
-// testerOrder is the order testers are listed in, everywhere.
+// testerOrder is the fixed testers -testers accepts, in the order they are
+// listed everywhere.
 var testerOrder = []string{"heuristic", "idle", "random", "diag-direct", "diag-lead"}
+
+// specTester is the tester name recorded for the -tester-spec agent. It is
+// not one of testerOrder, so -testers cannot ask for it.
+const specTester = "spec"
+
+// reportOrder is every tester a run can record, in report order. A
+// -tester-spec run plays only specTester, so it never mixes with the others.
+var reportOrder = append(slices.Clone(testerOrder), specTester)
 
 // testerSummary is one tester's results over the games it completed.
 type testerSummary struct {
@@ -35,11 +44,81 @@ type testerSummary struct {
 	// GameSeconds is the summed time of this tester's games. Games run in
 	// parallel, so it is work done, not wall-clock time.
 	GameSeconds float64 `json:"game_seconds"`
+
+	// CounterSummary totals the TesterCounts of the completed games. It is
+	// set only when they carry counts (a heuristic-v2 tester); embedded as a
+	// pointer, it is left out of the JSON otherwise, so other testers'
+	// summaries are unchanged.
+	*CounterSummary
 }
 
-// calibration is the exact check on the heuristic tester. heuristic-v1 uses
-// no randomness, so with it in every seat the four seat runs of one seed are
-// the same game; only which seat counts as "tested" differs.
+// CounterSummary is one tester's counts over its completed games, and the
+// rates made from them. A rate is a pointer so that it can be null in the
+// JSON, meaning undefined: nothing was counted to divide by. A rate of 0
+// would claim something was counted and none of it failed.
+type CounterSummary struct {
+	AimAttempts int `json:"aim_attempts"`
+	AimFailures int `json:"aim_failures"`
+	// AimFailureRate is AimFailures / AimAttempts: how often aiming ahead
+	// found no way to the target.
+	AimFailureRate   *float64 `json:"aim_failure_rate"`
+	FallbackLaunches int      `json:"fallback_launches"`
+	// FallbackRate is FallbackLaunches over every launch in the same games:
+	// the share of launches aimed straight because aiming ahead failed.
+	FallbackRate *float64 `json:"fallback_rate"`
+	RandomMoves  int      `json:"random_moves"`
+	// RandomMovesPerGame is RandomMoves over the games counted.
+	RandomMovesPerGame    float64 `json:"random_moves_per_game"`
+	DecodeCheckedLaunches int     `json:"decode_checked_launches"`
+}
+
+// rate is part / whole, or nil (undefined) when whole is 0.
+func rate(part, whole int) *float64 {
+	if whole == 0 {
+		return nil
+	}
+	r := float64(part) / float64(whole)
+	return &r
+}
+
+// summarizeCounts totals the counts of the completed records that carry
+// them, or returns nil when none does.
+func summarizeCounts(records []gameRecord) *CounterSummary {
+	var c CounterSummary
+	games, launches := 0, 0
+	for _, r := range records {
+		if r.TesterCounts == nil {
+			continue
+		}
+		games++
+		launches += r.Launches
+		c.AimAttempts += r.AimAttempts
+		c.AimFailures += r.AimFailures
+		c.FallbackLaunches += r.FallbackLaunches
+		c.RandomMoves += r.RandomMoves
+		c.DecodeCheckedLaunches += r.DecodeCheckedLaunches
+	}
+	if games == 0 {
+		return nil
+	}
+	c.AimFailureRate = rate(c.AimFailures, c.AimAttempts)
+	c.FallbackRate = rate(c.FallbackLaunches, launches)
+	c.RandomMovesPerGame = float64(c.RandomMoves) / float64(games)
+	return &c
+}
+
+// formatRate writes a rate as a percentage, or "undefined" when nil.
+func formatRate(r *float64) string {
+	if r == nil {
+		return "undefined"
+	}
+	return fmt.Sprintf("%.1f%%", 100**r)
+}
+
+// calibration is the exact check on the calibration tester: the opponent
+// playing itself. With the same agent in every seat, and each seat seeded by
+// its seat rather than by the "tested" label, the four seat runs of one seed
+// are the same game; only which seat counts as "tested" differs.
 type calibration struct {
 	// Seeds is how many seeds had all four seat runs completed.
 	Seeds int `json:"seeds"`
@@ -54,17 +133,18 @@ type calibration struct {
 	TiedSeeds  int          `json:"tied_seeds"`
 }
 
-// summarize builds one testerSummary per tester, in testerOrder, from every
+// summarize builds one testerSummary per tester, in reportOrder, from every
 // game record, including the games that did not complete.
 func summarize(records []gameRecord, planned map[string]int) []testerSummary {
 	var summaries []testerSummary
-	for _, tester := range testerOrder {
+	for _, tester := range reportOrder {
 		if planned[tester] == 0 {
 			continue
 		}
 		s := testerSummary{Tester: tester, Planned: planned[tester]}
 		var seatGames, seatWins [players]int
 		var lengths []int
+		var completed []gameRecord
 		launches := 0
 		for _, r := range records {
 			if r.Tester != tester {
@@ -80,6 +160,7 @@ func summarize(records []gameRecord, planned map[string]int) []testerSummary {
 				continue
 			}
 			s.Completed++
+			completed = append(completed, r)
 			seatGames[r.Seat]++
 			switch {
 			case r.Result > 0:
@@ -109,6 +190,7 @@ func summarize(records []gameRecord, planned map[string]int) []testerSummary {
 			}
 		}
 		s.LengthP10, s.LengthP50, s.LengthP90 = percentile(lengths, 0.1), percentile(lengths, 0.5), percentile(lengths, 0.9)
+		s.CounterSummary = summarizeCounts(completed)
 		summaries = append(summaries, s)
 	}
 	return summaries
@@ -125,13 +207,15 @@ func percentile(values []int, fraction float64) int {
 	return sorted[max(rank, 0)]
 }
 
-// checkCalibration applies the exact calibration rule to the heuristic
-// tester's completed games. Seeds missing any of their four seat runs are
-// skipped, and only a complete run gives a verdict anyway.
-func checkCalibration(records []gameRecord) calibration {
+// checkCalibration applies the exact calibration rule to the named tester's
+// completed games: the heuristic tester, or the -tester-spec agent when it is
+// the opponent spec (see matchConfig.calibrationTester). An empty name checks
+// nothing. Seeds missing any of their four seat runs are skipped, and only a
+// complete run gives a verdict anyway.
+func checkCalibration(records []gameRecord, tester string) calibration {
 	bySeed := map[int64][]gameRecord{}
 	for _, r := range records {
-		if r.Tester == "heuristic" && r.Status == statusCompleted {
+		if tester != "" && r.Tester == tester && r.Status == statusCompleted {
 			bySeed[r.Seed] = append(bySeed[r.Seed], r)
 		}
 	}
@@ -194,6 +278,11 @@ func verdict(meta runMeta, complete bool, summaries []testerSummary, c calibrati
 	if !complete {
 		return "no verdict: the run is incomplete", nil
 	}
+	// The criteria were fixed for the fixed testers only. A -tester-spec run
+	// measures some other agent, so its results are reported but not judged.
+	if meta.TesterSpec != "" {
+		return "no verdict: a -tester-spec run measures its tester but gives no verdict", nil
+	}
 	if !slices.Contains(agreedOpponents, meta.Opponent) || meta.Random != defaultRandom || meta.LaunchProbability != defaultLaunchProbability {
 		return fmt.Sprintf("no verdict: the decision criteria apply only to the agreed configuration (opponent one of %q, random tester %q, p = %g); this run used opponent %q, random tester %q, p = %g",
 			agreedOpponents, defaultRandom, defaultLaunchProbability, meta.Opponent, meta.Random, meta.LaunchProbability), nil
@@ -241,7 +330,17 @@ func markdownSummary(meta runMeta, summaries []testerSummary, c calibration, dec
 	if len(notes) > 0 {
 		b.WriteString("\n")
 	}
-	fmt.Fprintf(&b, "Seeds %d to %d, every seat, against three `%s` opponents. ", meta.SeedStart, meta.SeedStart+int64(meta.Seeds)-1, meta.Opponent)
+	if meta.TesterSpec != "" {
+		fmt.Fprintf(&b, "Tester `%s` is `%s`. ", specTester, meta.TesterSpec)
+	}
+	if meta.CheckDecode {
+		b.WriteString("Every tester launch was checked against the learner's decoder; a mismatch fails its game. ")
+	}
+	against := fmt.Sprintf("three `%s` opponents", meta.Opponent)
+	if strings.Contains(meta.Opponent, "|") {
+		against = fmt.Sprintf("the lineup `%s` (clockwise | opposite | counter-clockwise of the tester)", meta.Opponent)
+	}
+	fmt.Fprintf(&b, "Seeds %d to %d, every seat, against %s. ", meta.SeedStart, meta.SeedStart+int64(meta.Seeds)-1, against)
 	fmt.Fprintf(&b, "%d of %d games completed in %.0f s on %d workers.\n\n", meta.Completed, meta.Planned, meta.ElapsedSeconds, meta.Workers)
 
 	b.WriteString("| Tester | Completed | Wins | Losses | Draws | Win rate | Seat 0 | Seat 1 | Seat 2 | Seat 3 | Eliminated | Launches/game | Zero-launch games | Length p10/p50/p90 |\n")
@@ -253,12 +352,33 @@ func markdownSummary(meta runMeta, summaries []testerSummary, c calibration, dec
 			s.Eliminated, s.LaunchesPerGame, s.ZeroLaunchGames, s.LengthP10, s.LengthP50, s.LengthP90)
 	}
 
+	// The counts table appears only when some tester reports counts, so
+	// other runs' summaries are unchanged.
+	if slices.ContainsFunc(summaries, func(s testerSummary) bool { return s.CounterSummary != nil }) {
+		b.WriteString("\n## Aim and decode counts\n\n")
+		b.WriteString("Over completed games. A rate is undefined when nothing was counted to divide by.\n\n")
+		b.WriteString("| Tester | Aim attempts | Aim failures | Aim failure rate | Fallback launches | Fallback share of launches | Random moves | Random moves/game | Decode-checked launches |\n")
+		b.WriteString("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+		for _, s := range summaries {
+			if c := s.CounterSummary; c != nil {
+				fmt.Fprintf(&b, "| %s | %d | %d | %s | %d | %s | %d | %.1f | %d |\n",
+					s.Tester, c.AimAttempts, c.AimFailures, formatRate(c.AimFailureRate),
+					c.FallbackLaunches, formatRate(c.FallbackRate), c.RandomMoves, c.RandomMovesPerGame, c.DecodeCheckedLaunches)
+			}
+		}
+	}
+
 	fmt.Fprintf(&b, "\n## Calibration\n\n")
 	fmt.Fprintf(&b, "Seeds checked: %d. Passed: %v. Tied seeds: %d. ", c.Seeds, c.Passed, c.TiedSeeds)
 	fmt.Fprintf(&b, "Unique winners by seat (seat bias, not pass/fail): %v.\n", c.LeaderSeat)
 	for _, v := range c.Violations {
 		fmt.Fprintf(&b, "- %s\n", v)
 	}
-	fmt.Fprintf(&b, "\nDiagnostic launch probability p = %g. Random tester: `%s`.\n", meta.LaunchProbability, meta.Random)
+	// These settings only shape the fixed diagnostic and random testers, so a
+	// -tester-spec run, which plays neither, leaves them out here.
+	// summary.json still records both.
+	if meta.TesterSpec == "" {
+		fmt.Fprintf(&b, "\nDiagnostic launch probability p = %g. Random tester: `%s`.\n", meta.LaunchProbability, meta.Random)
+	}
 	return b.String()
 }

@@ -10,6 +10,7 @@ import (
 	"orrery/agent"
 	"orrery/arena"
 	"orrery/game"
+	"orrery/mlenv"
 	"orrery/scenario"
 )
 
@@ -67,13 +68,54 @@ type gameRecord struct {
 	Message  string `json:"message,omitempty"`
 	// Seconds is the wall-clock time this game took.
 	Seconds float64 `json:"seconds"`
+
+	// TesterCounts holds the tester's aim and decode counts. It is set only
+	// for a completed game whose tester reports AimStats (heuristic-v2), and
+	// nil otherwise. Embedded as a pointer, its fields appear at the top
+	// level of the JSON when set and are left out entirely when nil, so a
+	// record of any other tester is written exactly as before. The type is
+	// exported only because encoding/json can't fill an embedded pointer to
+	// an unexported struct when reading a record back.
+	*TesterCounts
+}
+
+// TesterCounts are one game's totals for the tested bot, read from its
+// AimStats at the end of the game (see agent.AimStats for each count).
+type TesterCounts struct {
+	// AimAttempts is how many times the bot tried to aim ahead, counting
+	// targets it considered but didn't launch at; AimFailures is how many of
+	// those found no way to the target.
+	AimAttempts int `json:"aim_attempts"`
+	AimFailures int `json:"aim_failures"`
+	// FallbackLaunches is how many launches were aimed straight at the
+	// target because aiming ahead failed. Only learner_aim=1 makes them.
+	FallbackLaunches int `json:"fallback_launches"`
+	// RandomMoves is how many times a body's move was chosen at random
+	// (epsilon), whether it launched or held.
+	RandomMoves int `json:"random_moves"`
+	// DecodeCheckedLaunches is how many launches passed the decode check:
+	// every launch of a completed game when -check-decode is on, else 0.
+	DecodeCheckedLaunches int `json:"decode_checked_launches"`
+}
+
+// aimReporter is the part of agent.HeuristicV2Agent the counters read.
+type aimReporter interface {
+	AimStats() agent.AimStats
 }
 
 // matchConfig is what every game of a run shares.
 type matchConfig struct {
-	opponent          agent.Factory
-	random            agent.Factory
+	// opponents is the -opponent lineup: one agent for every opponent seat,
+	// or one per board role from the tested seat (see mlenv.Lineup).
+	opponents mlenv.Lineup
+	random    agent.Factory
+	// tester is the -tester-spec agent, played as specTester; nil when the
+	// fixed testers are played.
+	tester            agent.Factory
 	launchProbability float64
+	// checkDecode runs the decode check (see decodecheck.go) on every turn of
+	// the tested seat. run allows it only for a fully restricted tester.
+	checkDecode bool
 	// newTester overrides how a tester's agent is built; tests use it to
 	// inject a failing agent. Nil uses buildTester.
 	newTester func(ctx context.Context, j job, live *game.Game) (agent.Agent, error)
@@ -104,10 +146,29 @@ func playGame(ctx context.Context, config matchConfig, j job) (record gameRecord
 		return fail(0, nil, fmt.Errorf("generate map: %w", err))
 	}
 
-	agents, err := buildAgents(ctx, config, j, g)
+	// The tested seat's frame says which seat is clockwise, opposite and
+	// counter-clockwise of it, and is what the decode check observes the
+	// board through. NewSeatFrame needs the starting board, which g still
+	// is: no turn has been played yet.
+	frame, err := mlenv.NewSeatFrame(g, j.seat)
+	if err != nil {
+		return fail(0, nil, fmt.Errorf("seat frame: %w", err))
+	}
+
+	agents, err := buildAgents(ctx, config, j, g, frame)
 	defer closeAgents(agents)
 	if err != nil {
 		return fail(0, nil, err)
+	}
+	// decodeChecked counts the tester's launches that passed the decode
+	// check. It is copied into the record only if the game completes.
+	decodeChecked := 0
+	var reporter choiceReporter
+	if config.checkDecode {
+		var ok bool
+		if reporter, ok = agents[j.seat].(choiceReporter); !ok {
+			return fail(0, &j.seat, fmt.Errorf("decode check: tester %s does not report its choices", agents[j.seat].ID()))
+		}
 	}
 
 	for !g.Finished() {
@@ -131,6 +192,14 @@ func playGame(ctx context.Context, config matchConfig, j job) (record gameRecord
 			}
 			if seat == j.seat {
 				record.Launches += len(decision.Actions)
+				// g has not advanced yet, so it is still the board the
+				// tester decided on, as the decoder needs.
+				if reporter != nil {
+					if err := checkDecode(g, frame, reporter.LastChoices(), decision.Actions); err != nil {
+						return fail(g.Turn, &seat, fmt.Errorf("decode check: %w", err))
+					}
+					decodeChecked += len(decision.Actions)
+				}
 			}
 			actions = append(actions, decision.Actions...)
 		}
@@ -157,6 +226,16 @@ func playGame(ctx context.Context, config matchConfig, j job) (record gameRecord
 	}
 	record.Leaders, _ = g.Winner()
 	record.Result = result(record.Leaders, j.seat)
+	// AimStats are running totals for the match, so reading them once at the
+	// end gives the whole game's counts.
+	if aims, ok := agents[j.seat].(aimReporter); ok {
+		stats := aims.AimStats()
+		record.TesterCounts = &TesterCounts{
+			AimAttempts: stats.AimAheadAttempts, AimFailures: stats.AimAheadFailed,
+			FallbackLaunches: stats.AimedStraight, RandomMoves: stats.RandomMoves,
+			DecodeCheckedLaunches: decodeChecked,
+		}
+	}
 	return record
 }
 
@@ -166,10 +245,12 @@ func matchID(j job) string {
 }
 
 // buildAgents creates one agent per seat. The tested seat gets the tester;
-// every other seat gets the opponent, built exactly as mlenv builds training
-// opponents: contestant ID "opponent-seat-<n>" and a seed from
-// arena.DeriveAgentSeed, so they behave as they do in training.
-func buildAgents(ctx context.Context, config matchConfig, j job, live *game.Game) ([]agent.Agent, error) {
+// every other seat gets its opponent, chosen and built exactly as mlenv
+// builds training opponents: the lineup entry for the seat's board role as
+// seen from the tested seat, contestant ID "opponent-seat-<n>", and a seed
+// from arena.DeriveAgentSeed, so they behave as they do in training. frame
+// is the tested seat's frame, which gives each other seat's role.
+func buildAgents(ctx context.Context, config matchConfig, j job, live *game.Game, frame mlenv.SeatFrame) ([]agent.Agent, error) {
 	agents := make([]agent.Agent, 0, players)
 	for seat := range players {
 		var a agent.Agent
@@ -181,10 +262,14 @@ func buildAgents(ctx context.Context, config matchConfig, j job, live *game.Game
 			}
 			a, err = build(ctx, j, live)
 		} else {
-			contestant := fmt.Sprintf("opponent-seat-%d", seat)
-			a, err = config.opponent.New(ctx, agent.AgentInit{
+			// Every seat of a generator-v2-4p map is seated, so RoleOf always
+			// finds a role here.
+			role, _ := frame.RoleOf(seat)
+			factory := config.opponents.ForRole(role)
+			contestant := seatContestant(seat)
+			a, err = factory.New(ctx, agent.AgentInit{
 				MatchID: matchID(j), ScenarioSeed: j.seed, ContestantID: contestant, PlayerID: seat,
-				AgentSeed: arena.DeriveAgentSeed(j.seed, contestant, config.opponent.Spec()),
+				AgentSeed: arena.DeriveAgentSeed(j.seed, contestant, factory.Spec()),
 			})
 		}
 		if err != nil {
@@ -195,6 +280,13 @@ func buildAgents(ctx context.Context, config matchConfig, j job, live *game.Game
 	return agents, nil
 }
 
+// seatContestant is the contestant ID of the opponent in seat, as mlenv
+// names training opponents. arena.DeriveAgentSeed hashes it, so it fixes that
+// seat's random stream.
+func seatContestant(seat int) string {
+	return fmt.Sprintf("opponent-seat-%d", seat)
+}
+
 // buildTester creates the tested seat's agent for one of the five testers.
 func (config matchConfig) buildTester(ctx context.Context, j job, live *game.Game) (agent.Agent, error) {
 	init := agent.AgentInit{
@@ -203,9 +295,19 @@ func (config matchConfig) buildTester(ctx context.Context, j job, live *game.Gam
 	switch j.tester {
 	case "heuristic":
 		// The calibration tester is the configured opponent playing itself:
-		// heuristic-v1 by default, whatever -opponent names otherwise.
-		init.AgentSeed = arena.DeriveAgentSeed(j.seed, init.ContestantID, config.opponent.Spec())
-		return config.opponent.New(ctx, init)
+		// heuristic-v1 by default, whatever -opponent names otherwise. run
+		// refuses this tester with a mixed lineup, so every role holds the
+		// same agent and any role's entry is it.
+		//
+		// It is seeded as the opponent in its seat would be, not as
+		// "tested". Calibration needs the four seat runs of a map to be one
+		// game, so each seat must draw the same random stream whichever
+		// seat carries the "tested" label. A seed tied to the label would
+		// give a random opponent (random-v1, or v2 with epsilon) a different
+		// stream in the tested seat, and calibration would fail falsely.
+		opponent := config.opponents.ForRole(mlenv.RoleCW)
+		init.AgentSeed = arena.DeriveAgentSeed(j.seed, seatContestant(j.seat), opponent.Spec())
+		return opponent.New(ctx, init)
 	case "idle":
 		return agent.IdleFactory{}.New(ctx, init)
 	case "random":
@@ -215,8 +317,42 @@ func (config matchConfig) buildTester(ctx context.Context, j job, live *game.Gam
 		return newDiagAgent(false, live, config.launchProbability, j.seed, j.seat), nil
 	case "diag-lead":
 		return newDiagAgent(true, live, config.launchProbability, j.seed, j.seat), nil
+	case specTester:
+		if config.tester == nil {
+			return nil, errors.New("no -tester-spec agent configured")
+		}
+		// A tester that is the opponent spec is the calibration, so it is
+		// seeded by its seat, exactly as the heuristic tester is. Any other
+		// tester spec isn't calibrated and keeps the "tested" seed.
+		contestant := init.ContestantID
+		if config.calibrationTester() == specTester {
+			contestant = seatContestant(j.seat)
+		}
+		init.AgentSeed = arena.DeriveAgentSeed(j.seed, contestant, config.tester.Spec())
+		return config.tester.New(ctx, init)
 	default:
 		return nil, fmt.Errorf("unknown tester %q", j.tester)
+	}
+}
+
+// calibrationTester names the tester whose games the calibration checks:
+// "heuristic" for the fixed testers, and specTester when the -tester-spec
+// agent is the opponent spec itself (same canonical form), so every seat
+// plays the same agent. A lineup whose three entries are all that spec
+// counts too: its canonical form is the one spec. Any other tester spec has
+// no calibration: "".
+//
+// The check expects the four seat runs of a seed to be one identical game.
+// That holds for random agents too, because the calibration tester is seeded
+// by its seat, exactly as the opponent there would be (see buildTester).
+func (config matchConfig) calibrationTester() string {
+	switch {
+	case config.tester == nil:
+		return "heuristic"
+	case config.tester.Spec().String() == config.opponents.String():
+		return specTester
+	default:
+		return ""
 	}
 }
 
