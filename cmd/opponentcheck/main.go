@@ -189,14 +189,22 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 		seedStart: *seedStart, seeds: *seeds, launchProbability: *probability,
 		workers: *workers, opponent: *opponent, random: *random, out: *out,
 	}
-	// -testers has a default, so only flags.Visit (which sees just the flags
-	// actually given) can tell whether it was typed alongside -tester-spec.
-	testersGiven := false
-	flags.Visit(func(f *flag.Flag) { testersGiven = testersGiven || f.Name == "testers" })
+	// Whether a flag was typed is asked of flags.Visit (which sees just the
+	// flags actually given), never of its value. -testers has a default, so
+	// its value can't tell; and -tester-spec typed with an empty value, say
+	// from an unset variable in a script, must not quietly fall back to the
+	// fixed testers.
+	testersGiven, testerSpecGiven := false, false
+	flags.Visit(func(f *flag.Flag) {
+		testersGiven = testersGiven || f.Name == "testers"
+		testerSpecGiven = testerSpecGiven || f.Name == "tester-spec"
+	})
 	switch {
-	case opts.testerSpec != "" && testersGiven:
+	case testerSpecGiven && opts.testerSpec == "":
+		return options{}, errors.New("-tester-spec must not be empty")
+	case testerSpecGiven && testersGiven:
 		return options{}, errors.New("-tester-spec cannot be combined with -testers")
-	case opts.testerSpec != "":
+	case testerSpecGiven:
 		opts.testers = []string{specTester}
 	default:
 		for _, name := range strings.Split(*testers, ",") {

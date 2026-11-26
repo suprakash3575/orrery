@@ -370,9 +370,10 @@ func TestCanonicalForms(t *testing.T) {
 	})
 }
 
-// TestParseOptionsRefusesConflictingFlags checks that flag combinations that
-// cannot both be honoured are refused before anything runs.
-func TestParseOptionsRefusesConflictingFlags(t *testing.T) {
+// TestParseOptionsRefusesBadFlags checks that a flag given a value that means
+// nothing, or flags that cannot both be honoured, are refused before
+// anything runs.
+func TestParseOptionsRefusesBadFlags(t *testing.T) {
 	tests := []struct {
 		name    string
 		args    []string
@@ -380,6 +381,11 @@ func TestParseOptionsRefusesConflictingFlags(t *testing.T) {
 	}{
 		// -tester-spec replaces the fixed testers, so naming both is a mistake.
 		{name: "tester spec with testers", args: []string{"-tester-spec", "idle-v1", "-testers", "idle"}, wantErr: "-tester-spec cannot be combined with -testers"},
+		// A blank -tester-spec, such as an unset variable in a script, must
+		// not fall back to the fixed testers, alone or next to -testers.
+		{name: "empty tester spec", args: []string{"-tester-spec", ""}, wantErr: "-tester-spec must not be empty"},
+		{name: "whitespace tester spec", args: []string{"-tester-spec", "  "}, wantErr: "-tester-spec must not be empty"},
+		{name: "empty tester spec with testers", args: []string{"-tester-spec", "", "-testers", "idle"}, wantErr: "-tester-spec must not be empty"},
 		// -canonical plays nothing, so a flag that shapes a run means the
 		// command was put together by mistake.
 		{name: "canonical with seeds", args: []string{"-canonical", "-seeds", "3", "idle-v1"}, wantErr: "-canonical cannot be combined with other flags"},
