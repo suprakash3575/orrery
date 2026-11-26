@@ -812,11 +812,27 @@ def run_training(
         players=config.players,
         profiler=profiler,
     ) as environment:
-        environment_metadata = _create_training_environment(
-            environment,
-            config,
-            checkpoint.seed_cursor if checkpoint is not None else 0,
-        )
+        try:
+            environment_metadata = _create_training_environment(
+                environment,
+                config,
+                checkpoint.seed_cursor if checkpoint is not None else 0,
+            )
+        except Exception as error:
+            # A new run's directory was created in step 3, before Go could
+            # check the configuration here (creating the environment needs a
+            # resume's seed cursor, so it can't move earlier). A misspelled
+            # or non-canonical training opponent therefore fails with the
+            # directory already in place, and a corrected retry into it would
+            # be refused as an existing run. Say so; delete nothing. A resume
+            # keeps its directory, so it gets no note.
+            if resume is None:
+                error.add_note(
+                    f"{destination} was created for this run before Go checked its "
+                    "configuration and holds no training updates; after fixing the "
+                    "configuration, remove that directory or choose a new --run-dir"
+                )
+            raise
         if resume is not None:
             review_recorded = _record_resumed_run(
                 destination,

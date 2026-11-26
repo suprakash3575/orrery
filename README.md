@@ -178,12 +178,17 @@ SHA-256 under `parent`. `--init-from` can't be combined with `--resume`.
 `diagnose.py --untrained` on such a run rebuilds random weights from the
 learner seed, not the starting checkpoint, so it isn't that run's baseline.
 
-`training_opponent` in a config is one pinned spec for every opponent seat,
-or a **lineup**: one pinned spec per opponent seat, joined by `|`, in board
-order from the learner: clockwise, opposite, then counter-clockwise. A
+`training_opponent` in a config is one agent spec for every opponent seat,
+or a **lineup**: one spec per opponent seat, joined by `|`, in board order
+from the learner: clockwise, opposite, then counter-clockwise. A
 four-player run takes three entries, and a two-player run takes a single
-spec. For the same opponent in every seat, write the spec once. The
-`configs/ladder-*` files are a mixed-opponent ladder:
+spec. For the same opponent in every seat, write the spec once. Any spec Go
+accepts may be used, such as a weakened `heuristic-v2` with `epsilon`, but
+it must be written in Go's canonical form, with parameters in alphabetical
+order. Training compares the opponent Go reports back with the config's
+text exactly, so any other spelling stops the run as it starts.
+`go run ./cmd/opponentcheck -canonical '<spec>'` prints the canonical form.
+The `configs/ladder-*` files are a mixed-opponent ladder:
 
 | Rung | Configs | Clockwise | Opposite | Counter-clockwise |
 |---|---|---|---|---|
@@ -212,6 +217,11 @@ on validation maps:
 ```bash
 make diagnose DIAG_RUN=runs/<run> DIAG_OUT=runs/<report-dir>
 ```
+
+It plays the first validation maps. To confirm a result on fresh maps that
+played no part in choosing it, start further in with
+`DIAG_ARGS="--seed-start 1005000"`. The maps must stay inside the
+validation seeds, never training maps or the protected test pools.
 
 The final held-out test of an archived checkpoint is a one-time step, because
 each pool of test maps may be used only once:

@@ -29,7 +29,11 @@ Run from the ``python/`` directory::
 
 ``--no-games`` keeps only the training history (seconds, no GPU or Go).
 ``--seeds N`` sets how many validation boards are played; each is played from
-every seat, so a four-player run plays ``4 × N`` games. ``--no-charts`` skips
+every seat, so a four-player run plays ``4 × N`` games. ``--seed-start S``
+plays them from validation seed S instead of the first, for fresh boards that
+played no part in choosing what is being checked; the boards must stay inside
+the validation seeds, never training maps or protected evaluation pools.
+``--no-charts`` skips
 the charts and the matplotlib dependency. ``--opponent SPEC`` plays a different
 opponent than the one the run trained against, for example
 ``random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2``.
@@ -1208,6 +1212,41 @@ def latest_checkpoint(run: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def diagnosis_seed_range(config: Any, seeds: int, seed_start: int | None = None) -> SeedRange:
+    """The ``seeds`` consecutive map seeds a diagnosis plays.
+
+    By default they are the first validation seeds, as before. ``seed_start``
+    moves them later, to maps that played no part in choosing what is being
+    checked, so a result can be confirmed on fresh maps.
+
+    The whole range must lie inside the reusable validation seeds. That keeps
+    out the training maps, which the model has learned from, and the
+    protected evaluation pools, which are used once each for a final
+    evaluation and would be spoiled by being seen first. The count rule is
+    validation_seed_prefix's, so ``--seeds`` means the same either way.
+
+    Example, with validation seeds [1,000,000, 1,010,000): 100 seeds from
+    1,005,000 play [1,005,000, 1,005,100); from 1,009,950 they would run past
+    the end and are refused.
+    """
+
+    prefix = validation_seed_prefix(config, seeds)
+    count = prefix.end - prefix.start
+    if seed_start is None:
+        return prefix
+    if isinstance(seed_start, bool) or not isinstance(seed_start, int):
+        raise TypeError(f"seed_start must be an integer, got {seed_start!r}")
+    validation = config.validation_seeds
+    if not validation.start <= seed_start <= validation.end - count:
+        raise ValueError(
+            f"--seed-start {seed_start} with {count} seeds plays "
+            f"[{seed_start}, {seed_start + count}), which is not inside the reusable "
+            f"validation seeds [{validation.start}, {validation.end}); a diagnosis never "
+            "plays training maps or the protected evaluation pools"
+        )
+    return SeedRange(seed_start, seed_start + count)
+
+
 def diagnose_games(
     *,
     checkpoint: Path | None,
@@ -1218,6 +1257,7 @@ def diagnose_games(
     game_charts: int,
     traced_wins: int,
     opponent: str | None = None,
+    seed_start: int | None = None,
     run: Path | None = None,
     command: Sequence[str] = DEFAULT_ENV_COMMAND,
     runner: Callable[..., Any] = run_rotated_matches,
@@ -1227,8 +1267,10 @@ def diagnose_games(
 
     The model is ``checkpoint``, or, when that is ``None``, the reconstructed
     untrained baseline of ``run``. ``opponent`` is a complete opponent spec;
-    ``None`` plays the run's training opponent. Returns the game section of
-    the report and the labels of charted games.
+    ``None`` plays the run's training opponent. ``seed_start`` is the first
+    map seed (see diagnosis_seed_range); ``None`` starts at the first
+    validation seed. Returns the game section of the report and the labels of
+    charted games.
     """
 
     # Choose the model before any game starts. A saved checkpoint is bound to
@@ -1268,9 +1310,9 @@ def diagnose_games(
     model["weights_sha256"] = state_dict_sha256(policy.state_dict())
     model["torch_version"] = torch.__version__
 
-    # Choose the boards: a prefix of the reusable validation seeds, never a
+    # Choose the boards: reusable validation seeds, never a training map or a
     # protected pool.
-    seed_range = validation_seed_prefix(config, seeds)
+    seed_range = diagnosis_seed_range(config, seeds, seed_start)
     target = resolve_evaluation_device(device, config.device)
     policy = policy.to(device=target)
     # The override is local to these games: the run's saved configuration is
@@ -1490,6 +1532,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=f"validation boards to play, each from every seat (default: {DEFAULT_SEEDS})",
     )
     parser.add_argument(
+        "--seed-start",
+        type=int,
+        help=(
+            "first validation board to play, for fresh boards that played no part in "
+            "choosing what is checked; the range must stay inside the validation seeds "
+            "(default: the first validation seed)"
+        ),
+    )
+    parser.add_argument(
         "--device",
         choices=("cpu", "cuda"),
         help="where the model decides moves (default: the run config's device)",
@@ -1513,10 +1564,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--game-charts and --traced-wins must not be negative")
     if arguments.no_games and arguments.opponent is not None:
         parser.error("--opponent chooses who the games are played against; it has no effect with --no-games")
+    if arguments.no_games and arguments.seed_start is not None:
+        parser.error("--seed-start chooses the boards played; it has no effect with --no-games")
     if arguments.untrained and arguments.checkpoint is not None:
         parser.error("--untrained replaces --checkpoint; choose one model to play")
     if arguments.untrained and arguments.no_games:
         parser.error("--untrained chooses the model that plays; it has no effect with --no-games")
+
+    # Check the boards before anything is written. The training chart is
+    # drawn before the games are chosen, so a refused --seeds or --seed-start
+    # found later would leave a non-empty --out, and the corrected command
+    # would then be refused for reusing it. diagnose_games checks the range
+    # again for its own callers.
+    if not arguments.no_games:
+        run_config = run_config_from_mapping(
+            read_json_object(arguments.run_dir / "run-config.json", "run configuration")
+        )
+        try:
+            diagnosis_seed_range(run_config, arguments.seeds, arguments.seed_start)
+        except ValueError as error:
+            parser.error(str(error))
 
     # Each run gets its own folder, so an earlier report is never mixed with or
     # replaced by a new one.
@@ -1533,6 +1600,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         seeds=arguments.seeds,
         device=arguments.device,
         opponent=arguments.opponent,
+        seed_start=arguments.seed_start,
         untrained=arguments.untrained,
         charts=not arguments.no_charts,
         game_charts=arguments.game_charts,
