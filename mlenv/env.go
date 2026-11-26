@@ -308,7 +308,7 @@ func NewBatch(ctx context.Context, config BatchConfig) (*Batch, error) {
 	}
 	// NewLineup has already refused nil factories and empty IDs. Only the
 	// zero Lineup and a count that doesn't fit this map can still get here.
-	if err := config.Opponents.validateFor(players); err != nil {
+	if err := config.Opponents.ValidateFor(players); err != nil {
 		return nil, batchError(ErrorValidation, "%v", err)
 	}
 
@@ -708,7 +708,7 @@ func (b *Batch) newEnvironment(ctx context.Context, plan episodeAssignment) (*en
 		// entry keeps its place around the board whichever seat the learner
 		// holds. Seats are still visited, and opponents created, in
 		// ascending seat order.
-		factory := b.config.Opponents.forRole(role)
+		factory := b.config.Opponents.ForRole(role)
 		opponent, err := b.newOpponent(ctx, info, matchID, seat, factory)
 		if err != nil {
 			// newOpponent has already closed the failed agent itself; close the
