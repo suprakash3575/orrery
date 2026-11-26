@@ -9,6 +9,8 @@
 // also takes a lineup of three specs joined by "|", seated by board role
 // from the tested seat, as mlenv seats training opponents. -check-decode
 // proves a restricted heuristic-v2 tester made only the learner's moves.
+// -canonical prints specs in canonical form and plays nothing, so a run
+// script can check its specs before starting.
 //
 // Each game is appended to games.jsonl as soon as it finishes, so an
 // interrupted run keeps its completed work. At the end it writes the sorted
@@ -74,7 +76,10 @@ type options struct {
 	// the fixed testers are played.
 	testerSpec string
 	// checkDecode turns on the decode check (see decodecheck.go).
-	checkDecode       bool
+	checkDecode bool
+	// canonical holds the specs to print in canonical form (-canonical).
+	// When it is set, no other option is, and nothing is played.
+	canonical         []string
 	seedStart         int64
 	seeds             int
 	launchProbability float64
@@ -117,6 +122,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "opponentcheck:", err)
 		os.Exit(2)
 	}
+	if opts.canonical != nil {
+		forms, err := canonicalForms(opts.canonical)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "opponentcheck:", err)
+			os.Exit(1)
+		}
+		for _, form := range forms {
+			fmt.Println(form)
+		}
+		return
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	complete, err := run(ctx, opts, os.Stdout)
@@ -144,8 +160,26 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	opponent := flags.String("opponent", defaultOpponent, "agent spec for the three opponent seats, or three specs joined by | for the seats clockwise, opposite and counter-clockwise of the tested seat")
 	random := flags.String("random", defaultRandom, "agent spec for the random tester")
 	out := flags.String("out", "", "new directory for the results (required; never overwritten)")
+	canonical := flags.Bool("canonical", false, "print the canonical form of each spec or lineup given as an argument, one per line, and exit; plays nothing")
 	if err := flags.Parse(args); err != nil {
 		return options{}, err
+	}
+	// -canonical is a separate mode: it takes specs as arguments and plays
+	// nothing, so no other flag applies and -out isn't needed.
+	if *canonical {
+		others := 0
+		flags.Visit(func(f *flag.Flag) {
+			if f.Name != "canonical" {
+				others++
+			}
+		})
+		switch {
+		case others > 0:
+			return options{}, errors.New("-canonical cannot be combined with other flags")
+		case flags.NArg() == 0:
+			return options{}, errors.New("-canonical needs at least one spec")
+		}
+		return options{canonical: flags.Args()}, nil
 	}
 	if flags.NArg() != 0 {
 		return options{}, fmt.Errorf("unexpected arguments: %v", flags.Args())
@@ -186,6 +220,37 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 		return options{}, errors.New("-launch-probability must be in [0, 1]")
 	}
 	return opts, nil
+}
+
+// canonicalForms returns the canonical form of each input, in input order.
+// Each is read exactly as -opponent reads it: one agent spec, or a lineup of
+// three joined by "|", parsed and checked by mlenv.Lineup. So a lineup of
+// three identical entries comes back as that one spec, which is the only
+// spelling training accepts for it.
+//
+// A caller checks a spec by comparing it with its canonical form: any
+// difference (parameter order, a setting written at its default, 0.50 for
+// 0.5) means the spelling isn't canonical. If any input doesn't parse, it
+// returns no forms and an error naming every bad input, so a caller never
+// pairs a form with the wrong input.
+func canonicalForms(inputs []string) ([]string, error) {
+	forms := make([]string, 0, len(inputs))
+	var errs []error
+	for _, input := range inputs {
+		lineup, err := mlenv.ParseLineup(input, agent.ParseFactory)
+		if err == nil {
+			err = lineup.ValidateFor(players)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%q: %w", input, err))
+			continue
+		}
+		forms = append(forms, lineup.String())
+	}
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	return forms, nil
 }
 
 // run plays every job and writes the results. It returns whether every game
