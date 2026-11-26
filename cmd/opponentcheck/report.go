@@ -357,13 +357,13 @@ func markdownSummary(meta runMeta, summaries []testerSummary, c calibration, dec
 	if slices.ContainsFunc(summaries, func(s testerSummary) bool { return s.CounterSummary != nil }) {
 		b.WriteString("\n## Aim and decode counts\n\n")
 		b.WriteString("Over completed games. A rate is undefined when nothing was counted to divide by.\n\n")
-		b.WriteString("| Tester | Aim attempts | Aim failures | Aim failure rate | Fallback launches | Fallback share of launches | Random moves/game | Decode-checked launches |\n")
-		b.WriteString("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+		b.WriteString("| Tester | Aim attempts | Aim failures | Aim failure rate | Fallback launches | Fallback share of launches | Random moves | Random moves/game | Decode-checked launches |\n")
+		b.WriteString("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
 		for _, s := range summaries {
 			if c := s.CounterSummary; c != nil {
-				fmt.Fprintf(&b, "| %s | %d | %d | %s | %d | %s | %.1f | %d |\n",
+				fmt.Fprintf(&b, "| %s | %d | %d | %s | %d | %s | %d | %.1f | %d |\n",
 					s.Tester, c.AimAttempts, c.AimFailures, formatRate(c.AimFailureRate),
-					c.FallbackLaunches, formatRate(c.FallbackRate), c.RandomMovesPerGame, c.DecodeCheckedLaunches)
+					c.FallbackLaunches, formatRate(c.FallbackRate), c.RandomMoves, c.RandomMovesPerGame, c.DecodeCheckedLaunches)
 			}
 		}
 	}

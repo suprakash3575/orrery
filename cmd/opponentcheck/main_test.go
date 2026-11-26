@@ -296,8 +296,9 @@ func TestBuildAgentsSeatsLineupByRole(t *testing.T) {
 }
 
 // TestSummarizeCountsRates checks the counts summary on hand-made records:
-// totals and rates add up across games, a rate with nothing to divide by is
-// undefined (nil) rather than 0, and records without counts give no summary.
+// totals and rates add up across games and appear in summary.md, a rate with
+// nothing to divide by is undefined (nil) rather than 0, and records without
+// counts give no summary.
 func TestSummarizeCountsRates(t *testing.T) {
 	counted := []gameRecord{
 		{Launches: 10, TesterCounts: &TesterCounts{AimAttempts: 8, AimFailures: 2, FallbackLaunches: 2, RandomMoves: 3, DecodeCheckedLaunches: 10}},
@@ -313,6 +314,13 @@ func TestSummarizeCountsRates(t *testing.T) {
 	}
 	if c.AimFailureRate == nil || *c.AimFailureRate != 0.25 || c.FallbackRate == nil || *c.FallbackRate != 0.125 || c.RandomMovesPerGame != 4 {
 		t.Fatalf("rates = %v, %v, %v; want 0.25, 0.125, 4", c.AimFailureRate, c.FallbackRate, c.RandomMovesPerGame)
+	}
+
+	// summary.md shows every total, the random-move total included, next to
+	// the rates and the per-game average.
+	markdown := markdownSummary(runMeta{TesterSpec: "heuristic-v2"}, []testerSummary{{Tester: specTester, CounterSummary: c}}, calibration{}, "no verdict", nil)
+	if row := "| spec | 20 | 5 | 25.0% | 5 | 12.5% | 8 | 4.0 | 40 |"; !strings.Contains(markdown, row) {
+		t.Fatalf("summary.md has no counts row %q:\n%s", row, markdown)
 	}
 
 	// A bot that never aimed ahead or launched: both rates are undefined.
