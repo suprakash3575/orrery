@@ -159,20 +159,6 @@ def test_run_config_rejects_malformed_contract_identity(
         # Checkpoints and archives recorded with the CPU evaluator are refused
         # instead of being validated under different decoding rules.
         ("evaluation_policy", "eval-policy-v1", "must be 'eval-policy-v2'"),
-        # Runs and checkpoints that trained against heuristic-v1 are refused,
-        # so they cannot be resumed or released under the heuristic-v2 gate.
-        (
-            "training_opponent",
-            "heuristic-v1:aggression=1.2,defense=0.1,economy=1,efficiency=1",
-            "training_opponent must be 'heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1' or",
-        ),
-        # Specs are compared whole: random-v1 with any other parameter is a
-        # different opponent, not the allowed easier one.
-        (
-            "training_opponent",
-            "random-v1:launch_probability=0.5,max_fraction=0.8,min_fraction=0.2",
-            "training_opponent must be",
-        ),
     ),
 )
 def test_run_config_rejects_inconsistent_values(
@@ -252,7 +238,6 @@ def test_training_opponent_accepts_pinned_lineups_and_single_specs(
 @pytest.mark.parametrize(
     ("path", "opponent", "message"),
     [
-        (FOUR_PLAYER_CONFIG, f"{_H}|{_R}|idle-v1", "entry 3 is 'idle-v1'"),
         (FOUR_PLAYER_CONFIG, f"{_H}|{_R}", "has 2 entries"),
         (FOUR_PLAYER_CONFIG, f"{_H}|{_R}|{_R}|{_R}", "has 4 entries"),
         (CONFIG, f"{_H}|{_R}", "has 2 entries"),
@@ -261,14 +246,16 @@ def test_training_opponent_accepts_pinned_lineups_and_single_specs(
         (FOUR_PLAYER_CONFIG, f"{_H}|{_R}|", "entry 3 is empty"),
     ],
     ids=[
-        "unpinned entry", "two entries on 4p", "four entries on 4p", "lineup on 2p",
+        "two entries on 4p", "four entries on 4p", "lineup on 2p",
         "same spec in every seat", "doubled separator", "trailing separator",
     ],
 )
 def test_training_opponent_rejects_invalid_lineups(
     path: Path, opponent: str, message: str
 ) -> None:
-    """Python refuses a bad lineup before Go starts: unpinned, wrong count, or empty.
+    """Python refuses a badly shaped lineup before Go starts: wrong count or empty.
+
+    Which specs are valid is Go's to decide when the environment starts.
 
     A lineup of one repeated spec is refused too: Go records it as the single
     spec, so training's exact check of Go's echoed opponent would fail later.

@@ -33,13 +33,11 @@ HEURISTIC_V2_OPPONENT = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
 # training opponent for runs that test whether a learner improves faster when
 # it wins some of its training games.
 RANDOM_V1_OPPONENT = "random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2"
-# The exact specs a run may train against. A spec is compared as a whole
-# string, so a changed parameter is a different opponent and is refused.
-TRAINING_OPPONENTS = (HEURISTIC_V2_OPPONENT, RANDOM_V1_OPPONENT)
 # Separates the specs of an opponent lineup, as Go's mlenv.LineupSeparator
 # does. A lineup names one opponent per seat by its board position from the
 # learner: clockwise, opposite, then counter-clockwise. Go owns what a lineup
-# does; Python only checks that each entry is pinned and the count fits.
+# and each spec in it mean; Python only checks the lineup's shape (see
+# _check_training_opponent).
 LINEUP_SEPARATOR = "|"
 # Release readiness and final evaluation always play this opponent, whatever
 # the run trained against. Without a separate identity, a run that trained
@@ -49,7 +47,7 @@ RELEASE_OPPONENT = HEURISTIC_V2_OPPONENT
 
 # These identities are the same in every rl-v2 run. The generator is fixed by
 # the player count instead, through GENERATOR_FOR_PLAYERS, and the training
-# opponent is chosen from TRAINING_OPPONENTS.
+# opponent is configured (see _check_training_opponent).
 _FIXED_IDENTITIES = {
     "training_schedule": SCHEDULE_TRAIN_V2,
     "pipeline_opponent": RANDOM_V1_OPPONENT,
@@ -159,11 +157,12 @@ class RunConfig:
     evaluation_pool_names: tuple[str, ...]
     # training_schedule names Go's deterministic cursor-to-seed-and-seat mapping.
     training_schedule: str
-    # training_opponent is what the learner trains against: one of
-    # TRAINING_OPPONENTS in every opponent seat, or a lineup of them joined by
-    # LINEUP_SEPARATOR, one per opponent seat (clockwise, opposite, then
-    # counter-clockwise of the learner). Release readiness and final
-    # evaluation do not use it; they play release_opponent.
+    # training_opponent is what the learner trains against: any agent spec Go
+    # accepts, in canonical form, in every opponent seat, or a lineup of specs
+    # joined by LINEUP_SEPARATOR, one per opponent seat (clockwise, opposite,
+    # then counter-clockwise of the learner). The pipeline gate, release
+    # readiness and final evaluation never use it; they play
+    # pipeline_opponent and release_opponent.
     training_opponent: str
     # pipeline_opponent is the complete opponent specification used by the initial gate.
     pipeline_opponent: str
@@ -444,34 +443,36 @@ def _seed_range(value: object, name: str) -> SeedRange:
 
 
 def _check_training_opponent(opponent: str, players: int) -> None:
-    """Refuse a training opponent that isn't a pinned spec or a valid lineup.
+    """Refuse a training opponent whose shape is wrong, before Go starts.
 
-    A single pinned spec plays every opponent seat. A lineup names one pinned
-    spec per opponent seat, so it must have players - 1 entries: three on a
-    four-player map, and none longer than one on a two-player map. Each entry
-    is compared as a whole string, as a single spec is, so an unpinned bot or a
-    changed parameter is refused before Go starts.
+    The opponent is one agent spec for every opponent seat, or a lineup with
+    one spec per opponent seat: players - 1 entries, so three on a
+    four-player map, and a two-player map takes no lineup at all.
 
-    A lineup whose entries are all the same is refused too. Go records it as
-    that single spec, and training's exact check of Go's echoed opponent would
-    then fail with a confusing mismatch, so a config writes such a setup once.
+    Python checks only that shape. Which specs exist, and how each is spelled,
+    is Go's to decide: Go parses the opponent when the environment starts,
+    and training then requires Go's canonical echo of it to equal this text
+    exactly (_validate_training_metadata). So a misspelled setting, or a
+    valid spec spelled another way, is refused there, before any update.
+    The gates can't be weakened by any of this: the pipeline gate and
+    release always play their own fixed opponents.
+
+    A lineup whose entries are all the same is refused here. Go records it as
+    that single spec, so the exact echo check would fail with a confusing
+    mismatch; a config writes such a setup once.
     """
 
     entries = opponent.split(LINEUP_SEPARATOR)
-    allowed = " or ".join(repr(spec) for spec in TRAINING_OPPONENTS)
-    if len(entries) == 1:
-        if opponent not in TRAINING_OPPONENTS:
-            raise ValueError(f"training_opponent must be {allowed} for {CONTRACT}")
-        return
     for position, entry in enumerate(entries, start=1):
-        # An empty entry comes from a doubled separator or one at either end.
-        if not entry:
+        # An empty entry comes from empty text, a doubled separator, or one at
+        # either end. Blank text is refused as empty too, rather than left to
+        # Go, so the message says what is wrong.
+        if not entry.strip():
+            if len(entries) == 1:
+                raise ValueError("training_opponent must not be empty")
             raise ValueError(f"training_opponent lineup entry {position} is empty")
-        if entry not in TRAINING_OPPONENTS:
-            raise ValueError(
-                f"training_opponent lineup entry {position} is {entry!r}; "
-                f"each entry must be {allowed}"
-            )
+    if len(entries) == 1:
+        return
     if len(entries) != players - 1:
         raise ValueError(
             f"training_opponent lineup has {len(entries)} entries; a {players}-player "
