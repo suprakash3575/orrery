@@ -541,6 +541,82 @@ func TestHeuristicV2Epsilon(t *testing.T) {
 	})
 }
 
+// TestHeuristicV2Reports checks AimStats and LastChoices, the read-only
+// reports the bot-only runner uses, on the board where the path from planet 1
+// to planet 2 crosses the sun, so aiming ahead fails.
+func TestHeuristicV2Reports(t *testing.T) {
+	g := smallV2Board(t, []game.Planet{
+		{ID: 1, OwnerID: 0, Ships: 50, Production: 1, Position: game.Vec2{X: 20, Y: 50}},
+		{ID: 2, OwnerID: game.NeutralPlayer, Ships: 10, Production: 3, Position: game.Vec2{X: 80, Y: 50}},
+	}, nil)
+	// decide makes a bot from spec and lets it decide on g once per turn,
+	// turns times, always on the same board.
+	decide := func(t *testing.T, spec string, turns int) *HeuristicV2Agent {
+		t.Helper()
+		factory, err := ParseFactory(HeuristicV2Default + spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		created, err := factory.New(context.Background(), AgentInit{AgentSeed: 7})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bot := created.(*HeuristicV2Agent)
+		for range turns {
+			if _, err := bot.Decide(context.Background(), TurnRequest{PlayerID: 0, View: NewView(g)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return bot
+	}
+
+	t.Run("learner_aim counts a failed aim and a straight launch", func(t *testing.T) {
+		// Each turn: one target, one attempt to aim ahead that fails, and
+		// one launch aimed straight at planet 2. Two turns add up.
+		bot := decide(t, ",learner_aim=1", 2)
+		want := AimStats{AimAheadAttempts: 2, AimAheadFailed: 2, AimedStraight: 2, Launches: 2}
+		if got := bot.AimStats(); got != want {
+			t.Errorf("AimStats = %+v, want %+v", got, want)
+		}
+		// LastChoices holds only the latest turn's launch, not both turns'.
+		if got, want := bot.LastChoices(), []LaunchChoice{{Source: 1, Target: 2}}; !reflect.DeepEqual(got, want) {
+			t.Errorf("LastChoices = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("normal v2 counts the failed aim but doesn't launch", func(t *testing.T) {
+		bot := decide(t, "", 1)
+		want := AimStats{AimAheadAttempts: 1, AimAheadFailed: 1}
+		if got := bot.AimStats(); got != want {
+			t.Errorf("AimStats = %+v, want %+v", got, want)
+		}
+		if got := bot.LastChoices(); len(got) != 0 {
+			t.Errorf("LastChoices = %v, want none", got)
+		}
+	})
+
+	t.Run("a random launch has no target", func(t *testing.T) {
+		// epsilon=1 makes every move random, and epsilon_launch_probability=1
+		// makes planet 1's 50 ships always launch.
+		bot := decide(t, ",epsilon=1,epsilon_launch_probability=1", 1)
+		want := AimStats{Launches: 1, RandomMoves: 1}
+		if got := bot.AimStats(); got != want {
+			t.Errorf("AimStats = %+v, want %+v", got, want)
+		}
+		if got, want := bot.LastChoices(), []LaunchChoice{{Source: 1, Target: NoTarget}}; !reflect.DeepEqual(got, want) {
+			t.Errorf("LastChoices = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("LastChoices returns a copy", func(t *testing.T) {
+		bot := decide(t, ",learner_aim=1", 1)
+		bot.LastChoices()[0].Target = 99
+		if got := bot.LastChoices()[0].Target; got != 2 {
+			t.Errorf("changing the returned list changed the bot's: target %d, want 2", got)
+		}
+	})
+}
+
 // epsilonBoard is six owned planets, each with 50 ships and its own neutral
 // target 10 units away, far from the others. Each planet's best target is its
 // own, so v2's choice for one planet never depends on another's, and the
