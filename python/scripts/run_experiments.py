@@ -23,8 +23,10 @@ The kinds of section:
 - ``[[botcheck]]``: bot-only games with ``opponentcheck``, one job per tester.
 - ``[[diagnose]]``: a trained checkpoint plays the session's maps, one job per
   (opponent, run, update).
-- ``[[train]]``: train from a checkpoint against an opponent, then diagnose
-  every saved checkpoint, one job per (training opponent, starting checkpoint).
+- ``[[train]]``: diagnose the starting checkpoint, train from it against an
+  opponent, then diagnose every saved checkpoint, one job per (training
+  opponent, starting checkpoint). The analysis compares the final
+  checkpoint's wins with the starting checkpoint's.
 - ``[[compare]]`` and ``[[dial]]``: no jobs; they tell analyze_experiments.py
   what to compare.
 
@@ -293,7 +295,14 @@ def parse_plan(text: str) -> Plan:
             answers[table["name"]] = _band(table)
     for table in raw.get("train", []):
         jobs.extend(_train_jobs(table))
-        answers[table["name"]] = {"progress_min_runs": _int(table, "progress_min_runs", "[[train]]", default=2)}
+        answers[table["name"]] = {
+            "progress_min_runs": _int(table, "progress_min_runs", "[[train]]", default=2),
+            # Required: how many more wins than its starting checkpoint a
+            # run's final checkpoint needs to count as progress. A fair
+            # threshold depends on how many games a diagnosis plays, so each
+            # file states its own.
+            "progress_min_extra_wins": _int(table, "progress_min_extra_wins", "[[train]]"),
+        }
 
     # Step 3: check the jobs fit together. Experiment names group jobs into
     # folders, so two sections may not share one, and job ids must be
@@ -615,6 +624,14 @@ def checkpoint_path(run_dir: str, update: int) -> Path:
     return repository_path(checkpoint_file(run_dir, update))
 
 
+def start_run(init_from: str) -> str:
+    """The run that saved a starting checkpoint, written as the experiment
+    file writes paths. Example: runs/x/checkpoints/update-000153.pt gives
+    runs/x. Diagnosing the checkpoint needs its run's files."""
+
+    return Path(init_from).parent.parent.as_posix()
+
+
 def training_config(job: Job, session: Session) -> dict[str, Any]:
     """The full training config a train job runs: its base config with this
     job's opponent, checkpoint cadence and the session's device.
@@ -731,9 +748,11 @@ def describe(plan: Plan, jobs: Sequence[Job]) -> list[str]:
         kind = group[0].kind
         if kind == "train":
             updates = sum(job.settings["max_updates"] for job in group)
-            diagnoses = sum(checkpoint_count(job) * len(job.settings["diagnose_against"]) for job in group)
+            # Each saved checkpoint, plus the starting one, is diagnosed
+            # against each diagnose_against opponent.
+            diagnoses = sum((checkpoint_count(job) + 1) * len(job.settings["diagnose_against"]) for job in group)
             lines.append(f"  {experiment} (train): {len(group)} runs, {updates} updates, "
-                         f"{diagnoses} checkpoint diagnoses, {diagnoses * games_per_job} games")
+                         f"{diagnoses} diagnoses (start and checkpoints), {diagnoses * games_per_job} games")
         else:
             lines.append(f"  {experiment} ({kind}): {len(group)} jobs, {len(group) * games_per_job} games")
     return lines
@@ -942,7 +961,19 @@ class Runner:
             return self._diagnose(run_dir, checkpoint_path(job.settings["run_dir"], job.settings["update"]),
                                   job.settings["opponent"], folder / "diagnosis", maps, log)
 
-        # A train job: write its own full config, train, then diagnose every
+        # A train job, part 1: diagnose the starting checkpoint against every
+        # diagnose_against opponent. The analysis compares the final
+        # checkpoint with this, so both play the same maps, seats and
+        # opponent with the same code. It runs before training, so the
+        # baseline exists even if training then fails.
+        start = repository_path(start_run(job.settings["init_from"]))
+        for label, spec in job.settings["diagnose_against"].items():
+            failed = self._diagnose(start, repository_path(job.settings["init_from"]), spec,
+                                    folder / "diagnoses" / f"start__{label}", maps, log)
+            if failed:
+                return failed
+
+        # Part 2: write the job's own full config, train, then diagnose every
         # checkpoint the run saved against every diagnose_against opponent.
         config = folder / "config.toml"
         config.write_text(toml_text(training_config(job, session)))
@@ -1153,22 +1184,26 @@ def input_files(jobs: Sequence[Job]) -> list[str]:
     """Every file the jobs read, as the experiment file writes paths, each
     once and sorted.
 
-    A diagnose job reads its checkpoint, and from the checkpoint's run the
+    Diagnosing a checkpoint reads the checkpoint, and from its run the
     run-config.json and manifest.json (diagnose checks the checkpoint against
-    both) and metrics.csv (its training history). A train job reads its
-    starting checkpoint and its base config; its own settings are in the
-    experiment file's text, which a resume already compares. A bot job reads
-    no files: its specs are in that text too.
+    both) and metrics.csv (its training history). A diagnose job diagnoses
+    its checkpoint. A train job diagnoses its starting checkpoint and reads
+    its base config; its own settings are in the experiment file's text,
+    which a resume already compares. A bot job reads no files: its specs are
+    in that text too.
     """
+
+    def run_files(run_dir: str) -> list[str]:
+        return [(Path(run_dir) / name).as_posix() for name in ("run-config.json", "manifest.json", "metrics.csv")]
 
     found: set[str] = set()
     for job in jobs:
         if job.kind == "diagnose":
-            run_dir = job.settings["run_dir"]
-            found.add(checkpoint_file(run_dir, job.settings["update"]))
-            found.update((Path(run_dir) / name).as_posix() for name in ("run-config.json", "manifest.json", "metrics.csv"))
+            found.add(checkpoint_file(job.settings["run_dir"], job.settings["update"]))
+            found.update(run_files(job.settings["run_dir"]))
         elif job.kind == "train":
             found.update((job.settings["init_from"], job.settings["base_config"]))
+            found.update(run_files(start_run(job.settings["init_from"])))
     return sorted(found)
 
 

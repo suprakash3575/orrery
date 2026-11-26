@@ -171,6 +171,16 @@ def diagnosis_win_rate(report_path: Path) -> float:
     return games["wins"] / games["games"]
 
 
+def diagnosis_wins(report_path: Path) -> dict[str, int] | None:
+    """A diagnosis's wins and games, from its report.json; None when the
+    diagnosis is missing. Example: {"wins": 3, "games": 400}."""
+
+    if not report_path.is_file():
+        return None
+    games = json.loads(report_path.read_text())["games"]["measurements"]
+    return {"wins": games["wins"], "games": games["games"]}
+
+
 def training_win_rates(metrics_path: Path) -> list[tuple[int, int, int]]:
     """(update, wins, games) for every update in a run's metrics.csv.
 
@@ -398,7 +408,8 @@ def analyze(out: Path) -> dict[str, Any]:
                 "opponent": job.settings["opponent_label"]} for job in group]
         analysis["train"][experiment] = {
             "runs": runs,
-            "answer": train_answer(runs, plan.answers[experiment]["progress_min_runs"]),
+            "answer": train_answer(runs, plan.answers[experiment]["progress_min_runs"],
+                                   plan.answers[experiment]["progress_min_extra_wins"]),
         }
     return analysis
 
@@ -487,45 +498,83 @@ def train_run(out: Path, job: Job) -> dict[str, Any]:
         "first_training_win_rate": first if span else None,
         "last_training_win_rate": last if span else None,
         "training_rose": bool(span) and last > first,
+        "progress": train_progress(folder, job),
     }
 
 
-def train_answer(runs: Sequence[Mapping[str, Any]], min_runs: int) -> str:
-    """Experiment 4: progress if, for some training opponent, at least
-    min_runs runs beat the first diagnose_against opponent at any checkpoint.
+def train_progress(folder: Path, job: Job) -> dict[str, Any]:
+    """The progress measure of one train job: its final checkpoint's wins
+    minus its starting checkpoint's wins, against the first
+    diagnose_against opponent (full v2 in Stage 1).
 
-    The three answers, checked in this order:
+    Both diagnoses play the same maps, seats and opponent, so the difference
+    is what training added. The final checkpoint is the one at max_updates,
+    the update the experiment file asked for. extra_wins is None (the run is
+    pending) when either diagnosis is missing, for example because training
+    stopped early and never saved that checkpoint.
 
-    1. **First real progress**: for one training opponent, at least min_runs
-       runs won some games (above 0%) against the full opponent at some
-       checkpoint. Training on a weakened opponent is then a route forward.
-    2. **Partial**: no such progress, but the training win rate rose in at
-       least min_runs runs: the model improves against the weakened
-       opponent, yet the gap to the full one is still too large.
-    3. **Not working**: neither.
-
-    Example, min_runs 2: three runs against one training opponent reach 0%,
-    1% and 0.5% against full v2 at their best checkpoints. Two are above 0,
-    so the answer is first real progress.
+    Example: the start wins 1 of 400 games and the final checkpoint 6 of
+    400, so extra_wins is 5.
     """
 
-    if not all(run["done"] for run in runs):
-        return "Not ready: some runs aren't done."
+    against = next(iter(job.settings["diagnose_against"]))
+    final_update = job.settings["max_updates"]
+    start = diagnosis_wins(folder / "diagnoses" / f"start__{against}" / "report.json")
+    final = diagnosis_wins(folder / "diagnoses" / f"update-{final_update:06d}__{against}" / "report.json")
+    # Wins only compare if both played the same number of games, which they
+    # do when both ran in this session.
+    comparable = start is not None and final is not None and start["games"] == final["games"]
+    return {
+        "against": against,
+        "final_update": final_update,
+        "start": start,
+        "final": final,
+        "extra_wins": final["wins"] - start["wins"] if comparable else None,
+    }
+
+
+def train_answer(runs: Sequence[Mapping[str, Any]], min_runs: int, min_extra_wins: int) -> str:
+    """Experiment 4: progress if, for some training opponent, at least
+    min_runs runs' final checkpoints win at least min_extra_wins more games
+    than their starting checkpoints against the full opponent.
+
+    The four answers, checked in this order:
+
+    1. **Pending**: some run isn't done, or has no final-versus-start result
+       (see train_progress). No verdict is given on part of the evidence.
+    2. **Observed progress**: for one training opponent, at least min_runs
+       runs reached min_extra_wins extra wins. It is called "observed"
+       because the threshold is a screening rule on one set of maps, not a
+       statistical test. Training on a weakened opponent is then a route
+       forward.
+    3. **Partial**: no such progress, but the training win rate rose in at
+       least min_runs runs: the model improves against the weakened
+       opponent, yet that doesn't carry over to the full one.
+    4. **Not working**: neither.
+
+    Example, min_runs 2 and min_extra_wins 4: three runs against one
+    training opponent have 5, 4 and 0 extra wins. Two reach 4, so the
+    answer is observed progress.
+    """
+
+    pending = [run["job"] for run in runs if not run["done"] or run["progress"]["extra_wins"] is None]
+    if pending:
+        return f"Pending: no final-versus-start result yet for {', '.join(pending)}."
+    against = runs[0]["progress"]["against"]
     for opponent in dict.fromkeys(run["opponent"] for run in runs):
         group = [run for run in runs if run["opponent"] == opponent]
-        # next(iter(...)) takes the first diagnose_against opponent's rate.
-        beat = sum(
-            any(next(iter(c["diagnosis_win_rates"].values())) > 0 for c in run["checkpoints"]) for run in group
-        )
-        if beat >= min_runs:
-            return (f"First real progress: training against {opponent} won games against the full opponent "
-                    f"in {beat} of {len(group)} runs. The next step lowers epsilon towards 0.")
+        # True counts as 1 in a sum, so this counts the runs that progressed.
+        progressed = sum(run["progress"]["extra_wins"] >= min_extra_wins for run in group)
+        if progressed >= min_runs:
+            return (f"Observed progress: after training against {opponent}, the final checkpoint won at least "
+                    f"{min_extra_wins} more games against {against} than its starting checkpoint in {progressed} "
+                    f"of {len(group)} runs. The next step lowers epsilon towards 0.")
     for opponent in dict.fromkeys(run["opponent"] for run in runs):
         group = [run for run in runs if run["opponent"] == opponent]
         if sum(run["training_rose"] for run in group) >= min_runs:
-            return (f"Partial: training wins rose against {opponent}, but still 0% against the full opponent. "
-                    "Use experiment 1's answer to choose between widening the learner's moves and a smaller "
-                    "epsilon step.")
+            return (f"Partial: training wins rose against {opponent}, but fewer than {min_runs} runs gained "
+                    f"{min_extra_wins} wins against {against}. Use experiment 1's answer to choose between "
+                    "widening the learner's moves and a smaller epsilon step.")
     return "Not working: training wins didn't rise either. Experiment 1 says whether the learner's moves or the training method are to blame."
 
 
@@ -640,9 +689,18 @@ def markdown(analysis: Mapping[str, Any]) -> str:
                 lines += [f"- {run['job']}: not done", ""]
                 continue
             labels = list(run["checkpoints"][0]["diagnosis_win_rates"]) if run["checkpoints"] else []
+            progress = run["progress"]
+            if progress["extra_wins"] is None:
+                versus = (f"Against {progress['against']}: pending (no start or update-{progress['final_update']} "
+                          "diagnosis to compare).")
+            else:
+                start, final = progress["start"], progress["final"]
+                versus = (f"Against {progress['against']}: start {start['wins']}/{start['games']} wins, "
+                          f"update {progress['final_update']} {final['wins']}/{final['games']} "
+                          f"({progress['extra_wins']:+d}).")
             lines += [f"**{run['opponent']} from {run['start']}:** training win rate "
                       f"{percent(run['first_training_win_rate'])} at the start, "
-                      f"{percent(run['last_training_win_rate'])} at the end.", "",
+                      f"{percent(run['last_training_win_rate'])} at the end.", "", versus, "",
                       "| Checkpoint | Training win rate since the previous one | "
                       + " | ".join(f"Against {label}" for label in labels) + " |",
                       "|---|---|" + "---|" * len(labels)]

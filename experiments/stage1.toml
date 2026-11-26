@@ -70,8 +70,12 @@ band_min_runs = 2
 v2-whole-capture-rr = "heuristic-v2:candidates=4,enemy_bonus=1,garrison_cost=needed,margin=0.1,whole_garrison=1|random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2|random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2"
 
 # Experiment 4: can training against a weakened v2 move the 0%? Each run
-# starts from one of B's update-153 models; every saved checkpoint is then
-# diagnosed against full v2.
+# starts from one of B's update-153 models. The starting model is diagnosed
+# against full v2 first, then every saved checkpoint is. The answer is
+# "observed progress" when the final checkpoint wins at least
+# `progress_min_extra_wins` more games than its starting model, on the same
+# maps and seats, in at least `progress_min_runs` runs of one training
+# opponent.
 [[train]]
 name = "train-weakened"
 base_config = "configs/rl-v2-4p.toml"
@@ -83,6 +87,7 @@ init_from = [
 max_updates = 153
 checkpoint_every_updates = 30
 progress_min_runs = 2
+progress_min_extra_wins = 4
 
 [train.training_opponents]
 "v2-eps0.75" = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.75,margin=0.1"

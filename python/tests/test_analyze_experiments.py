@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.analyze_experiments import analyze, markdown
+from scripts.analyze_experiments import analyze, markdown, train_answer
 from scripts.run_experiments import Runner, parse_plan
 
 V2 = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
@@ -80,6 +80,7 @@ init_from = ["runs/b-s1/checkpoints/update-000153.pt"]
 max_updates = 2
 checkpoint_every_updates = 1
 progress_min_runs = 1
+progress_min_extra_wins = 1
 training_opponents = {{ weak = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.75,margin=0.1" }}
 diagnose_against = {{ v2 = "{V2}" }}
 """
@@ -88,18 +89,20 @@ diagnose_against = {{ v2 = "{V2}" }}
 def test_a_train_job_trains_diagnoses_every_checkpoint_and_is_analysed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A train job writes its config, trains, then diagnoses each checkpoint.
+    """A train job diagnoses its starting checkpoint, writes its config,
+    trains, then diagnoses each checkpoint.
 
     Training and diagnosis are replaced by fakes that write what the real
     commands write. Training wins 1 of 4 games in update 1 and 3 of 4 in
     update 2, so its win rate is 25% then 75% and it rose. The diagnoses win
-    0 of 8 at checkpoint 1 and 1 of 8 at checkpoint 2, above 0%, which is
-    experiment 4's "first real progress".
+    0 of 8 at the start, 0 of 8 at checkpoint 1 and 1 of 8 at checkpoint 2,
+    the final one: 1 extra win, which reaches this file's threshold of 1, so
+    experiment 4's answer is "observed progress".
     """
 
     plan = parse_plan(TRAIN_EXPERIMENT)
     (job,) = plan.jobs
-    diagnosis_wins = iter([0, 1])
+    diagnosis_wins = iter([0, 0, 1])
 
     def fake_command(self, arguments, log, *, cwd, gomaxprocs):
         if "orrery.train" in arguments:
@@ -119,6 +122,7 @@ def test_a_train_job_trains_diagnoses_every_checkpoint_and_is_analysed(
     monkeypatch.setattr(Runner, "command", fake_command)
     assert Runner(plan, tmp_path, Path("opponentcheck")).run_job(job) == "done"
     folder = tmp_path / job.experiment / job.label
+    assert (folder / "diagnoses" / "start__v2" / "report.json").exists()
     assert 'training_opponent = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.75,margin=0.1"' in (
         folder / "config.toml"
     ).read_text()
@@ -128,7 +132,27 @@ def test_a_train_job_trains_diagnoses_every_checkpoint_and_is_analysed(
     assert [c["training_win_rate"] for c in run["checkpoints"]] == [0.25, 0.75]
     assert [c["diagnosis_win_rates"]["v2"] for c in run["checkpoints"]] == [0.0, 0.125]
     assert run["training_rose"] is True
-    assert analyze(tmp_path)["train"]["train"]["answer"].startswith("First real progress")
+    assert run["progress"] == {"against": "v2", "final_update": 2, "start": {"wins": 0, "games": 8},
+                               "final": {"wins": 1, "games": 8}, "extra_wins": 1}
+    assert analyze(tmp_path)["train"]["train"]["answer"].startswith("Observed progress")
+
+
+def test_progress_needs_extra_wins_in_enough_runs_and_waits_for_every_result() -> None:
+    """Three runs against one training opponent gain 4, 4 and 0 wins over
+    their starting checkpoints: two reach 4, so with min_runs 2 the answer
+    is observed progress. If one of the two had no final diagnosis, the
+    answer would wait rather than judge on part of the evidence."""
+
+    def run(job: str, extra_wins: int | None) -> dict:
+        return {"job": job, "done": True, "opponent": "weak", "training_rose": False,
+                "progress": {"against": "v2", "extra_wins": extra_wins}}
+
+    runs = [run("train/weak__s1", 4), run("train/weak__s2", 4), run("train/weak__s3", 0)]
+    assert train_answer(runs, min_runs=2, min_extra_wins=4).startswith("Observed progress")
+    runs[1] = run("train/weak__s2", None)
+    assert train_answer(runs, min_runs=2, min_extra_wins=4) == (
+        "Pending: no final-versus-start result yet for train/weak__s2."
+    )
 
 
 def test_bot_results_compare_and_answer_as_worked_out_by_hand(tmp_path: Path) -> None:

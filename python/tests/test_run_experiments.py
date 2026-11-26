@@ -53,6 +53,7 @@ init_from = ["runs/b-s1/checkpoints/update-000153.pt", "runs/b-s2/checkpoints/up
 training_opponents = {{ weak = "{WEAK}" }}
 max_updates = 4
 checkpoint_every_updates = 2
+progress_min_extra_wins = 1
 diagnose_against = {{ v2 = "{V2}" }}
 
 [[compare]]
