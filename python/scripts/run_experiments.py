@@ -43,7 +43,9 @@ A run has four stages:
    file, the code version and every job's state.
 4. **Resume.** Running the same command again skips finished jobs. A folder
    without ``done.json`` (interrupted or failed) is renamed
-   ``<name>.partial-<n>``, never deleted, and the job runs again. A resume
+   ``<name>.partial-<n>``, never deleted, and the job runs again. A train
+   job whose training finished is the exception: its folder is kept, and
+   the retry redoes only the diagnoses that didn't finish. A resume
    refuses to run if the code or any input file changed since the first
    run, so after changing either, start a new session with a new ``--out``.
 
@@ -101,6 +103,11 @@ PYTHON_ROOT = REPOSITORY_ROOT / "python"
 # Examples: "normal", "eps-0.5" and "v2-eps0.5" are fine; "my tester" (a
 # space) and "a/b" (a slash) are refused.
 LABEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# The file a train job writes in its folder once training has finished
+# successfully. A retry of that job keeps the trained run and redoes only
+# what didn't finish (see keep_finished_training).
+TRAINING_DONE = "training-done.json"
 
 # The order kinds of job run in. Jobs run one at a time, never at once: each
 # job already keeps the machine busy on its own (a bot job plays many games
@@ -999,9 +1006,10 @@ class Runner:
     def run_job(self, job: Job) -> str:
         """Run one job in its folder and return "done" or "failed".
 
-        The stages are: set aside any unfinished folder; create a fresh one
-        and record what it runs; run the job's commands; write done.json last,
-        or failed.json. A job that raises an error is recorded as failed and
+        The stages are: set aside any unfinished folder (or, for a train job
+        whose training finished, keep it); create the folder and record what
+        it runs; run the job's commands; write done.json last, or
+        failed.json. A job that raises an error is recorded as failed and
         never stops the other jobs. Ctrl-C is the exception: it stops the
         whole session, leaving this job without a result.
         """
@@ -1010,16 +1018,25 @@ class Runner:
         # Stage 1: a finished job is never run again. Any other folder is
         # left from an interrupted or failed try: rename it out of the way
         # (kept, never deleted), so the new try starts from an empty folder
-        # and its files can't mix with the old ones.
+        # and its files can't mix with the old ones. The exception is a train
+        # job whose training finished: training is the expensive part, so
+        # its folder is kept and the retry redoes only the steps that didn't
+        # finish (see keep_finished_training). Reusing it is safe because a
+        # resume runs the same code on the same inputs (the session
+        # fingerprint), and training-done.json is written only after
+        # training succeeded.
         if (folder / "done.json").exists():
             return "done"
         if folder.exists():
-            set_aside_unfinished_folder(folder)
-        # Stage 2: a fresh folder, and job.json first, so even a job that
-        # dies at once says what it was trying to run. monotonic() is a clock
+            if job.kind == "train" and (folder / TRAINING_DONE).exists():
+                keep_finished_training(folder)
+            else:
+                set_aside_unfinished_folder(folder)
+        # Stage 2: the folder, and job.json first, so even a job that dies
+        # at once says what it was trying to run. monotonic() is a clock
         # that only moves forward, so the duration is right even if the
         # computer's clock is changed during the job.
-        folder.mkdir(parents=True)
+        folder.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
         record = {"job": job.id, "kind": job.kind, "settings": dict(job.settings), "started": utc_timestamp()}
         write_json_atomically(folder / "job.json", record)
@@ -1069,32 +1086,50 @@ class Runner:
             return self._run_diagnosis(run_dir, full_checkpoint_path(job.settings["run_dir"], job.settings["update"]),
                                   job.settings["opponent"], folder / "diagnosis", maps, log)
 
-        # A train job, part 1: diagnose the starting checkpoint against every
+        # A train job runs in steps, and each step records its own success:
+        # every diagnosis writes done.json in its folder, and training writes
+        # training-done.json in the job folder. A retry of a job whose
+        # training finished keeps that work (see run_job) and skips every
+        # step already marked done, so a diagnosis failing after hours of
+        # training costs a rerun of that diagnosis, not of the training.
+
+        # Part 1: diagnose the starting checkpoint against every
         # diagnose_against opponent. The analysis compares the final
         # checkpoint with this, so both play the same maps, seats and
         # opponent with the same code. It runs before training, so the
         # baseline exists even if training then fails.
         start = resolve_repository_path(starting_run_dir(job.settings["init_from"]))
         for label, spec in job.settings["diagnose_against"].items():
+            out = folder / "diagnoses" / f"start__{label}"
+            if (out / "done.json").exists():
+                continue  # finished on an earlier try
             failed = self._run_diagnosis(start, resolve_repository_path(job.settings["init_from"]), spec,
-                                    folder / "diagnoses" / f"start__{label}", maps, log)
+                                         out, maps, log)
             if failed:
                 return failed
 
-        # Part 2: write the job's own full config, train, then diagnose every
-        # checkpoint the run saved against every diagnose_against opponent.
-        config = folder / "config.toml"
-        config.write_text(format_toml(build_training_config(job, session)))
+        # Part 2: write the job's own full config and train, unless an
+        # earlier try already finished training.
         run_dir = folder / "run"
-        # sys.executable is the Python running this script, so training uses
-        # the same Python and installed packages.
-        code = self.run_command([
-            sys.executable, "-m", "orrery.train", "--config", str(config), "--run-dir", str(run_dir),
-            "--init-from", str(resolve_repository_path(job.settings["init_from"])),
-            "--max-updates", str(job.settings["max_updates"]),
-        ], log, cwd=PYTHON_ROOT, gomaxprocs=session.gomaxprocs)
-        if code != 0:
-            return f"training exited with {code}"
+        training_done = folder / TRAINING_DONE
+        if not training_done.exists():
+            config = folder / "config.toml"
+            config.write_text(format_toml(build_training_config(job, session)))
+            # sys.executable is the Python running this script, so training
+            # uses the same Python and installed packages.
+            code = self.run_command([
+                sys.executable, "-m", "orrery.train", "--config", str(config), "--run-dir", str(run_dir),
+                "--init-from", str(resolve_repository_path(job.settings["init_from"])),
+                "--max-updates", str(job.settings["max_updates"]),
+            ], log, cwd=PYTHON_ROOT, gomaxprocs=session.gomaxprocs)
+            if code != 0:
+                return f"training exited with {code}"
+            # Written only after training exited successfully, so its
+            # presence promises a complete training run in run/.
+            write_json_atomically(training_done, {"finished": utc_timestamp()})
+
+        # Part 3: diagnose every checkpoint the run saved against every
+        # diagnose_against opponent, skipping those an earlier try finished.
         # The checkpoint files actually saved, not the ones expected: names
         # are zero-padded (update-000030.pt), so sorting them as text puts
         # them in update order.
@@ -1103,8 +1138,10 @@ class Runner:
             return "training saved no checkpoint"
         for checkpoint in checkpoints:
             for label, spec in job.settings["diagnose_against"].items():
-                failed = self._run_diagnosis(run_dir, checkpoint, spec,
-                                        folder / "diagnoses" / f"{checkpoint.stem}__{label}", maps, log)
+                out = folder / "diagnoses" / f"{checkpoint.stem}__{label}"
+                if (out / "done.json").exists():
+                    continue  # finished on an earlier try
+                failed = self._run_diagnosis(run_dir, checkpoint, spec, out, maps, log)
                 if failed:
                     return failed
         return None
@@ -1114,7 +1151,9 @@ class Runner:
         """Run diagnose.py on one checkpoint; return why it failed, or None.
 
         --no-charts skips the pictures: the analysis reads only report.json,
-        and the charts would need the optional plotting packages.
+        and the charts would need the optional plotting packages. On success
+        it writes done.json in ``out``, last, so a retry of a train job can
+        tell a finished diagnosis from a half-written one.
         """
 
         code = self.run_command([
@@ -1122,7 +1161,10 @@ class Runner:
             "--opponent", opponent, *maps, "--device", self.plan.session.device, "--no-charts",
             "--out", str(out),
         ], log, cwd=PYTHON_ROOT, gomaxprocs=self.plan.session.gomaxprocs)
-        return None if code == 0 else f"diagnose of {checkpoint.name} against {opponent} exited with {code}"
+        if code != 0:
+            return f"diagnose of {checkpoint.name} against {opponent} exited with {code}"
+        write_json_atomically(out / "done.json", {"finished": utc_timestamp()})
+        return None
 
 
 def set_aside_unfinished_folder(folder: Path) -> Path:
@@ -1140,6 +1182,40 @@ def set_aside_unfinished_folder(folder: Path) -> Path:
         n += 1
     folder.rename(target)
     return target
+
+
+def keep_finished_training(folder: Path) -> None:
+    """Get a train job's folder ready for a retry that reuses its finished
+    training.
+
+    The folder stays where it is, with its run/ (the trained model and
+    checkpoints) and every diagnosis that finished (one with done.json).
+    Only what an unfinished try left is moved out of the way, never deleted:
+    - failed.json becomes failed.previous-<n>.json, so the job no longer
+      reads as failed while it retries, and the earlier error stays
+      readable;
+    - a diagnosis folder without done.json (it failed or was interrupted)
+      is renamed <name>.partial-<n>, so its retry starts from an empty
+      folder. Folders already set aside by an earlier retry are left alone.
+
+    Example: diagnoses/update-000153__v2 failed after training finished.
+    The retry keeps run/ and the five finished diagnoses, renames that
+    folder update-000153__v2.partial-1, and runs only that diagnosis again.
+    """
+
+    failed = folder / "failed.json"
+    if failed.exists():
+        n = 1
+        while (target := folder / f"failed.previous-{n}.json").exists():
+            n += 1
+        failed.rename(target)
+    diagnoses = folder / "diagnoses"
+    if diagnoses.is_dir():
+        # sorted() lists the folders before any is renamed, so renaming
+        # can't disturb the loop.
+        for diagnosis in sorted(diagnoses.iterdir()):
+            if diagnosis.is_dir() and ".partial-" not in diagnosis.name and not (diagnosis / "done.json").exists():
+                set_aside_unfinished_folder(diagnosis)
 
 
 # ---------------------------------------------------------------------------
