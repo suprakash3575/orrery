@@ -244,9 +244,9 @@ make exp-analyze EXP_OUT=runs/stage1-<date>                  # analysis.md and a
 ```
 
 Preflight refuses a missing checkpoint or an agent spec not written in
-canonical form, before anything runs. A run keeps the GPU and spare CPUs
-busy at once: model jobs run one after another on one lane, bot jobs on
-another. Each job writes `done.json` last. Running the same `exp-run` again
+canonical form, before anything runs. Jobs then run one at a time, bot
+jobs first (they take minutes, so their answers arrive early), then
+diagnose and train jobs. Each job writes `done.json` last. Running the same `exp-run` again
 skips finished jobs and renames any unfinished folder to
 `<name>.partial-<n>` before rerunning it; nothing is deleted. A failed job is
 recorded and the others carry on. `EXP_ONLY=<name>` runs one experiment, and
