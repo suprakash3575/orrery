@@ -107,9 +107,19 @@ type HeuristicV2Agent struct {
 // AimStats counts what one heuristic-v2 agent did over a match, for reports.
 // The counts only grow, and reading them never changes the bot's moves.
 //
-// Example, for a bot with LearnerAim over a whole game: AimAheadAttempts 300,
-// AimAheadFailed 60 and AimedStraight 40 would mean 1 in 5 attempts to aim
-// ahead found no way, and 40 launches went straight at their target instead.
+// They come in two kinds:
+//
+//   - Attempts: AimAheadAttempts and AimAheadFailed count every time the bot
+//     tries to aim ahead, including at targets it then doesn't launch at.
+//     They measure how often aiming ahead fails.
+//   - Launches: every launch the bot actually makes falls into exactly one of
+//     AimedAhead, AimedStraight and RandomLaunches, so
+//     Launches = AimedAhead + AimedStraight + RandomLaunches.
+//
+// Example, for a bot with LearnerAim over a whole game: AimAheadAttempts 300
+// and AimAheadFailed 60 mean 1 in 5 attempts to aim ahead found no way.
+// Launches 100, AimedAhead 60 and AimedStraight 40 mean 40 of its 100
+// launches went straight at their target, because aiming ahead had failed.
 type AimStats struct {
 	// AimAheadAttempts is how many times the bot tried to aim ahead, counting
 	// targets it considered but didn't launch at.
@@ -117,13 +127,22 @@ type AimStats struct {
 	// AimAheadFailed is how many of those attempts found no way to the
 	// target, for example because the path crossed the sun.
 	AimAheadFailed int
-	// AimedStraight is how many launches were aimed straight because aiming
-	// ahead failed. Only LearnerAim does this; normal v2 skips such targets.
-	AimedStraight int
-	// Launches is every launch the bot made, planned or random.
+
+	// Launches is every launch the bot made: planned or random.
 	Launches int
+	// AimedAhead is how many planned launches were aimed ahead.
+	AimedAhead int
+	// AimedStraight is how many planned launches were aimed straight because
+	// aiming ahead failed. Only LearnerAim does this; normal v2 skips such
+	// targets.
+	AimedStraight int
+	// RandomLaunches is how many launches were random moves (Epsilon), which
+	// fly in a random direction rather than at a target.
+	RandomLaunches int
+
 	// RandomMoves is how many times a planet made a random move because of
-	// Epsilon, whether it launched or held.
+	// Epsilon, whether it launched or held. RandomMoves − RandomLaunches is
+	// how many of those random moves held.
 	RandomMoves int
 }
 
@@ -269,6 +288,7 @@ func (a *HeuristicV2Agent) Decide(ctx context.Context, request TurnRequest) (Dec
 			if action, ok := randomMove(a.rng, a.randomMove, request.PlayerID, source); ok {
 				actions = append(actions, action)
 				a.stats.Launches++
+				a.stats.RandomLaunches++
 				a.lastChoices = append(a.lastChoices, LaunchChoice{Source: source.id, Target: NoTarget})
 			}
 			continue
@@ -303,10 +323,12 @@ func (a *HeuristicV2Agent) Decide(ctx context.Context, request TurnRequest) (Dec
 			Ships:    best.ships,
 			Angle:    best.aim.Angle,
 		})
-		// Report it: one more launch, and whether it was aimed straight.
+		// Report it: one more launch, counted by how it was aimed.
 		a.stats.Launches++
 		if best.straight {
 			a.stats.AimedStraight++
+		} else {
+			a.stats.AimedAhead++
 		}
 		a.lastChoices = append(a.lastChoices, LaunchChoice{Source: source.id, Target: best.target.id})
 	}
