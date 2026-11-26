@@ -33,8 +33,9 @@ A run has four stages:
 1. **Preflight.** Expand every job, check that every path exists and every
    agent spec is canonical, build the Go tools, and print what will run. Any
    mistake stops here, in seconds, before anything runs.
-2. **Run.** Two lanes at once: the GPU lane runs diagnose and train jobs one
-   at a time, and the CPU lane runs bot jobs one at a time.
+2. **Run.** One job at a time: every bot job first (they are quick, so
+   experiments 1 and 2 have answers early), then the diagnose and train jobs,
+   each group in the order the file lists them.
 3. **Record.** A job writes ``done.json`` last, so a folder with it is a
    finished job that can be trusted. ``session.json`` holds the experiment
    file, the code version and every job's state.
@@ -76,7 +77,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import tomllib
 from typing import Any
@@ -96,12 +96,13 @@ PYTHON_ROOT = REPOSITORY_ROOT / "python"
 # space) and "a/b" (a slash) are refused.
 LABEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-# The two lanes. A lane is a queue of jobs run one after another; the two
-# lanes run at the same time. Bot games need only CPUs, so they go in the CPU
-# lane; diagnose and train use the model, on the GPU when there is one, so
-# they go in the GPU lane. One GPU job at a time keeps them from competing
-# for the GPU's memory.
-CPU_LANE, GPU_LANE = "cpu", "gpu"
+# The order kinds of job run in. Jobs run one at a time, never at once: each
+# job already keeps the machine busy on its own (a bot job plays many games
+# at once; training steps hundreds of games and uses the GPU), so running two
+# together would mostly make them share the same CPUs and GPU. Bot jobs go
+# first because they are the quickest: their answers arrive minutes into a
+# session instead of after hours of training.
+KIND_ORDER = ("botcheck", "diagnose", "train")
 
 
 class PlanError(ValueError):
@@ -121,8 +122,8 @@ class PlanError(ValueError):
 # ---------------------------------------------------------------------------
 
 
-# frozen=True makes these objects read-only once built, so a job can't be
-# changed by accident while two lanes are using the plan at the same time.
+# frozen=True makes these objects read-only once built, so a job's settings
+# can't be changed by accident after the file was checked.
 @dataclass(frozen=True)
 class Session:
     """The ``[session]`` table: settings every job shares."""
@@ -142,9 +143,10 @@ class Session:
     # use to play them.
     cpu_workers: int
     # Go threads for the game environment of a train or diagnose job. Go
-    # reads its thread limit from the GOMAXPROCS environment variable. Each
-    # job gets its own value, so model jobs leave CPUs free for the bot lane,
-    # and bot jobs aren't held to the model jobs' limit.
+    # reads its thread limit from the GOMAXPROCS environment variable. More
+    # threads isn't always faster for the environment (the Makefile's train
+    # target notes the measurements), so model jobs get this setting, while
+    # bot jobs get cpu_workers instead.
     gomaxprocs: int
 
 
@@ -177,12 +179,17 @@ class Job:
 
         return f"{self.experiment}/{self.label}"
 
-    @property
-    def lane(self) -> str:
-        """Which lane runs the job: bot jobs need no model, so they use the
-        CPU lane; every other job uses the GPU lane."""
 
-        return CPU_LANE if self.kind == "botcheck" else GPU_LANE
+def run_order(jobs: Sequence[Job]) -> list[Job]:
+    """The jobs in the order they run: by kind (KIND_ORDER), and within a
+    kind in file order.
+
+    Example: a file listing a train section, then a bot section, runs the bot
+    jobs first. sorted() keeps equal items in their original order, so jobs
+    of one kind stay in the order the file lists them.
+    """
+
+    return sorted(jobs, key=lambda job: KIND_ORDER.index(job.kind))
 
 
 @dataclass(frozen=True)
@@ -715,11 +722,10 @@ def describe(plan: Plan, jobs: Sequence[Job]) -> list[str]:
         if kind == "train":
             updates = sum(job.settings["max_updates"] for job in group)
             diagnoses = sum(checkpoint_count(job) * len(job.settings["diagnose_against"]) for job in group)
-            lines.append(f"  {experiment} (train, GPU lane): {len(group)} runs, {updates} updates, "
+            lines.append(f"  {experiment} (train): {len(group)} runs, {updates} updates, "
                          f"{diagnoses} checkpoint diagnoses, {diagnoses * games_per_job} games")
         else:
-            lane = "CPU lane" if kind == "botcheck" else "GPU lane"
-            lines.append(f"  {experiment} ({kind}, {lane}): {len(group)} jobs, {len(group) * games_per_job} games")
+            lines.append(f"  {experiment} ({kind}): {len(group)} jobs, {len(group) * games_per_job} games")
     return lines
 
 
@@ -741,7 +747,7 @@ def preflight(plan: Plan, jobs: Sequence[Job], bin_dir: Path) -> tuple[list[str]
 
 
 # ---------------------------------------------------------------------------
-# Stages 2 and 3: run each job in its lane and record it.
+# Stages 2 and 3: run each job and record it.
 #
 # Each job runs other programs (opponentcheck, training, diagnose) as
 # separate processes, waits for them, and records the outcome in its folder.
@@ -763,7 +769,7 @@ def write_json(path: Path, value: Any) -> None:
     A rename within one folder happens all at once: anyone reading the file
     sees either the old version or the new one, never a half-written mix.
     That matters for done.json, which promises "this job finished", and for
-    session.json, which both lanes update while the other may be reading.
+    session.json, which `status` may read while a session is updating it.
     sort_keys gives the same key order every time, so two files are easy to
     compare.
     """
@@ -806,13 +812,12 @@ def toml_text(values: Mapping[str, Any]) -> str:
 
 
 class Runner:
-    """Runs jobs and keeps track of the processes they start, so an
-    interrupted session can stop them all.
+    """Runs jobs, one at a time, each as separate processes.
 
-    Both lanes share one Runner, each from its own thread (a thread is a
-    second line of work inside the same program, running at the same time).
-    The lock lets only one thread at a time change the shared set of
-    processes and the stopping flag, so they can't trip over each other.
+    A process is a separate running program. Each job's commands
+    (opponentcheck, training, diagnose) run as processes the runner starts
+    and waits for, so a crash in one ends only that job, and each starts
+    with a clean slate (for example, its GPU memory is freed when it ends).
     """
 
     def __init__(self, plan: Plan, out: Path, tool: Path) -> None:
@@ -821,39 +826,19 @@ class Runner:
         self.out = out
         # The opponentcheck binary built by preflight.
         self.tool = tool
-        self._lock = threading.Lock()
-        # Every process started and not yet finished, so stop() can end them.
-        self._processes: set[subprocess.Popen[bytes]] = set()
-        # Set by stop() after Ctrl-C; from then on no new command starts.
-        self._stopping = False
-
-    def stop(self) -> None:
-        """Stop every running command; no new one starts afterwards.
-
-        terminate() asks each process to end (the SIGTERM signal). The
-        process ends, its command() call returns, and its job is left
-        unfinished for the next run.
-        """
-
-        with self._lock:
-            self._stopping = True
-            for process in self._processes:
-                process.terminate()
-
-    @property
-    def stopping(self) -> bool:
-        """Whether stop() has been called."""
-
-        with self._lock:
-            return self._stopping
 
     def command(self, arguments: Sequence[str], log: Path, *, cwd: Path, gomaxprocs: int) -> int:
         """Run one command, appending its output to the job's log.
 
         Returns the command's exit code: 0 means it succeeded, anything else
-        that it failed. -1 means it never started because the session is
-        stopping. A negative code from a started process means it was ended
-        by a signal (for example -15 after stop()).
+        that it failed.
+
+        Ctrl-C: Python turns it into a KeyboardInterrupt in this program
+        while it waits. The command is then stopped too (a terminal's Ctrl-C
+        usually reaches it as well, but a signal sent to the runner alone
+        wouldn't), and the KeyboardInterrupt carries on up to run_session,
+        which records the session and stops. The job is left without a
+        result, so the next run reruns it.
         """
 
         # The child gets a copy of this program's environment variables, with
@@ -864,27 +849,24 @@ class Runner:
         with log.open("ab") as handle:
             handle.write(f"$ {' '.join(arguments)}\n".encode())
             handle.flush()
-            # Start the process and register it in one locked step, so stop()
-            # can't run in between and miss it.
-            with self._lock:
-                if self._stopping:
-                    return -1
-                process = subprocess.Popen(arguments, cwd=cwd, env=env, stdout=handle, stderr=subprocess.STDOUT)
-                self._processes.add(process)
+            process = subprocess.Popen(arguments, cwd=cwd, env=env, stdout=handle, stderr=subprocess.STDOUT)
             try:
                 return process.wait()
-            finally:
-                with self._lock:
-                    self._processes.discard(process)
+            except KeyboardInterrupt:
+                # terminate() asks the command to end (the SIGTERM signal);
+                # wait() then makes sure it has, so nothing is left running.
+                process.terminate()
+                process.wait()
+                raise
 
     def run_job(self, job: Job) -> str:
-        """Run one job in its folder and return "done", "failed" or
-        "unfinished".
+        """Run one job in its folder and return "done" or "failed".
 
         The stages are: set aside any unfinished folder; create a fresh one
         and record what it runs; run the job's commands; write done.json last,
-        or failed.json. A job that raises is recorded as failed and never
-        stops the other jobs.
+        or failed.json. A job that raises an error is recorded as failed and
+        never stops the other jobs. Ctrl-C is the exception: it stops the
+        whole session, leaving this job without a result.
         """
 
         folder = self.out / job.experiment / job.label
@@ -906,7 +888,9 @@ class Runner:
         write_json(folder / "job.json", record)
         log = folder / "log.txt"
         # Stage 3: run the commands. Any error is caught and recorded, so one
-        # broken job can't crash the lane and stop the jobs after it.
+        # broken job can't stop the jobs after it. KeyboardInterrupt (Ctrl-C)
+        # is not an Exception in Python, so it isn't caught here: it passes
+        # straight up to run_session, before anything below is written.
         try:
             failed = self._run(job, folder, log)
         except Exception as error:  # recorded, so one broken job can't stop the session
@@ -914,11 +898,6 @@ class Runner:
         record.update(finished=now(), seconds=round(time.monotonic() - started, 1))
         # Stage 4: record the outcome. done.json is written last of all, so
         # its presence promises everything before it finished.
-        if failed and self.stopping:
-            # Stopped by Ctrl-C, not failed: leave the folder without a result,
-            # so status shows it unfinished and the next run sets it aside and
-            # runs the job again.
-            return "unfinished"
         if failed:
             write_json(folder / "failed.json", {**record, "error": failed, "log": "log.txt"})
             return "failed"
@@ -1015,7 +994,7 @@ def set_aside(folder: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Stage 4 and the session record: session.json, status and the two lanes.
+# Stage 4 and the session record: session.json, status and the job loop.
 # ---------------------------------------------------------------------------
 
 
@@ -1060,7 +1039,7 @@ def versions() -> dict[str, Any]:
 
 
 def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
-    """Preflight, then run every job not yet done, two lanes at once.
+    """Preflight, then run every job not yet done, one at a time.
 
     Returns 0 when every selected job is done, 1 when any failed or the run
     was interrupted, and 2 when preflight found problems or the session
@@ -1068,14 +1047,14 @@ def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
 
     The stages are: read the plan and choose the jobs; check the session
     folder belongs to this file; preflight; record the run in session.json;
-    start the two lanes and wait for both; record every job's final state.
+    run the jobs in order; record every job's final state.
     """
 
     # Stage 1: the plan, and the jobs this run covers (--only picks one
     # experiment by name).
     text = experiment.read_text()
     plan = parse_plan(text)
-    jobs = [job for job in plan.jobs if only is None or job.experiment == only]
+    jobs = run_order([job for job in plan.jobs if only is None or job.experiment == only])
     if not jobs:
         print(f"no experiment named {only!r}; experiments: {sorted({j.experiment for j in plan.jobs})}")
         return 2
@@ -1107,70 +1086,36 @@ def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
     record.setdefault("experiment_file", str(experiment))
     record.setdefault("experiment_text", text)
     record.setdefault("runs", []).append({"started": now(), "only": only, **versions()})
-    # Both lanes update the one record; the lock makes each save whole.
-    lock = threading.Lock()
 
     def save(job: Job | None = None, state: str | None = None) -> None:
         """Set one job's state (if given) and write session.json."""
 
-        with lock:
-            if job is not None:
-                record.setdefault("jobs", {})[job.id] = state
-            write_json(session_file, record)
+        if job is not None:
+            record.setdefault("jobs", {})[job.id] = state
+        write_json(session_file, record)
 
     for job in jobs:
         record.setdefault("jobs", {})[job.id] = job_state(out, job)
     save()
 
-    # Stage 5: the two lanes.
+    # Stage 5: run the jobs, one at a time, skipping any already done (from
+    # an earlier run of this session). session.json is saved before and after
+    # each job, so `status` can follow along.
     runner = Runner(plan, out, tool)
-    # Each lane sets its event when it has finished, including after Ctrl-C.
-    # The main thread waits on these events rather than Thread.join: in
-    # CPython a join interrupted by Ctrl-C can make a later join return
-    # before the thread has really ended, and the session would then be
-    # recorded while a lane is still writing its last job. (An Event is a
-    # flag one thread sets and another waits for.)
-    finished = {name: threading.Event() for name in (GPU_LANE, CPU_LANE)}
-
-    def lane(name: str) -> None:
-        """Run this lane's jobs one after another, skipping finished ones."""
-
-        try:
-            for job in (job for job in jobs if job.lane == name):
-                # After Ctrl-C, start nothing new: the remaining jobs stay
-                # waiting for the next run.
-                if runner.stopping:
-                    return
-                if job_state(out, job) == "done":
-                    continue
-                print(f"[{name}] start {job.id}", flush=True)
-                save(job, "running")
-                state = runner.run_job(job)
-                save(job, state)
-                print(f"[{name}] {state} {job.id}", flush=True)
-        finally:
-            # finally runs however the loop ends (finished, returned early, or
-            # an error), so the main thread is never left waiting forever.
-            finished[name].set()
-
-    # daemon=True: if the main thread ends, these threads don't keep the
-    # program alive on their own.
-    for name in finished:
-        threading.Thread(target=lane, args=(name,), daemon=True).start()
     try:
-        # Wait in one-second steps rather than all at once, so Ctrl-C (which
-        # Python delivers to the main thread as KeyboardInterrupt) is noticed
-        # within a second.
-        for event in finished.values():
-            while not event.wait(timeout=1):
-                pass
+        for number, job in enumerate(jobs, start=1):
+            if job_state(out, job) == "done":
+                continue
+            print(f"[{number}/{len(jobs)}] start {job.id}", flush=True)
+            save(job, "running")
+            state = runner.run_job(job)
+            save(job, state)
+            print(f"[{number}/{len(jobs)}] {state} {job.id}", flush=True)
     except KeyboardInterrupt:
-        # Ctrl-C: stop the running commands, wait for both lanes to finish
-        # their current job (each now ends quickly), then record the states.
-        print("interrupted: stopping running jobs; run the same command again to resume", flush=True)
-        runner.stop()
-        for event in finished.values():
-            event.wait()
+        # Ctrl-C: the running command has already been stopped (see
+        # Runner.command) and its job left without a result. Record every
+        # job's state and stop; the same command resumes later.
+        print("interrupted: run the same command again to resume", flush=True)
         for job in jobs:
             record["jobs"][job.id] = job_state(out, job)
         record["runs"][-1]["finished"] = now()

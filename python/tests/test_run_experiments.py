@@ -14,6 +14,7 @@ from scripts.run_experiments import (
     canonical_problems,
     file_problems,
     parse_plan,
+    run_order,
     specs_of,
 )
 
@@ -78,7 +79,12 @@ def test_a_small_file_expands_into_one_job_per_combination() -> None:
         "train/weak__b-s1",
         "train/weak__b-s2",
     ]
-    assert [job.lane for job in plan.jobs] == ["cpu"] * 2 + ["gpu"] * 6
+    # Jobs run bot jobs first, then diagnose, then train, whatever order they
+    # come in; within a kind they keep the order given. Reversing the list
+    # shows both: the kinds are regrouped, and the two bot jobs stay reversed.
+    ordered = run_order(list(reversed(plan.jobs)))
+    assert [job.kind for job in ordered] == ["botcheck"] * 2 + ["diagnose"] * 4 + ["train"] * 2
+    assert [job.id for job in ordered][:2] == ["bots/weak", "bots/normal"]
     assert plan.jobs[1].settings == {"tester": WEAK, "opponent": V2, "check_decode": True}
     assert specs_of(plan.jobs) == [V2, WEAK]
     with pytest.raises(PlanError, match="not a bot job"):
