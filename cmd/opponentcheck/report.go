@@ -286,6 +286,11 @@ func markdownSummary(meta runMeta, summaries []testerSummary, c calibration, dec
 	for _, v := range c.Violations {
 		fmt.Fprintf(&b, "- %s\n", v)
 	}
-	fmt.Fprintf(&b, "\nDiagnostic launch probability p = %g. Random tester: `%s`.\n", meta.LaunchProbability, meta.Random)
+	// These settings only shape the fixed diagnostic and random testers, so a
+	// -tester-spec run, which plays neither, leaves them out here.
+	// summary.json still records both.
+	if meta.TesterSpec == "" {
+		fmt.Fprintf(&b, "\nDiagnostic launch probability p = %g. Random tester: `%s`.\n", meta.LaunchProbability, meta.Random)
+	}
 	return b.String()
 }
