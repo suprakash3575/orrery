@@ -1,0 +1,69 @@
+# The full smoke test, every job type including training, on 2 maps and 2
+# training updates. Run it first on the Vast.ai machine, where training is
+# fast, to check the session works there and to time it for the run sheet:
+#
+#   make exp-smoke-gpu
+#
+# Training can't run here on a laptop CPU: the rl-v2 contract makes every
+# update full size (512 games x 64 turns). stage1-smoke.toml is the same
+# check without training, for a laptop.
+#
+# Its numbers mean nothing; only that every job finishes and the analysis
+# reads them.
+
+[session]
+name = "stage1-smoke-gpu"
+maps = { start = 1000000, count = 2 }
+device = "cuda"
+cpu_workers = 8
+gomaxprocs = 12
+
+[[botcheck]]
+name = "restricted-bot"
+opponent = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+check_decode = ["all-three-capture"]
+
+[botcheck.testers]
+normal = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+all-three-capture = "heuristic-v2:candidates=4,enemy_bonus=1,garrison_cost=needed,learner_aim=1,margin=0.1,no_aim_check=1,whole_garrison=1"
+
+[[botcheck]]
+name = "epsilon-scale"
+opponent = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+
+[botcheck.testers]
+"eps-0.5" = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.5,margin=0.1"
+
+[[diagnose]]
+name = "probe"
+run_dirs = ["runs/vast-experiment/exp-b-4p-s1501"]
+updates = [153]
+band = [0.10, 0.40]
+band_min_runs = 1
+
+[diagnose.opponents]
+"v2-eps0.5" = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.5,margin=0.1"
+
+[[train]]
+name = "train-weakened"
+base_config = "configs/rl-v2-4p.toml"
+init_from = ["runs/vast-experiment/exp-b-4p-s1501/checkpoints/update-000153.pt"]
+max_updates = 2
+checkpoint_every_updates = 1
+progress_min_runs = 1
+
+[train.training_opponents]
+"v2-eps0.75" = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.75,margin=0.1"
+
+[train.diagnose_against]
+v2 = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+
+[[compare]]
+question = "How much strength does the fully limited bot keep?"
+baseline = "restricted-bot/normal"
+candidate = "restricted-bot/all-three-capture"
+rule = "restricted-bot"
+
+[[dial]]
+name = "epsilon"
+order = ["restricted-bot/normal", "epsilon-scale/eps-0.5"]
