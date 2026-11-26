@@ -1,0 +1,131 @@
+"""The experiment runner must expand, check and resume a session exactly."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from scripts import run_experiments
+from scripts.run_experiments import (
+    PlanError,
+    Runner,
+    canonical_problems,
+    file_problems,
+    parse_plan,
+    specs_of,
+)
+
+V2 = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+WEAK = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.5,margin=0.1"
+
+# One section of each kind: 2 testers, 2 opponents x 1 run x 2 updates, and
+# 1 training opponent x 2 starting checkpoints.
+SMALL = f"""
+[session]
+name = "small"
+maps = {{ start = 1000000, count = 2 }}
+device = "cpu"
+cpu_workers = 2
+
+[[botcheck]]
+name = "bots"
+opponent = "{V2}"
+check_decode = ["weak"]
+[botcheck.testers]
+normal = "{V2}"
+weak = "{WEAK}"
+
+[[diagnose]]
+name = "probe"
+run_dirs = ["runs/b-s1"]
+updates = [30, 60]
+[diagnose.opponents]
+v2 = "{V2}"
+"v2-eps0.5" = "{WEAK}"
+
+[[train]]
+name = "train"
+base_config = "configs/rl-v2-4p.toml"
+init_from = ["runs/b-s1/checkpoints/update-000153.pt", "runs/b-s2/checkpoints/update-000153.pt"]
+training_opponents = {{ weak = "{WEAK}" }}
+max_updates = 4
+checkpoint_every_updates = 2
+diagnose_against = {{ v2 = "{V2}" }}
+
+[[compare]]
+question = "weak minus normal"
+baseline = "bots/normal"
+candidate = "bots/weak"
+rule = "restricted-bot"
+"""
+
+
+def test_a_small_file_expands_into_one_job_per_combination() -> None:
+    """Each list or table of choices gives one job per combination, each with
+    its own folder named after what it varies."""
+
+    plan = parse_plan(SMALL)
+
+    assert [job.id for job in plan.jobs] == [
+        "bots/normal",
+        "bots/weak",
+        "probe/v2__b-s1__u000030",
+        "probe/v2__b-s1__u000060",
+        "probe/v2-eps0.5__b-s1__u000030",
+        "probe/v2-eps0.5__b-s1__u000060",
+        "train/weak__b-s1",
+        "train/weak__b-s2",
+    ]
+    assert [job.lane for job in plan.jobs] == ["cpu"] * 2 + ["gpu"] * 6
+    assert plan.jobs[1].settings == {"tester": WEAK, "opponent": V2, "check_decode": True}
+    assert specs_of(plan.jobs) == [V2, WEAK]
+    with pytest.raises(PlanError, match="not a bot job"):
+        parse_plan(SMALL.replace('candidate = "bots/weak"', 'candidate = "bots/missing"'))
+
+
+def test_preflight_refuses_a_missing_checkpoint_and_a_non_canonical_spec() -> None:
+    """Both mistakes are found before anything runs. A fake opponentcheck
+    answers -canonical as Go would: parameters in alphabetical order."""
+
+    plan = parse_plan(SMALL)
+    missing = file_problems(plan, [job for job in plan.jobs if job.kind == "diagnose"])
+    assert len(missing) == 4
+    assert "checkpoints/update-000030.pt does not exist" in missing[0]
+
+    def fake_opponentcheck(arguments, **_kwargs):
+        forms = [V2 if spec.startswith("heuristic-v2:margin") else spec for spec in arguments[2:]]
+        return SimpleNamespace(returncode=0, stdout="\n".join(forms) + "\n", stderr="")
+
+    misspelled = "heuristic-v2:margin=0.1,candidates=4,enemy_bonus=1"
+    problems = canonical_problems([V2, misspelled], Path("opponentcheck"), runner=fake_opponentcheck)
+    assert problems == [f"spec is not canonical: {misspelled!r}\n    write it as: {V2!r}"]
+
+
+def test_a_rerun_skips_finished_jobs_and_sets_aside_unfinished_folders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job with done.json is never run again. A folder without one is
+    renamed <name>.partial-<n>, kept, and the job runs afresh."""
+
+    plan = parse_plan(SMALL)
+    normal, weak = plan.jobs[0], plan.jobs[1]
+    ran = []
+    monkeypatch.setattr(Runner, "_run", lambda self, job, folder, log: ran.append(job.id))
+    runner = Runner(plan, tmp_path, Path("opponentcheck"))
+
+    finished = tmp_path / "bots" / "normal"
+    finished.mkdir(parents=True)
+    (finished / "done.json").write_text("{}")
+    interrupted = tmp_path / "bots" / "weak"
+    interrupted.mkdir(parents=True)
+    (interrupted / "log.txt").write_text("half a run")
+
+    assert runner.run_job(normal) == "done"
+    assert runner.run_job(weak) == "done"
+
+    assert ran == ["bots/weak"]
+    assert (tmp_path / "bots" / "weak.partial-1" / "log.txt").read_text() == "half a run"
+    assert (tmp_path / "bots" / "weak" / "done.json").exists()
+    assert run_experiments.job_state(tmp_path, weak) == "done"
