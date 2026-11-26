@@ -204,6 +204,15 @@ def test_random_v1_is_an_allowed_training_opponent_but_never_the_release_opponen
 
 # Short names for the lineup tests: H is heuristic-v2, R is random-v1.
 _H, _R = HEURISTIC_V2_OPPONENT, RANDOM_V1_OPPONENT
+# heuristic-v2 settings stage 1 trains and probes against, written in Go's
+# canonical form (parameters in alphabetical order), the only spelling
+# training's exact check of Go's echo accepts: WEAK is experiment 4's
+# weakened v2, RESTRICTED the bot limited to the learner's moves.
+_WEAK = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.75,margin=0.1"
+_RESTRICTED = (
+    "heuristic-v2:candidates=4,enemy_bonus=1,learner_aim=1,margin=0.1,"
+    "no_aim_check=1,whole_garrison=1"
+)
 
 
 @pytest.mark.parametrize(
@@ -215,22 +224,28 @@ _H, _R = HEURISTIC_V2_OPPONENT, RANDOM_V1_OPPONENT
         (FOUR_PLAYER_CONFIG, _R),
         (CONFIG, _H),
         (CONFIG, _R),
+        (FOUR_PLAYER_CONFIG, _WEAK),
+        (FOUR_PLAYER_CONFIG, f"{_RESTRICTED}|{_R}|{_R}"),
     ],
-    ids=["4p H|R|R", "4p H|H|R", "4p single H", "4p single R", "2p single H", "2p single R"],
+    ids=[
+        "4p H|R|R", "4p H|H|R", "4p single H", "4p single R", "2p single H", "2p single R",
+        "4p weakened v2", "4p restricted v2 in a mixed lineup",
+    ],
 )
-def test_training_opponent_accepts_pinned_lineups_and_single_specs(
-    path: Path, opponent: str
-) -> None:
-    """A lineup of pinned specs, one per opponent seat, trains like a single spec.
+def test_training_opponent_accepts_any_spec_and_lineups(path: Path, opponent: str) -> None:
+    """Any spec trains, alone or in a lineup with one spec per opponent seat.
 
-    Single specs keep working as before. The recorded configuration keeps the
-    lineup text exactly, so a resume or --init-from sees what the run trained
-    against, and release still plays heuristic-v2.
+    The pinned specs keep working as before, and so do specs Python never
+    listed, such as a weakened or restricted heuristic-v2: Go decides which
+    specs exist. The recorded configuration keeps the text exactly, so a
+    resume or --init-from sees what the run trained against, and the gates
+    still play their own fixed opponents whatever the run trained against.
     """
 
     config = replace(load_run_config(path), training_opponent=opponent)
 
     assert config.training_opponent == opponent
+    assert config.pipeline_opponent == RANDOM_V1_OPPONENT
     assert config.release_opponent == HEURISTIC_V2_OPPONENT
     assert run_config_from_mapping(json_value(config.to_dict())) == config
 
@@ -244,16 +259,20 @@ def test_training_opponent_accepts_pinned_lineups_and_single_specs(
         (FOUR_PLAYER_CONFIG, f"{_H}|{_H}|{_H}", "same spec in every seat"),
         (FOUR_PLAYER_CONFIG, f"{_H}||{_R}", "entry 2 is empty"),
         (FOUR_PLAYER_CONFIG, f"{_H}|{_R}|", "entry 3 is empty"),
+        (FOUR_PLAYER_CONFIG, "", "must not be empty"),
+        (FOUR_PLAYER_CONFIG, "   ", "must not be empty"),
     ],
     ids=[
         "two entries on 4p", "four entries on 4p", "lineup on 2p",
         "same spec in every seat", "doubled separator", "trailing separator",
+        "empty", "blank",
     ],
 )
-def test_training_opponent_rejects_invalid_lineups(
+def test_training_opponent_rejects_badly_shaped_opponents(
     path: Path, opponent: str, message: str
 ) -> None:
-    """Python refuses a badly shaped lineup before Go starts: wrong count or empty.
+    """Python refuses a badly shaped opponent before Go starts: empty, or a
+    lineup with the wrong count or an empty entry.
 
     Which specs are valid is Go's to decide when the environment starts.
 
