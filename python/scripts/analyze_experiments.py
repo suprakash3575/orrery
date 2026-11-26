@@ -72,6 +72,9 @@ LOST_AT_MOST = -0.10
 # fixed seed makes it draw the same samples every time, so rerunning the
 # analysis gives exactly the same 95% ranges.
 BOOTSTRAP_SEED = 0
+# The seats a bot job plays each map from: every Stage 1 game has four
+# players, and run_experiments.py counts a job's games the same way.
+BOT_SEATS = 4
 # Training's win rate is compared over this many updates at each end of a run
 # to decide whether it rose. Averaging several updates smooths out one lucky
 # or unlucky update.
@@ -126,6 +129,39 @@ def read_bot_games(out: Path, job: Job) -> list[dict[str, Any]]:
     path = job_folder(out, job) / "opponentcheck" / "games.jsonl"
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     return [row for row in rows if row["status"] == "completed"]
+
+
+def read_failure(out: Path, job: Job) -> str:
+    """Why a failed job failed: the error its failed.json records. The job's
+    log.txt has the full output of its commands.
+
+    Example: "opponentcheck exited with 1" for a bot job whose decode check
+    found a mismatch.
+    """
+
+    try:
+        return json.loads((job_folder(out, job) / "failed.json").read_text())["error"]
+    except (OSError, ValueError, KeyError):
+        return "no reason recorded"
+
+
+def check_bot_games_complete(job_id: str, games: Sequence[Mapping[str, Any]], maps: Sequence[int]) -> str | None:
+    """Why a bot job's completed games aren't a full set, or None when they
+    are: every map seed of the session from every one of BOT_SEATS seats,
+    exactly once.
+
+    A comparison pairs two jobs game by game. If either job lacks some
+    games, pairing would quietly compare only the games both have, so the
+    comparison is refused instead. Example: with 2 maps, 8 games are
+    expected; a job that completed 7 fails.
+    """
+
+    expected = sorted((seed, seat) for seed in range(*maps) for seat in range(BOT_SEATS))
+    played = sorted((row["seed"], row["seat"]) for row in games)
+    if played != expected:
+        return (f"{job_id} completed {len(played)} games, not the {len(expected)} expected "
+                f"(every map from each of {BOT_SEATS} seats once)")
+    return None
 
 
 def summarize_bot_job(out: Path, job: Job) -> dict[str, Any]:
@@ -200,6 +236,38 @@ def read_diagnosis_win_rate(report_path: Path) -> float | None:
     return None if result is None else result["wins"] / result["games"]
 
 
+def check_diagnosis_valid(report_folder: Path, opponent: str, maps: Sequence[int]) -> str | None:
+    """Why one diagnosis can't be used as evidence, or None when it can.
+
+    A win rate only measures the model if its games are a clean, complete
+    record of the games that were asked for. So the report must pass
+    compare_diagnoses.py's require_valid (every map seed played from every
+    seat exactly once, and no learner action rejected, since a rejected
+    action is a turn the model didn't really play), and it must have played
+    the session's maps against the job's own opponent.
+
+    ``maps`` is the session's [first seed, one past the last]. Example: a
+    report that played seeds 1,000,000 to 1,000,099 in a session of maps
+    [1,000,000, 1,000,100) passes that part; one that played
+    [1,010,000, 1,010,100) doesn't.
+    """
+
+    try:
+        report = load_report(report_folder)
+        require_valid(report, "the")
+    except ValueError as error:
+        return str(error)
+    except KeyError as error:
+        # A report from an older or broken diagnose, missing a field the
+        # check reads.
+        return f"the report is missing the field {error}"
+    if list(report["games"]["seeds"]) != list(maps):
+        return f"it played seeds {report['games']['seeds']}, not the session's maps {list(maps)}"
+    if report["games"]["opponent"] != opponent:
+        return f"it played {report['games']['opponent']!r}, not {opponent!r}"
+    return None
+
+
 def read_training_win_rates(metrics_path: Path) -> list[tuple[int, int, int]]:
     """(update, wins, games) for every update in a run's metrics.csv.
 
@@ -248,8 +316,9 @@ def compare_jobs(baseline: Sequence[Mapping[str, Any]], candidate: Sequence[Mapp
     # anything else, so averaging gives a win rate.
     won = {(row["seed"], row["seat"]): float(row["result"] > 0) for row in baseline}
     # Pair each candidate game with the baseline game at the same map and
-    # seat, grouped by map. A game only one side completed is left out, so
-    # both sides always describe the same games.
+    # seat, grouped by map. analyze() checks first that both jobs hold the
+    # full set of games (check_bot_games_complete), so every game pairs;
+    # the "if key in won" only guards a direct caller.
     by_map: dict[int, list[tuple[float, float]]] = {}
     for row in candidate:
         key = (row["seed"], row["seat"])
@@ -279,7 +348,7 @@ def compare_jobs(baseline: Sequence[Mapping[str, Any]], candidate: Sequence[Mapp
     return result
 
 
-def answer_restricted_bot(compare: Mapping[str, Any], valid: bool, why_invalid: str) -> str:
+def answer_restricted_bot(compare: Mapping[str, Any]) -> str:
     """Experiment 1's answer from the main comparison: the fully limited bot
     (candidate) minus normal v2 (baseline).
 
@@ -296,13 +365,12 @@ def answer_restricted_bot(compare: Mapping[str, Any], valid: bool, why_invalid: 
     with a range of -16 to -8 would be an obstacle: far enough behind, with
     the whole range below 0.
 
-    The answer is "invalid" instead when the run can't be trusted: a game
-    failed (which includes a decode mismatch, since that fails its game), or
-    the normal tester failed calibration.
+    It is only asked once both jobs are valid evidence with a full set of
+    games; otherwise analyze() answers "Invalid evidence" with the reason
+    (a failed job, such as a decode mismatch, a failed or cancelled game,
+    a failed calibration, or missing games).
     """
 
-    if not valid:
-        return f"Invalid: {why_invalid}. Fix the bot or runner first."
     low_high = compare["range"]
     if low_high is None:
         return "Unclear: too few maps for a range."
@@ -366,34 +434,59 @@ def analyze(out: Path) -> dict[str, Any]:
         group = [job for job in plan.jobs if job.experiment == experiment]
         analysis["botcheck"][experiment] = {
             "testers": [bot_rows[job.id] for job in group if job.id in bot_rows],
-            "not_done": [job.id for job in group if job.id not in bot_rows],
+            # A failed job, with why, kept apart from one not run yet.
+            "failed": {job.id: read_failure(out, job) for job in group if states[job.id] == "failed"},
+            "not_done": [job.id for job in group if job.id not in bot_rows and states[job.id] != "failed"],
         }
 
-    # Stage 3: each [[compare]]. Both jobs must be done; with rule
-    # "restricted-bot", experiment 1's answer is added, or "invalid" if
-    # either job is incomplete or failed calibration.
+    def evidence_problems(job_ids: Sequence[str]) -> list[str]:
+        """Why these bot jobs can't support a conclusion: a failed job (a
+        decode mismatch makes opponentcheck fail, for example), a run with a
+        failed or cancelled game, or a failed calibration. Empty when they
+        all can; a job that just isn't done yet is not a problem here."""
+
+        problems = [f"{job_id} failed: {read_failure(out, jobs[job_id])}"
+                    for job_id in job_ids if states[job_id] == "failed"]
+        rows = [bot_rows[job_id] for job_id in job_ids if job_id in bot_rows]
+        problems += [f"{row['tester']} is incomplete" for row in rows if not row["complete"]]
+        problems += [f"{row['tester']} failed calibration" for row in rows if row["calibration"] == "FAILED"]
+        return problems
+
+    # Stage 3: each [[compare]]. Both jobs must be valid evidence (see
+    # evidence_problems), done, and hold the full set of games, every map
+    # from every seat (check_bot_games_complete), so the two are compared on
+    # exactly the same games. With rule "restricted-bot", experiment 1's
+    # answer is added. Any problem makes the answer "Invalid evidence".
     for compare in plan.compares:
-        entry: dict[str, Any] = {**compare}
-        missing = [job_id for job_id in (compare["baseline"], compare["candidate"]) if job_id not in done]
-        if missing:
-            entry["result"] = None
+        entry: dict[str, Any] = {**compare, "result": None, "answer": None}
+        pair = (compare["baseline"], compare["candidate"])
+        problems = evidence_problems(pair)
+        missing = [job_id for job_id in pair if job_id not in done and states[job_id] != "failed"]
+        if not problems and not missing:
+            games = {job_id: read_bot_games(out, jobs[job_id]) for job_id in pair}
+            problems = [problem for job_id in pair
+                        if (problem := check_bot_games_complete(job_id, games[job_id], analysis["maps"]))]
+        if problems:
+            entry["answer"] = f"Invalid evidence: {'; '.join(problems)}."
+        elif missing:
             entry["answer"] = f"Not ready: {', '.join(missing)} not done." if compare["rule"] else None
         else:
-            entry["result"] = compare_jobs(read_bot_games(out, jobs[compare["baseline"]]),
-                                           read_bot_games(out, jobs[compare["candidate"]]))
+            entry["result"] = compare_jobs(games[compare["baseline"]], games[compare["candidate"]])
             if compare["rule"] == "restricted-bot":
-                pair = [bot_rows[compare["baseline"]], bot_rows[compare["candidate"]]]
-                problems = [f"{row['tester']} is incomplete" for row in pair if not row["complete"]]
-                problems += [f"{row['tester']} failed calibration" for row in pair if row["calibration"] == "FAILED"]
-                entry["answer"] = answer_restricted_bot(entry["result"], not problems, "; ".join(problems))
+                entry["answer"] = answer_restricted_bot(entry["result"])
         analysis["compare"].append(entry)
 
     # Stage 4: each [[dial]] (experiment 2). The dial is usable if the win
     # rate falls at every step of its order. Example: 25%, 18%, 9%, 4% is
-    # usable; 25%, 18%, 19%, 4% isn't, because the third step rises.
+    # usable; 25%, 18%, 19%, 4% isn't, because the third step rises. A step
+    # that isn't valid evidence (see evidence_problems) makes the answer
+    # "Invalid evidence": rates alone can look fine after a runner fault.
     for dial in plan.dials:
         rates = [bot_rows[job_id]["win_rate"] if job_id in bot_rows else None for job_id in dial["order"]]
-        if any(rate is None for rate in rates):
+        problems = evidence_problems(dial["order"])
+        if problems:
+            answer = f"Invalid evidence: {'; '.join(problems)}."
+        elif any(rate is None for rate in rates):
             answer = "Not ready: some testers aren't done."
         else:
             # Every step whose rate is not strictly below the one before it.
@@ -404,15 +497,21 @@ def analyze(out: Path) -> dict[str, Any]:
         analysis["dial"].append({**dial, "win_rates": rates, "answer": answer})
 
     # Stage 5: each [[diagnose]] section (experiment 3): one row per job, and
-    # the band answer when the section sets a band.
+    # the band answer when the section sets a band. A finished job's report
+    # is checked before its win rate is used: an invalid one gets no rate,
+    # and its reason in "invalid".
     for experiment in dict.fromkeys(job.experiment for job in plan.jobs if job.kind == "diagnose"):
         group = [job for job in plan.jobs if job.experiment == experiment]
         rows = []
         for job in group:
-            rate = (read_diagnosis_win_rate(job_folder(out, job) / "diagnosis" / "report.json")
-                    if job.id in done else None)
-            rows.append({"opponent": job.settings["opponent_label"], "run": Path(job.settings["run_dir"]).name,
-                         "update": job.settings["update"], "win_rate": rate})
+            rate = invalid = None
+            if job.id in done:
+                folder = job_folder(out, job) / "diagnosis"
+                invalid = check_diagnosis_valid(folder, job.settings["opponent"], analysis["maps"])
+                rate = None if invalid else read_diagnosis_win_rate(folder / "report.json")
+            rows.append({"job": job.id, "opponent": job.settings["opponent_label"],
+                         "run": Path(job.settings["run_dir"]).name, "update": job.settings["update"],
+                         "win_rate": rate, "invalid": invalid})
         section: dict[str, Any] = {"rows": rows, "answer": None}
         options = plan.answers.get(experiment)
         if options:
@@ -423,50 +522,64 @@ def analyze(out: Path) -> dict[str, Any]:
     # the progress answer.
     for experiment in dict.fromkeys(job.experiment for job in plan.jobs if job.kind == "train"):
         group = [job for job in plan.jobs if job.experiment == experiment]
-        runs = [summarize_train_job(out, job) if job.id in done else {"job": job.id, "done": False,
-                "opponent": job.settings["opponent_label"]} for job in group]
+        options = plan.answers[experiment]
+        runs = [summarize_train_job(out, job, options["progress_against"]) if job.id in done
+                else {"job": job.id, "done": False, "opponent": job.settings["opponent_label"]} for job in group]
         analysis["train"][experiment] = {
             "runs": runs,
-            "answer": answer_training(runs, plan.answers[experiment]["progress_min_runs"],
-                                   plan.answers[experiment]["progress_min_extra_wins"]),
+            "answer": answer_training(runs, options["progress_min_runs"], options["progress_min_extra_wins"],
+                                      options["progress_against"]),
         }
     return analysis
 
 
 def answer_band(rows: Sequence[Mapping[str, Any]], band: Sequence[float], min_runs: int) -> str:
-    """Experiment 3: an opponent is found if at least min_runs models win
-    inside the band against it.
+    """Experiment 3: an opponent is found if, at one update, at least
+    min_runs runs' models win inside the band against it.
 
     Training needs an opponent it sometimes beats: never winning teaches
     nothing about winning, and almost always winning leaves little to learn.
     The band is that "sometimes".
 
-    Example, band 10%-40% and min_runs 2: three models win 12%, 35% and 50%
-    against one opponent. Two of them are inside the band, so it is found.
-    When none is found, each opponent is said to be "below" or "above" the
-    band (by its models' average), which shows which way to move next time.
+    Each run votes once per update: rows are grouped by (opponent, update),
+    and a run has exactly one row in each group. Counting every row of an
+    opponent instead would let one run with two in-band checkpoints count
+    as two models.
+
+    Example, band 10%-40% and min_runs 2: at update 153, three runs win
+    12%, 35% and 50% against one opponent. Two of them are inside the band,
+    so it is found. When none is found, each (opponent, update) is said to
+    be "below" or "above" the band (by its runs' average), which shows which
+    way to move next time.
+
+    A row whose report failed check_diagnosis_valid makes the answer
+    "Invalid evidence", with its reason: no verdict is drawn from games the
+    model didn't cleanly play.
     """
 
+    invalid = [f"{row['job']} ({row['invalid']})" for row in rows if row["invalid"]]
+    if invalid:
+        return f"Invalid evidence: {'; '.join(invalid)}."
     if any(row["win_rate"] is None for row in rows):
         return "Not ready: some diagnoses aren't done."
     low, high = band
     found = []
     sides = []
-    for opponent in dict.fromkeys(row["opponent"] for row in rows):
-        rates = [row["win_rate"] for row in rows if row["opponent"] == opponent]
-        # True counts as 1 in a sum, so this counts the models inside the band.
+    for opponent, update in dict.fromkeys((row["opponent"], row["update"]) for row in rows):
+        rates = [row["win_rate"] for row in rows if (row["opponent"], row["update"]) == (opponent, update)]
+        # True counts as 1 in a sum, so this counts the runs inside the band.
         inside = sum(low <= rate <= high for rate in rates)
         if inside >= min_runs:
-            found.append(f"{opponent} ({inside} of {len(rates)} models)")
+            found.append(f"{opponent} at update {update} ({inside} of {len(rates)} runs)")
         else:
             side = "below" if np.mean(rates) < low else "above" if np.mean(rates) > high else "around"
-            sides.append(f"{opponent}: {side}")
+            sides.append(f"{opponent} at update {update}: {side}")
     if found:
         return f"Found: {', '.join(found)} gives {format_percent(low)}-{format_percent(high)}, an opponent with enough wins to learn from."
     return f"Not found. Each opponent's side of the band: {'; '.join(sides)}."
 
 
-def summarize_train_job(out: Path, job: Job) -> dict[str, Any]:
+def summarize_train_job(out: Path, job: Job, against: str | None) -> dict[str, Any]:
     """One train job's checkpoints: training win rate since the previous
     checkpoint next to each diagnosis win rate, and the training trend.
 
@@ -478,6 +591,9 @@ def summarize_train_job(out: Path, job: Job) -> dict[str, Any]:
     Example: checkpoints at updates 30 and 60. The training win rate at 60
     counts the training games of updates 31 to 60 together: their total wins
     ÷ their total games.
+
+    ``against`` is the section's progress_against label, the opponent the
+    progress measure uses (see measure_training_progress).
     """
 
     folder = job_folder(out, job)
@@ -503,10 +619,17 @@ def summarize_train_job(out: Path, job: Job) -> dict[str, Any]:
         previous = update
     # Rising: the last TREND_UPDATES updates win more often than the first.
     # A short run uses half its updates at each end instead (so the two ends
-    # never overlap). max(1, ...) only guards against dividing by 0.
+    # never overlap).
     span = min(TREND_UPDATES, len(history) // 2)
-    first = sum(w for _u, w, _g in history[:span]) / max(1, sum(g for _u, _w, g in history[:span]))
-    last = sum(w for _u, w, _g in history[-span:]) / max(1, sum(g for _u, _w, g in history[-span:]))
+
+    def window_rate(window: Sequence[tuple[int, int, int]]) -> float | None:
+        # None when no training game finished in the window: there is no
+        # win rate, and treating it as 0% could make a rise out of nothing.
+        games = sum(g for _u, _w, g in window)
+        return sum(w for _u, w, _g in window) / games if games else None
+
+    first = window_rate(history[:span]) if span else None
+    last = window_rate(history[-span:]) if span else None
     return {
         "job": job.id,
         "done": True,
@@ -514,17 +637,19 @@ def summarize_train_job(out: Path, job: Job) -> dict[str, Any]:
         # The starting run's name, which carries its training seed.
         "start": Path(job.settings["init_from"]).parent.parent.name,
         "checkpoints": checkpoints,
-        "first_training_win_rate": first if span else None,
-        "last_training_win_rate": last if span else None,
-        "training_rose": bool(span) and last > first,
-        "progress": measure_training_progress(folder, job),
+        "first_training_win_rate": first,
+        "last_training_win_rate": last,
+        # None (undefined) when either end has no rate.
+        "training_rose": None if first is None or last is None else last > first,
+        "progress": measure_training_progress(folder, job, against),
     }
 
 
-def measure_training_progress(folder: Path, job: Job) -> dict[str, Any]:
+def measure_training_progress(folder: Path, job: Job, against: str | None) -> dict[str, Any]:
     """The progress measure of one train job: its final checkpoint's wins
-    minus its starting checkpoint's wins, against the first
-    diagnose_against opponent (full v2 in Stage 1).
+    minus its starting checkpoint's wins, against the diagnose_against
+    opponent labelled ``against`` (the section's progress_against; full v2
+    in Stage 1). None means no target was named, so nothing is measured.
 
     The difference only means "what training added" if both diagnoses are
     clean and played the same games, so both are checked first (see
@@ -540,8 +665,11 @@ def measure_training_progress(folder: Path, job: Job) -> dict[str, Any]:
     the same 400, so extra_wins is 5.
     """
 
-    against, spec = next(iter(job.settings["diagnose_against"].items()))
     final_update = job.settings["max_updates"]
+    if against is None:
+        return {"against": None, "final_update": final_update, "start": None, "final": None,
+                "invalid": None, "extra_wins": None}
+    spec = job.settings["diagnose_against"][against]
     start_folder = folder / "diagnoses" / f"start__{against}"
     final_folder = folder / "diagnoses" / f"update-{final_update:06d}__{against}"
     start = read_diagnosis_wins(start_folder / "report.json")
@@ -596,17 +724,19 @@ def check_diagnoses_comparable(start_folder: Path, final_folder: Path, opponent:
     return None
 
 
-def answer_training(runs: Sequence[Mapping[str, Any]], min_runs: int, min_extra_wins: int | None) -> str:
+def answer_training(runs: Sequence[Mapping[str, Any]], min_runs: int, min_extra_wins: int | None,
+                    against: str | None) -> str:
     """Experiment 4's answer. Training made progress if, for some training
     opponent, the final checkpoint won at least min_extra_wins more games
-    than its starting checkpoint against the full opponent, in at least
-    min_runs runs.
+    than its starting checkpoint against the ``against`` opponent (the
+    section's progress_against), in at least min_runs runs.
 
     The answers, checked in this order:
 
-    1. **Unavailable**: min_extra_wins is None, because the session was made
-       before progress_min_extra_wins existed. There is no threshold to
-       judge by, so no verdict; its tables are still shown.
+    1. **Unavailable**: min_extra_wins or against is None, because the
+       session was made before progress_min_extra_wins or progress_against
+       existed. There is no threshold or target to judge by, so no verdict;
+       its tables are still shown.
     2. **Invalid evidence**: some run's start and final diagnoses fail the
        checks in check_diagnoses_comparable. Waiting won't fix that, so it comes
        before pending, and no verdict is given.
@@ -622,6 +752,11 @@ def answer_training(runs: Sequence[Mapping[str, Any]], min_runs: int, min_extra_
        opponent, yet that doesn't carry over to the full one.
     6. **Not working**: neither.
 
+    Partial and not working end with each training opponent's counts, so
+    the answer says how many runs did gain wins, not just that too few did.
+    A run whose training rise is undefined (a window with no finished
+    games) doesn't count as rising.
+
     Example, min_runs 2 and min_extra_wins 4: three runs against one
     training opponent have 5, 4 and 0 extra wins. Two reach 4, so the
     answer is observed progress.
@@ -630,6 +765,9 @@ def answer_training(runs: Sequence[Mapping[str, Any]], min_runs: int, min_extra_
     if min_extra_wins is None:
         return ("Unavailable: this session was made before progress_min_extra_wins existed, so there is no "
                 "progress threshold to judge its training by.")
+    if against is None:
+        return ("Unavailable: diagnose_against has several labels and no progress_against names the one to "
+                "judge training against.")
     invalid = [f"{run['job']} ({run['progress']['invalid']})" for run in runs
                if run["done"] and run["progress"]["invalid"]]
     if invalid:
@@ -637,22 +775,36 @@ def answer_training(runs: Sequence[Mapping[str, Any]], min_runs: int, min_extra_
     pending = [run["job"] for run in runs if not run["done"] or run["progress"]["extra_wins"] is None]
     if pending:
         return f"Pending: no final-versus-start result yet for {', '.join(pending)}."
-    against = runs[0]["progress"]["against"]
+    # Each training opponent's counts: runs that gained enough wins, and runs
+    # whose training win rate rose. True counts as 1 in a sum; "is True"
+    # leaves out a rise that is undefined (None).
+    counts = {}
     for opponent in dict.fromkeys(run["opponent"] for run in runs):
         group = [run for run in runs if run["opponent"] == opponent]
-        # True counts as 1 in a sum, so this counts the runs that progressed.
-        progressed = sum(run["progress"]["extra_wins"] >= min_extra_wins for run in group)
-        if progressed >= min_runs:
+        counts[opponent] = {
+            "runs": len(group),
+            "progressed": sum(run["progress"]["extra_wins"] >= min_extra_wins for run in group),
+            "rose": sum(run["training_rose"] is True for run in group),
+        }
+    for opponent, count in counts.items():
+        if count["progressed"] >= min_runs:
             return (f"Observed progress: after training against {opponent}, the final checkpoint won at least "
-                    f"{min_extra_wins} more games against {against} than its starting checkpoint in {progressed} "
-                    f"of {len(group)} runs. The next step lowers epsilon towards 0.")
-    for opponent in dict.fromkeys(run["opponent"] for run in runs):
-        group = [run for run in runs if run["opponent"] == opponent]
-        if sum(run["training_rose"] for run in group) >= min_runs:
+                    f"{min_extra_wins} more games against {against} than its starting checkpoint in "
+                    f"{count['progressed']} of {count['runs']} runs. The next step lowers epsilon towards 0.")
+    # Example: "v2-eps0.75: 1 of 3 runs gained 4 wins against v2, training
+    # rose in 2 of 3".
+    summary = "; ".join(
+        f"{opponent}: {count['progressed']} of {count['runs']} runs gained {min_extra_wins} wins against "
+        f"{against}, training rose in {count['rose']} of {count['runs']}"
+        for opponent, count in counts.items()
+    )
+    for opponent, count in counts.items():
+        if count["rose"] >= min_runs:
             return (f"Partial: training wins rose against {opponent}, but fewer than {min_runs} runs gained "
-                    f"{min_extra_wins} wins against {against}. Use experiment 1's answer to choose between "
-                    "widening the learner's moves and a smaller epsilon step.")
-    return "Not working: training wins didn't rise either. Experiment 1 says whether the learner's moves or the training method are to blame."
+                    f"{min_extra_wins} wins against {against} ({summary}). Use experiment 1's answer to choose "
+                    "between widening the learner's moves and a smaller epsilon step.")
+    return (f"Not working: training wins didn't rise either ({summary}). Experiment 1 says whether the "
+            "learner's moves or the training method are to blame.")
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +855,8 @@ def render_markdown(analysis: Mapping[str, Any]) -> str:
                 f"| {row['tester']} | {row['completed']}/{row['planned']} | {row['wins']} | {format_percent(row['win_rate'])} "
                 f"| {row['eliminated']} | {row['median_finish_turn']} | {format_percent(row['aim_failure_rate'])} "
                 f"| {format_percent(row['fallback_rate'])} | {random_text} | {checked} | {row['calibration']} |")
+        for job_id, error in section["failed"].items():
+            lines.append(f"| {job_id.split('/', 1)[1]} | failed: {error} | | | | | | | | | |")
         for job_id in section["not_done"]:
             lines.append(f"| {job_id.split('/', 1)[1]} | not done | | | | | | | | | |")
         # The wins of decode-checked testers, by map seed and seat.
@@ -721,7 +875,10 @@ def render_markdown(analysis: Mapping[str, Any]) -> str:
         for entry in analysis["compare"]:
             result = entry["result"]
             if result is None:
-                lines.append(f"| {entry['question']} | not done | | | | |")
+                # No result: either invalid evidence (its answer, below,
+                # says why) or a job not done yet.
+                state = "invalid" if (entry["answer"] or "").startswith("Invalid") else "not done"
+                lines.append(f"| {entry['question']} | {state} | | | | |")
                 continue
             span = result["range"]
             span_text = f"{format_points(span[0])} to {format_points(span[1])}" if span else "undefined"
@@ -750,7 +907,8 @@ def render_markdown(analysis: Mapping[str, Any]) -> str:
         for opponent in dict.fromkeys(row["opponent"] for row in section["rows"]):
             # For each column, the one row with this opponent and that
             # (run, update).
-            cells = [next(format_percent(r["win_rate"]) for r in section["rows"]
+            # An invalid report shows "invalid" rather than a win rate.
+            cells = [next("invalid" if r["invalid"] else format_percent(r["win_rate"]) for r in section["rows"]
                           if r["opponent"] == opponent and (r["run"], r["update"]) == run) for run in runs]
             lines.append(f"| {opponent} | " + " | ".join(cells) + " |")
         if section["answer"]:
@@ -767,7 +925,9 @@ def render_markdown(analysis: Mapping[str, Any]) -> str:
                 continue
             labels = list(run["checkpoints"][0]["diagnosis_win_rates"]) if run["checkpoints"] else []
             progress = run["progress"]
-            if progress["invalid"]:
+            if progress["against"] is None:
+                versus = "Progress: not measured (no progress_against target)."
+            elif progress["invalid"]:
                 versus = f"Against {progress['against']}: invalid evidence ({progress['invalid']})."
             elif progress["extra_wins"] is None:
                 versus = (f"Against {progress['against']}: pending (no start or update-{progress['final_update']} "

@@ -308,11 +308,13 @@ def parse_plan(text: str) -> Plan:
                 _read_int(table, "progress_min_extra_wins", "[[train]]")
                 if "progress_min_extra_wins" in table else None
             ),
+            "progress_against": _read_progress_against(table),
         }
         # Both thresholds must be at least 1. With 0 extra wins, a run whose
         # final checkpoint did no better than its start would count as
         # progress; with 0 runs, progress would need no run at all.
-        for key, value in answers[table["name"]].items():
+        for key in ("progress_min_runs", "progress_min_extra_wins"):
+            value = answers[table["name"]][key]
             if value is not None and value < 1:
                 raise PlanError(f"[[train]] {table['name']}: {key} must be at least 1, got {value}")
 
@@ -445,6 +447,34 @@ def _expand_train(table: Mapping[str, Any]) -> list[Job]:
     ]
 
 
+def _read_progress_against(table: Mapping[str, Any]) -> str | None:
+    """Which diagnose_against label the progress answer measures against.
+
+    The answer compares the final checkpoint with the start against one
+    opponent, so it must be the intended one, named by its label. With a
+    single diagnose_against label there is no choice, and progress_against
+    may be left out. With several, it must be given: guessing the first one
+    could judge progress against a weaker opponent than full v2.
+
+    None means "several labels and no choice made". Reading accepts that,
+    so sessions saved before this setting stay readable; preflight refuses
+    a new run with it (check_required_settings).
+
+    Example: diagnose_against = { v2 = "...", weak = "..." } with
+    progress_against = "v2" gives "v2"; with only { v2 = "..." }, leaving it
+    out also gives "v2".
+    """
+
+    labels = list(table["diagnose_against"])
+    against = table.get("progress_against")
+    if against is None:
+        return labels[0] if len(labels) == 1 else None
+    if against not in labels:
+        raise PlanError(f"[[train]] {table['name']}: progress_against {against!r} is not one of the "
+                        f"diagnose_against labels {labels}")
+    return against
+
+
 def _read_compare(table: Mapping[str, Any], bot_ids: set[str]) -> Mapping[str, Any]:
     """Read one [[compare]]: candidate minus baseline, both bot job ids.
 
@@ -486,8 +516,9 @@ def _read_dial(table: Mapping[str, Any], bot_ids: set[str]) -> Mapping[str, Any]
 def _read_band(table: Mapping[str, Any]) -> Mapping[str, Any]:
     """Read a [[diagnose]]'s band: the win-rate range an answer looks for.
 
-    Example: band [0.10, 0.40] with band_min_runs 2 means "found" when at
-    least 2 models win between 10% and 40% against the same opponent.
+    Example: band [0.10, 0.40] with band_min_runs 2 means "found" when the
+    models of at least 2 runs, at the same update, win between 10% and 40%
+    against the same opponent. band_min_runs must be at least 1.
     """
 
     where = f"[[diagnose]] {table.get('name')}"
@@ -500,7 +531,11 @@ def _read_band(table: Mapping[str, Any]) -> Mapping[str, Any]:
         or not 0 <= band[0] < band[1] <= 1
     ):
         raise PlanError(f"{where}: band must be [low, high] with 0 <= low < high <= 1")
-    return {"band": [float(band[0]), float(band[1])], "band_min_runs": _read_int(table, "band_min_runs", where, default=2)}
+    min_runs = _read_int(table, "band_min_runs", where, default=2)
+    # With 0, "found" would need no run inside the band at all.
+    if min_runs < 1:
+        raise PlanError(f"{where}: band_min_runs must be at least 1, got {min_runs}")
+    return {"band": [float(band[0]), float(band[1])], "band_min_runs": min_runs}
 
 
 # Small readers that name the field and section in every error. Each takes
@@ -812,18 +847,23 @@ def check_required_settings(plan: Plan, jobs: Sequence[Job]) -> list[str]:
     """Settings a new run must have, even though reading the file lets them
     be missing.
 
-    Reading the file accepts a missing progress_min_extra_wins, so that old
-    sessions saved before it existed stay readable (see parse_plan). A new
-    run without it would finish with no threshold to judge its training by,
-    so preflight refuses it.
+    Reading the file accepts a missing progress_min_extra_wins, and a
+    missing progress_against when diagnose_against has several labels, so
+    that old sessions saved before these settings existed stay readable
+    (see parse_plan). A new run without them would finish with no threshold,
+    or no target opponent, to judge its training by, so preflight refuses
+    it.
     """
 
     trained = dict.fromkeys(job.experiment for job in jobs if job.kind == "train")
-    return [
-        f"[[train]] {experiment}: progress_min_extra_wins is required"
-        for experiment in trained
-        if plan.answers[experiment]["progress_min_extra_wins"] is None
-    ]
+    problems = []
+    for experiment in trained:
+        if plan.answers[experiment]["progress_min_extra_wins"] is None:
+            problems.append(f"[[train]] {experiment}: progress_min_extra_wins is required")
+        if plan.answers[experiment]["progress_against"] is None:
+            problems.append(f"[[train]] {experiment}: progress_against is required, because "
+                            "diagnose_against has more than one label")
+    return problems
 
 
 def check_plan_and_build_tools(plan: Plan, jobs: Sequence[Job], bin_dir: Path) -> tuple[list[str], Path | None]:

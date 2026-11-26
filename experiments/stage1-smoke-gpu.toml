@@ -52,6 +52,7 @@ max_updates = 2
 checkpoint_every_updates = 1
 progress_min_runs = 1
 progress_min_extra_wins = 1
+progress_against = "v2"
 
 [train.training_opponents]
 "v2-eps0.75" = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.75,margin=0.1"

@@ -174,9 +174,9 @@ def test_progress_needs_extra_wins_in_enough_runs_and_waits_for_every_result() -
                 "progress": {"against": "v2", "invalid": None, "extra_wins": extra_wins}}
 
     runs = [run("train/weak__s1", 4), run("train/weak__s2", 4), run("train/weak__s3", 0)]
-    assert answer_training(runs, min_runs=2, min_extra_wins=4).startswith("Observed progress")
+    assert answer_training(runs, min_runs=2, min_extra_wins=4, against="v2").startswith("Observed progress")
     runs[1] = run("train/weak__s2", None)
-    assert answer_training(runs, min_runs=2, min_extra_wins=4) == (
+    assert answer_training(runs, min_runs=2, min_extra_wins=4, against="v2") == (
         "Pending: no final-versus-start result yet for train/weak__s2."
     )
 
@@ -214,11 +214,11 @@ def test_progress_refuses_diagnoses_that_did_not_play_the_same_clean_games(
         (tmp_path / "diagnoses" / name).mkdir(parents=True)
         (tmp_path / "diagnoses" / name / "report.json").write_text(json.dumps(report))
 
-    progress = measure_training_progress(tmp_path, job)
+    progress = measure_training_progress(tmp_path, job, "v2")
 
     assert progress["extra_wins"] is None and reason in progress["invalid"]
     run = {"job": job.id, "done": True, "opponent": "weak", "training_rose": True, "progress": progress}
-    assert answer_training([run], min_runs=1, min_extra_wins=1).startswith("Invalid evidence")
+    assert answer_training([run], min_runs=1, min_extra_wins=1, against="v2").startswith("Invalid evidence")
 
 
 def test_bot_results_compare_and_answer_as_worked_out_by_hand(tmp_path: Path) -> None:
