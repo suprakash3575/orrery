@@ -68,6 +68,39 @@ type gameRecord struct {
 	Message  string `json:"message,omitempty"`
 	// Seconds is the wall-clock time this game took.
 	Seconds float64 `json:"seconds"`
+
+	// TesterCounts holds the tester's aim and decode counts. It is set only
+	// for a completed game whose tester reports AimStats (heuristic-v2), and
+	// nil otherwise. Embedded as a pointer, its fields appear at the top
+	// level of the JSON when set and are left out entirely when nil, so a
+	// record of any other tester is written exactly as before. The type is
+	// exported only because encoding/json can't fill an embedded pointer to
+	// an unexported struct when reading a record back.
+	*TesterCounts
+}
+
+// TesterCounts are one game's totals for the tested bot, read from its
+// AimStats at the end of the game (see agent.AimStats for each count).
+type TesterCounts struct {
+	// AimAttempts is how many times the bot tried to aim ahead, counting
+	// targets it considered but didn't launch at; AimFailures is how many of
+	// those found no way to the target.
+	AimAttempts int `json:"aim_attempts"`
+	AimFailures int `json:"aim_failures"`
+	// FallbackLaunches is how many launches were aimed straight at the
+	// target because aiming ahead failed. Only learner_aim=1 makes them.
+	FallbackLaunches int `json:"fallback_launches"`
+	// RandomMoves is how many times a body's move was chosen at random
+	// (epsilon), whether it launched or held.
+	RandomMoves int `json:"random_moves"`
+	// DecodeCheckedLaunches is how many launches passed the decode check:
+	// every launch of a completed game when -check-decode is on, else 0.
+	DecodeCheckedLaunches int `json:"decode_checked_launches"`
+}
+
+// aimReporter is the part of agent.HeuristicV2Agent the counters read.
+type aimReporter interface {
+	AimStats() agent.AimStats
 }
 
 // matchConfig is what every game of a run shares.
@@ -127,6 +160,9 @@ func playGame(ctx context.Context, config matchConfig, j job) (record gameRecord
 	if err != nil {
 		return fail(0, nil, err)
 	}
+	// decodeChecked counts the tester's launches that passed the decode
+	// check. It is copied into the record only if the game completes.
+	decodeChecked := 0
 	var reporter choiceReporter
 	if config.checkDecode {
 		var ok bool
@@ -162,6 +198,7 @@ func playGame(ctx context.Context, config matchConfig, j job) (record gameRecord
 					if err := checkDecode(g, frame, reporter.LastChoices(), decision.Actions); err != nil {
 						return fail(g.Turn, &seat, fmt.Errorf("decode check: %w", err))
 					}
+					decodeChecked += len(decision.Actions)
 				}
 			}
 			actions = append(actions, decision.Actions...)
@@ -189,6 +226,16 @@ func playGame(ctx context.Context, config matchConfig, j job) (record gameRecord
 	}
 	record.Leaders, _ = g.Winner()
 	record.Result = result(record.Leaders, j.seat)
+	// AimStats are running totals for the match, so reading them once at the
+	// end gives the whole game's counts.
+	if aims, ok := agents[j.seat].(aimReporter); ok {
+		stats := aims.AimStats()
+		record.TesterCounts = &TesterCounts{
+			AimAttempts: stats.AimAheadAttempts, AimFailures: stats.AimAheadFailed,
+			FallbackLaunches: stats.AimedStraight, RandomMoves: stats.RandomMoves,
+			DecodeCheckedLaunches: decodeChecked,
+		}
+	}
 	return record
 }
 

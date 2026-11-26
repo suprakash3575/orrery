@@ -44,6 +44,75 @@ type testerSummary struct {
 	// GameSeconds is the summed time of this tester's games. Games run in
 	// parallel, so it is work done, not wall-clock time.
 	GameSeconds float64 `json:"game_seconds"`
+
+	// CounterSummary totals the TesterCounts of the completed games. It is
+	// set only when they carry counts (a heuristic-v2 tester); embedded as a
+	// pointer, it is left out of the JSON otherwise, so other testers'
+	// summaries are unchanged.
+	*CounterSummary
+}
+
+// CounterSummary is one tester's counts over its completed games, and the
+// rates made from them. A rate is a pointer so that it can be null in the
+// JSON, meaning undefined: nothing was counted to divide by. A rate of 0
+// would claim something was counted and none of it failed.
+type CounterSummary struct {
+	AimAttempts int `json:"aim_attempts"`
+	AimFailures int `json:"aim_failures"`
+	// AimFailureRate is AimFailures / AimAttempts: how often aiming ahead
+	// found no way to the target.
+	AimFailureRate   *float64 `json:"aim_failure_rate"`
+	FallbackLaunches int      `json:"fallback_launches"`
+	// FallbackRate is FallbackLaunches over every launch in the same games:
+	// the share of launches aimed straight because aiming ahead failed.
+	FallbackRate *float64 `json:"fallback_rate"`
+	RandomMoves  int      `json:"random_moves"`
+	// RandomMovesPerGame is RandomMoves over the games counted.
+	RandomMovesPerGame    float64 `json:"random_moves_per_game"`
+	DecodeCheckedLaunches int     `json:"decode_checked_launches"`
+}
+
+// rate is part / whole, or nil (undefined) when whole is 0.
+func rate(part, whole int) *float64 {
+	if whole == 0 {
+		return nil
+	}
+	r := float64(part) / float64(whole)
+	return &r
+}
+
+// summarizeCounts totals the counts of the completed records that carry
+// them, or returns nil when none does.
+func summarizeCounts(records []gameRecord) *CounterSummary {
+	var c CounterSummary
+	games, launches := 0, 0
+	for _, r := range records {
+		if r.TesterCounts == nil {
+			continue
+		}
+		games++
+		launches += r.Launches
+		c.AimAttempts += r.AimAttempts
+		c.AimFailures += r.AimFailures
+		c.FallbackLaunches += r.FallbackLaunches
+		c.RandomMoves += r.RandomMoves
+		c.DecodeCheckedLaunches += r.DecodeCheckedLaunches
+	}
+	if games == 0 {
+		return nil
+	}
+	c.AimFailureRate = rate(c.AimFailures, c.AimAttempts)
+	c.FallbackRate = rate(c.FallbackLaunches, launches)
+	c.RandomMovesPerGame = float64(c.RandomMoves) / float64(games)
+	return &c
+}
+
+// formatRate writes a rate as a percentage, or "undefined" when nil.
+func formatRate(r *float64) string {
+	if r == nil {
+		return "undefined"
+	}
+	return fmt.Sprintf("%.1f%%", 100**r)
 }
 
 // calibration is the exact check on the calibration tester: the opponent
@@ -75,6 +144,7 @@ func summarize(records []gameRecord, planned map[string]int) []testerSummary {
 		s := testerSummary{Tester: tester, Planned: planned[tester]}
 		var seatGames, seatWins [players]int
 		var lengths []int
+		var completed []gameRecord
 		launches := 0
 		for _, r := range records {
 			if r.Tester != tester {
@@ -90,6 +160,7 @@ func summarize(records []gameRecord, planned map[string]int) []testerSummary {
 				continue
 			}
 			s.Completed++
+			completed = append(completed, r)
 			seatGames[r.Seat]++
 			switch {
 			case r.Result > 0:
@@ -119,6 +190,7 @@ func summarize(records []gameRecord, planned map[string]int) []testerSummary {
 			}
 		}
 		s.LengthP10, s.LengthP50, s.LengthP90 = percentile(lengths, 0.1), percentile(lengths, 0.5), percentile(lengths, 0.9)
+		s.CounterSummary = summarizeCounts(completed)
 		summaries = append(summaries, s)
 	}
 	return summaries
@@ -278,6 +350,22 @@ func markdownSummary(meta runMeta, summaries []testerSummary, c calibration, dec
 			s.Tester, s.Completed, s.Planned, s.Wins, s.Losses, s.Draws, 100*s.WinRate,
 			100*s.SeatWinRate[0], 100*s.SeatWinRate[1], 100*s.SeatWinRate[2], 100*s.SeatWinRate[3],
 			s.Eliminated, s.LaunchesPerGame, s.ZeroLaunchGames, s.LengthP10, s.LengthP50, s.LengthP90)
+	}
+
+	// The counts table appears only when some tester reports counts, so
+	// other runs' summaries are unchanged.
+	if slices.ContainsFunc(summaries, func(s testerSummary) bool { return s.CounterSummary != nil }) {
+		b.WriteString("\n## Aim and decode counts\n\n")
+		b.WriteString("Over completed games. A rate is undefined when nothing was counted to divide by.\n\n")
+		b.WriteString("| Tester | Aim attempts | Aim failures | Aim failure rate | Fallback launches | Fallback share of launches | Random moves/game | Decode-checked launches |\n")
+		b.WriteString("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+		for _, s := range summaries {
+			if c := s.CounterSummary; c != nil {
+				fmt.Fprintf(&b, "| %s | %d | %d | %s | %d | %s | %.1f | %d |\n",
+					s.Tester, c.AimAttempts, c.AimFailures, formatRate(c.AimFailureRate),
+					c.FallbackLaunches, formatRate(c.FallbackRate), c.RandomMovesPerGame, c.DecodeCheckedLaunches)
+			}
+		}
 	}
 
 	fmt.Fprintf(&b, "\n## Calibration\n\n")
