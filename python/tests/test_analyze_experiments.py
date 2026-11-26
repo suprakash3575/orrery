@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from scripts.analyze_experiments import analyze, markdown, train_answer, train_progress
-from scripts.run_experiments import Runner, parse_plan, print_status, setting_problems
+from scripts.analyze_experiments import analyze, answer_training, measure_training_progress, render_markdown
+from scripts.run_experiments import Runner, check_required_settings, parse_plan, print_status
 
 V2 = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
 LIMITED = "heuristic-v2:candidates=4,enemy_bonus=1,garrison_cost=needed,learner_aim=1,margin=0.1,no_aim_check=1,whole_garrison=1"
@@ -135,7 +135,7 @@ def test_a_train_job_trains_diagnoses_every_checkpoint_and_is_analysed(
             (out / "report.json").write_text(json.dumps(diagnosis_report(next(diagnosis_wins))))
         return 0
 
-    monkeypatch.setattr(Runner, "command", fake_command)
+    monkeypatch.setattr(Runner, "run_command", fake_command)
     assert Runner(plan, tmp_path, Path("opponentcheck")).run_job(job) == "done"
     folder = tmp_path / job.experiment / job.label
     assert (folder / "diagnoses" / "start__v2" / "report.json").exists()
@@ -160,7 +160,7 @@ def test_a_train_job_trains_diagnoses_every_checkpoint_and_is_analysed(
     assert run["checkpoints"][1]["diagnosis_win_rates"]["v2"] is None
     assert run["progress"]["extra_wins"] is None
     assert analysis["train"]["train"]["answer"].startswith("Pending")
-    assert "| 2 | 75.0% | missing |" in markdown(analysis)
+    assert "| 2 | 75.0% | missing |" in render_markdown(analysis)
 
 
 def test_progress_needs_extra_wins_in_enough_runs_and_waits_for_every_result() -> None:
@@ -174,9 +174,9 @@ def test_progress_needs_extra_wins_in_enough_runs_and_waits_for_every_result() -
                 "progress": {"against": "v2", "invalid": None, "extra_wins": extra_wins}}
 
     runs = [run("train/weak__s1", 4), run("train/weak__s2", 4), run("train/weak__s3", 0)]
-    assert train_answer(runs, min_runs=2, min_extra_wins=4).startswith("Observed progress")
+    assert answer_training(runs, min_runs=2, min_extra_wins=4).startswith("Observed progress")
     runs[1] = run("train/weak__s2", None)
-    assert train_answer(runs, min_runs=2, min_extra_wins=4) == (
+    assert answer_training(runs, min_runs=2, min_extra_wins=4) == (
         "Pending: no final-versus-start result yet for train/weak__s2."
     )
 
@@ -195,7 +195,7 @@ def test_a_session_saved_before_the_progress_threshold_stays_readable(
     assert "waiting    train/weak__b-s1" in capsys.readouterr().out
     assert analyze(tmp_path)["train"]["train"]["answer"].startswith("Unavailable")
     plan = parse_plan(old_text)
-    assert setting_problems(plan, plan.jobs) == ["[[train]] train: progress_min_extra_wins is required"]
+    assert check_required_settings(plan, plan.jobs) == ["[[train]] train: progress_min_extra_wins is required"]
 
 
 @pytest.mark.parametrize(("final", "reason"), [
@@ -214,11 +214,11 @@ def test_progress_refuses_diagnoses_that_did_not_play_the_same_clean_games(
         (tmp_path / "diagnoses" / name).mkdir(parents=True)
         (tmp_path / "diagnoses" / name / "report.json").write_text(json.dumps(report))
 
-    progress = train_progress(tmp_path, job)
+    progress = measure_training_progress(tmp_path, job)
 
     assert progress["extra_wins"] is None and reason in progress["invalid"]
     run = {"job": job.id, "done": True, "opponent": "weak", "training_rose": True, "progress": progress}
-    assert train_answer([run], min_runs=1, min_extra_wins=1).startswith("Invalid evidence")
+    assert answer_training([run], min_runs=1, min_extra_wins=1).startswith("Invalid evidence")
 
 
 def test_bot_results_compare_and_answer_as_worked_out_by_hand(tmp_path: Path) -> None:
@@ -245,4 +245,4 @@ def test_bot_results_compare_and_answer_as_worked_out_by_hand(tmp_path: Path) ->
     assert compare["answer"].startswith("The learner's moves are an obstacle.")
     assert analysis["dial"][0]["win_rates"] == [0.25, 0.0]
     assert analysis["dial"][0]["answer"].startswith("Usable")
-    assert "| normal | 8/8 | 2 | 25.0% |" in markdown(analysis)
+    assert "| normal | 8/8 | 2 | 25.0% |" in render_markdown(analysis)

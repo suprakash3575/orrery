@@ -219,7 +219,7 @@ class Plan:
     answers: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
 
-def specs_of(jobs: Sequence[Job]) -> list[str]:
+def unique_specs(jobs: Sequence[Job]) -> list[str]:
     """Every agent spec or lineup the jobs play, once each, in order.
 
     Preflight sends this list to Go to check each spelling. A spec used by
@@ -237,7 +237,7 @@ def specs_of(jobs: Sequence[Job]) -> list[str]:
     return found
 
 
-def checkpoint_count(job: Job) -> int:
+def saved_checkpoint_count(job: Job) -> int:
     """How many checkpoints a train job saves: one every N updates, plus the
     last update when it isn't a multiple of N.
 
@@ -284,28 +284,28 @@ def parse_plan(text: str) -> Plan:
 
     # Step 2: expand each section into its jobs, in file order, and keep the
     # settings each answer needs.
-    session = _session(_table(raw, "session", "the file"))
+    session = _read_session(_read_table(raw, "session", "the file"))
     jobs: list[Job] = []
     answers: dict[str, Mapping[str, Any]] = {}
     for table in raw.get("botcheck", []):
-        jobs.extend(_botcheck_jobs(table))
+        jobs.extend(_expand_botcheck(table))
     for table in raw.get("diagnose", []):
-        jobs.extend(_diagnose_jobs(table))
+        jobs.extend(_expand_diagnose(table))
         if "band" in table:
-            answers[table["name"]] = _band(table)
+            answers[table["name"]] = _read_band(table)
     for table in raw.get("train", []):
-        jobs.extend(_train_jobs(table))
+        jobs.extend(_expand_train(table))
         answers[table["name"]] = {
-            "progress_min_runs": _int(table, "progress_min_runs", "[[train]]", default=2),
+            "progress_min_runs": _read_int(table, "progress_min_runs", "[[train]]", default=2),
             # How many more wins than its starting checkpoint a run's final
             # checkpoint needs to count as progress. A fair threshold
             # depends on how many games a diagnosis plays, so each file
             # states its own. Reading accepts it missing (as None), because
             # status and the analysis also read sessions saved before the
             # setting existed; preflight still refuses a new run without it
-            # (setting_problems).
+            # (check_required_settings).
             "progress_min_extra_wins": (
-                _int(table, "progress_min_extra_wins", "[[train]]")
+                _read_int(table, "progress_min_extra_wins", "[[train]]")
                 if "progress_min_extra_wins" in table else None
             ),
         }
@@ -334,23 +334,23 @@ def parse_plan(text: str) -> Plan:
     # Step 4: [[compare]] and [[dial]] name bot jobs by id; check each one
     # exists now, rather than finding out in the analysis after the session.
     bot_ids = {job.id for job in jobs if job.kind == "botcheck"}
-    compares = tuple(_compare(table, bot_ids) for table in raw.get("compare", []))
-    dials = tuple(_dial(table, bot_ids) for table in raw.get("dial", []))
+    compares = tuple(_read_compare(table, bot_ids) for table in raw.get("compare", []))
+    dials = tuple(_read_dial(table, bot_ids) for table in raw.get("dial", []))
     return Plan(session, tuple(jobs), compares, dials, answers)
 
 
-def _session(table: Mapping[str, Any]) -> Session:
+def _read_session(table: Mapping[str, Any]) -> Session:
     """Read and check the [session] table."""
 
     where = "[session]"
-    maps = _table(table, "maps", where)
+    maps = _read_table(table, "maps", where)
     session = Session(
-        name=_label(table, "name", where),
-        map_start=_int(maps, "start", f"{where} maps"),
-        map_count=_int(maps, "count", f"{where} maps"),
-        device=_choice(table, "device", where, ("cuda", "cpu")),
-        cpu_workers=_int(table, "cpu_workers", where),
-        gomaxprocs=_int(table, "gomaxprocs", where, default=12),
+        name=_read_label(table, "name", where),
+        map_start=_read_int(maps, "start", f"{where} maps"),
+        map_count=_read_int(maps, "count", f"{where} maps"),
+        device=_read_choice(table, "device", where, ("cuda", "cpu")),
+        cpu_workers=_read_int(table, "cpu_workers", where),
+        gomaxprocs=_read_int(table, "gomaxprocs", where, default=12),
     )
     # Zero maps or zero threads would run nothing, or hang; refuse them.
     for name in ("map_count", "cpu_workers", "gomaxprocs"):
@@ -359,7 +359,7 @@ def _session(table: Mapping[str, Any]) -> Session:
     return session
 
 
-def _botcheck_jobs(table: Mapping[str, Any]) -> list[Job]:
+def _expand_botcheck(table: Mapping[str, Any]) -> list[Job]:
     """One job per tester, each against the same opponent.
 
     Example: testers ``normal`` and ``aim`` in an experiment named ``bots``
@@ -367,13 +367,13 @@ def _botcheck_jobs(table: Mapping[str, Any]) -> list[Job]:
     """
 
     where = "[[botcheck]]"
-    name = _label(table, "name", where)
-    opponent = _string(table, "opponent", where)
-    testers = _named_specs(table, "testers", where)
+    name = _read_label(table, "name", where)
+    opponent = _read_string(table, "opponent", where)
+    testers = _read_named_specs(table, "testers", where)
     # check_decode lists the tester labels whose launches are checked against
     # the learner's decoder (opponentcheck -check-decode). A label that isn't
     # a tester is a typo, and the check would silently not run.
-    check_decode = _strings(table, "check_decode", where, default=[])
+    check_decode = _read_strings(table, "check_decode", where, default=[])
     unknown = sorted(set(check_decode) - set(testers))
     if unknown:
         raise PlanError(f"{where} {name}: check_decode names testers it doesn't have: {unknown}")
@@ -385,7 +385,7 @@ def _botcheck_jobs(table: Mapping[str, Any]) -> list[Job]:
     ]
 
 
-def _diagnose_jobs(table: Mapping[str, Any]) -> list[Job]:
+def _expand_diagnose(table: Mapping[str, Any]) -> list[Job]:
     """One job per (opponent, run, update), named after all three.
 
     Example: opponent label ``v2-eps0.5``, run folder
@@ -397,10 +397,10 @@ def _diagnose_jobs(table: Mapping[str, Any]) -> list[Job]:
     """
 
     where = "[[diagnose]]"
-    name = _label(table, "name", where)
-    run_dirs = _strings(table, "run_dirs", where)
-    updates = _ints(table, "updates", where)
-    opponents = _named_specs(table, "opponents", where)
+    name = _read_label(table, "name", where)
+    run_dirs = _read_strings(table, "run_dirs", where)
+    updates = _read_ints(table, "updates", where)
+    opponents = _read_named_specs(table, "opponents", where)
     # Three nested loops: every opponent with every run with every update.
     return [
         Job(name, "diagnose", f"{label}__{Path(run_dir).name}__u{update:06d}", {
@@ -412,7 +412,7 @@ def _diagnose_jobs(table: Mapping[str, Any]) -> list[Job]:
     ]
 
 
-def _train_jobs(table: Mapping[str, Any]) -> list[Job]:
+def _expand_train(table: Mapping[str, Any]) -> list[Job]:
     """One job per (training opponent, starting checkpoint).
 
     A starting checkpoint is named after its run: ``runs/x/checkpoints/u.pt``
@@ -423,15 +423,15 @@ def _train_jobs(table: Mapping[str, Any]) -> list[Job]:
     """
 
     where = "[[train]]"
-    name = _label(table, "name", where)
-    starts = _strings(table, "init_from", where)
-    opponents = _named_specs(table, "training_opponents", where)
-    against = _named_specs(table, "diagnose_against", where)
+    name = _read_label(table, "name", where)
+    starts = _read_strings(table, "init_from", where)
+    opponents = _read_named_specs(table, "training_opponents", where)
+    against = _read_named_specs(table, "diagnose_against", where)
     # Settings every run of this section shares.
     common = {
-        "base_config": _string(table, "base_config", where),
-        "max_updates": _int(table, "max_updates", where),
-        "checkpoint_every_updates": _int(table, "checkpoint_every_updates", where),
+        "base_config": _read_string(table, "base_config", where),
+        "max_updates": _read_int(table, "max_updates", where),
+        "checkpoint_every_updates": _read_int(table, "checkpoint_every_updates", where),
         "diagnose_against": against,
     }
     if common["max_updates"] < 1 or common["checkpoint_every_updates"] < 1:
@@ -445,7 +445,7 @@ def _train_jobs(table: Mapping[str, Any]) -> list[Job]:
     ]
 
 
-def _compare(table: Mapping[str, Any], bot_ids: set[str]) -> Mapping[str, Any]:
+def _read_compare(table: Mapping[str, Any], bot_ids: set[str]) -> Mapping[str, Any]:
     """Read one [[compare]]: candidate minus baseline, both bot job ids.
 
     ``rule``, when present, names the answer the analysis gives for this
@@ -454,9 +454,9 @@ def _compare(table: Mapping[str, Any], bot_ids: set[str]) -> Mapping[str, Any]:
 
     where = "[[compare]]"
     compare = {
-        "baseline": _string(table, "baseline", where),
-        "candidate": _string(table, "candidate", where),
-        "question": _string(table, "question", where),
+        "baseline": _read_string(table, "baseline", where),
+        "candidate": _read_string(table, "candidate", where),
+        "question": _read_string(table, "question", where),
         "rule": table.get("rule"),
     }
     for key in ("baseline", "candidate"):
@@ -467,7 +467,7 @@ def _compare(table: Mapping[str, Any], bot_ids: set[str]) -> Mapping[str, Any]:
     return compare
 
 
-def _dial(table: Mapping[str, Any], bot_ids: set[str]) -> Mapping[str, Any]:
+def _read_dial(table: Mapping[str, Any], bot_ids: set[str]) -> Mapping[str, Any]:
     """Read one [[dial]]: bot jobs in the order their win rate should fall.
 
     A "dial" is a setting meant to make a bot weaker step by step, like
@@ -476,14 +476,14 @@ def _dial(table: Mapping[str, Any], bot_ids: set[str]) -> Mapping[str, Any]:
     """
 
     where = "[[dial]]"
-    dial = {"name": _label(table, "name", where), "order": _strings(table, "order", where)}
+    dial = {"name": _read_label(table, "name", where), "order": _read_strings(table, "order", where)}
     unknown = [job_id for job_id in dial["order"] if job_id not in bot_ids]
     if unknown or len(dial["order"]) < 2:
         raise PlanError(f"{where} {dial['name']}: order needs at least two bot jobs; unknown: {unknown}")
     return dial
 
 
-def _band(table: Mapping[str, Any]) -> Mapping[str, Any]:
+def _read_band(table: Mapping[str, Any]) -> Mapping[str, Any]:
     """Read a [[diagnose]]'s band: the win-rate range an answer looks for.
 
     Example: band [0.10, 0.40] with band_min_runs 2 means "found" when at
@@ -500,7 +500,7 @@ def _band(table: Mapping[str, Any]) -> Mapping[str, Any]:
         or not 0 <= band[0] < band[1] <= 1
     ):
         raise PlanError(f"{where}: band must be [low, high] with 0 <= low < high <= 1")
-    return {"band": [float(band[0]), float(band[1])], "band_min_runs": _int(table, "band_min_runs", where, default=2)}
+    return {"band": [float(band[0]), float(band[1])], "band_min_runs": _read_int(table, "band_min_runs", where, default=2)}
 
 
 # Small readers that name the field and section in every error. Each takes
@@ -509,7 +509,7 @@ def _band(table: Mapping[str, Any]) -> Mapping[str, Any]:
 # Example error: "[[botcheck]] opponent must be a non-empty string".
 
 
-def _table(raw: Mapping[str, Any], key: str, where: str) -> Mapping[str, Any]:
+def _read_table(raw: Mapping[str, Any], key: str, where: str) -> Mapping[str, Any]:
     """A sub-table, such as [session] or maps = { ... }."""
 
     value = raw.get(key)
@@ -518,7 +518,7 @@ def _table(raw: Mapping[str, Any], key: str, where: str) -> Mapping[str, Any]:
     return value
 
 
-def _string(raw: Mapping[str, Any], key: str, where: str) -> str:
+def _read_string(raw: Mapping[str, Any], key: str, where: str) -> str:
     """Text that isn't empty or only spaces."""
 
     value = raw.get(key)
@@ -527,16 +527,16 @@ def _string(raw: Mapping[str, Any], key: str, where: str) -> str:
     return value
 
 
-def _label(raw: Mapping[str, Any], key: str, where: str) -> str:
+def _read_label(raw: Mapping[str, Any], key: str, where: str) -> str:
     """Text that is safe as a folder name (see LABEL_PATTERN)."""
 
-    value = _string(raw, key, where)
+    value = _read_string(raw, key, where)
     if not LABEL_PATTERN.match(value):
         raise PlanError(f"{where} {key} {value!r} must use only letters, digits, '.', '_' and '-'")
     return value
 
 
-def _int(raw: Mapping[str, Any], key: str, where: str, default: int | None = None) -> int:
+def _read_int(raw: Mapping[str, Any], key: str, where: str, default: int | None = None) -> int:
     """A whole number. With no default, the field is required."""
 
     value = raw.get(key, default)
@@ -547,7 +547,7 @@ def _int(raw: Mapping[str, Any], key: str, where: str, default: int | None = Non
     return value
 
 
-def _choice(raw: Mapping[str, Any], key: str, where: str, choices: Sequence[str]) -> str:
+def _read_choice(raw: Mapping[str, Any], key: str, where: str, choices: Sequence[str]) -> str:
     """One of a few fixed words, such as "cuda" or "cpu"."""
 
     value = raw.get(key)
@@ -556,7 +556,7 @@ def _choice(raw: Mapping[str, Any], key: str, where: str, choices: Sequence[str]
     return value
 
 
-def _strings(raw: Mapping[str, Any], key: str, where: str, default: list[str] | None = None) -> list[str]:
+def _read_strings(raw: Mapping[str, Any], key: str, where: str, default: list[str] | None = None) -> list[str]:
     """A list of non-empty texts. With no default it is required and must
     not be empty; with a default (such as []) it may be left out."""
 
@@ -568,7 +568,7 @@ def _strings(raw: Mapping[str, Any], key: str, where: str, default: list[str] | 
     return value
 
 
-def _ints(raw: Mapping[str, Any], key: str, where: str) -> list[int]:
+def _read_ints(raw: Mapping[str, Any], key: str, where: str) -> list[int]:
     """A required, non-empty list of whole numbers."""
 
     value = raw.get(key)
@@ -579,7 +579,7 @@ def _ints(raw: Mapping[str, Any], key: str, where: str) -> list[int]:
     return value
 
 
-def _named_specs(raw: Mapping[str, Any], key: str, where: str) -> dict[str, str]:
+def _read_named_specs(raw: Mapping[str, Any], key: str, where: str) -> dict[str, str]:
     """A table of ``label = "spec"``. The label names the job's folder, so a
     long spec never has to be one.
 
@@ -612,7 +612,7 @@ def _named_specs(raw: Mapping[str, Any], key: str, where: str) -> dict[str, str]
 # ---------------------------------------------------------------------------
 
 
-def repository_path(path: str) -> Path:
+def resolve_repository_path(path: str) -> Path:
     """A path from the experiment file, which is written from the repository root.
 
     Example: "configs/rl-v2-4p.toml" becomes <repository>/configs/rl-v2-4p.toml,
@@ -623,7 +623,7 @@ def repository_path(path: str) -> Path:
     return candidate if candidate.is_absolute() else REPOSITORY_ROOT / candidate
 
 
-def checkpoint_file(run_dir: str, update: int) -> str:
+def relative_checkpoint_path(run_dir: str, update: int) -> str:
     """The checkpoint for one update, as a path from the repository root, the
     way the experiment file writes paths. Example: update 153 of runs/x is
     runs/x/checkpoints/update-000153.pt."""
@@ -631,13 +631,13 @@ def checkpoint_file(run_dir: str, update: int) -> str:
     return (Path(run_dir) / "checkpoints" / f"update-{update:06d}.pt").as_posix()
 
 
-def checkpoint_path(run_dir: str, update: int) -> Path:
+def full_checkpoint_path(run_dir: str, update: int) -> Path:
     """Where training saved the checkpoint for one update, as a full path."""
 
-    return repository_path(checkpoint_file(run_dir, update))
+    return resolve_repository_path(relative_checkpoint_path(run_dir, update))
 
 
-def start_run(init_from: str) -> str:
+def starting_run_dir(init_from: str) -> str:
     """The folder of the run that saved a starting checkpoint, as a path from
     the repository root. Example: runs/x/checkpoints/update-000153.pt gives
     runs/x. Diagnosing the checkpoint needs files from that folder."""
@@ -645,7 +645,7 @@ def start_run(init_from: str) -> str:
     return Path(init_from).parent.parent.as_posix()
 
 
-def diagnosis_inputs(run_dir: str, checkpoint: str) -> list[str]:
+def files_read_by_diagnosis(run_dir: str, checkpoint: str) -> list[str]:
     """Every file that diagnosing one checkpoint reads, as paths from the
     repository root.
 
@@ -669,14 +669,14 @@ def diagnosis_inputs(run_dir: str, checkpoint: str) -> list[str]:
     ]
 
 
-def missing_files(names: Sequence[str]) -> list[str]:
+def find_missing_files(names: Sequence[str]) -> list[str]:
     """The files in ``names`` that don't exist. Each name is a path from the
     repository root, such as runs/x/manifest.json."""
 
-    return [name for name in names if not repository_path(name).is_file()]
+    return [name for name in names if not resolve_repository_path(name).is_file()]
 
 
-def training_config(job: Job, session: Session) -> dict[str, Any]:
+def build_training_config(job: Job, session: Session) -> dict[str, Any]:
     """The full training config a train job runs: its base config with this
     job's opponent, checkpoint cadence and the session's device.
 
@@ -685,7 +685,7 @@ def training_config(job: Job, session: Session) -> dict[str, Any]:
     config.toml, so exactly what trained is kept with its results.
     """
 
-    with repository_path(job.settings["base_config"]).open("rb") as source:
+    with resolve_repository_path(job.settings["base_config"]).open("rb") as source:
         config = tomllib.load(source)
     config.update(
         training_opponent=job.settings["training_opponent"],
@@ -714,7 +714,7 @@ def build_go_tools(bin_dir: Path, runner: Callable[..., Any] = subprocess.run) -
     return tool
 
 
-def canonical_problems(specs: Sequence[str], tool: Path,
+def check_specs_canonical(specs: Sequence[str], tool: Path,
                        runner: Callable[..., Any] = subprocess.run) -> list[str]:
     """Ask Go for each spec's canonical form; list every spec that differs.
 
@@ -745,12 +745,12 @@ def canonical_problems(specs: Sequence[str], tool: Path,
     ]
 
 
-def file_problems(plan: Plan, jobs: Sequence[Job]) -> list[str]:
+def check_input_files(plan: Plan, jobs: Sequence[Job]) -> list[str]:
     """Every missing input file, and every train config that won't load.
 
     A diagnose job needs every file that diagnosing its checkpoint reads.
     A train job needs the same files for its starting checkpoint, because
-    it diagnoses that first (see diagnosis_inputs). Each job's missing
+    it diagnoses that first (see files_read_by_diagnosis). Each job's missing
     files are listed together on one line.
     Each train job's config is built and checked by the same code training
     uses (run_config_from_mapping), so a bad setting is found now, not when
@@ -761,26 +761,26 @@ def file_problems(plan: Plan, jobs: Sequence[Job]) -> list[str]:
     for job in jobs:
         if job.kind == "diagnose":
             run_dir = job.settings["run_dir"]
-            missing = missing_files(diagnosis_inputs(run_dir, checkpoint_file(run_dir, job.settings["update"])))
+            missing = find_missing_files(files_read_by_diagnosis(run_dir, relative_checkpoint_path(run_dir, job.settings["update"])))
             if missing:
                 problems.append(f"{job.id}: these files do not exist: {', '.join(missing)}")
         elif job.kind == "train":
             start = job.settings["init_from"]
-            missing = missing_files(diagnosis_inputs(start_run(start), start))
+            missing = find_missing_files(files_read_by_diagnosis(starting_run_dir(start), start))
             if missing:
                 problems.append(f"{job.id}: these files of its starting checkpoint do not exist: {', '.join(missing)}")
-            base = repository_path(job.settings["base_config"])
+            base = resolve_repository_path(job.settings["base_config"])
             if not base.is_file():
                 problems.append(f"{job.id}: base config {base} does not exist")
                 continue
             try:
-                run_config_from_mapping(training_config(job, plan.session))
+                run_config_from_mapping(build_training_config(job, plan.session))
             except (TypeError, ValueError) as error:
                 problems.append(f"{job.id}: training config is invalid: {error}")
     return problems
 
 
-def describe(plan: Plan, jobs: Sequence[Job]) -> list[str]:
+def summarize_plan(plan: Plan, jobs: Sequence[Job]) -> list[str]:
     """What the run will do, in a few lines: jobs, games and updates.
 
     Every job plays each map from all 4 seats, so a job plays
@@ -800,7 +800,7 @@ def describe(plan: Plan, jobs: Sequence[Job]) -> list[str]:
             updates = sum(job.settings["max_updates"] for job in group)
             # Each saved checkpoint, plus the starting one, is diagnosed
             # against each diagnose_against opponent.
-            diagnoses = sum((checkpoint_count(job) + 1) * len(job.settings["diagnose_against"]) for job in group)
+            diagnoses = sum((saved_checkpoint_count(job) + 1) * len(job.settings["diagnose_against"]) for job in group)
             lines.append(f"  {experiment} (train): {len(group)} runs, {updates} updates, "
                          f"{diagnoses} diagnoses (start and checkpoints), {diagnoses * games_per_job} games")
         else:
@@ -808,7 +808,7 @@ def describe(plan: Plan, jobs: Sequence[Job]) -> list[str]:
     return lines
 
 
-def setting_problems(plan: Plan, jobs: Sequence[Job]) -> list[str]:
+def check_required_settings(plan: Plan, jobs: Sequence[Job]) -> list[str]:
     """Settings a new run must have, even though reading the file lets them
     be missing.
 
@@ -826,7 +826,7 @@ def setting_problems(plan: Plan, jobs: Sequence[Job]) -> list[str]:
     ]
 
 
-def preflight(plan: Plan, jobs: Sequence[Job], bin_dir: Path) -> tuple[list[str], Path | None]:
+def check_plan_and_build_tools(plan: Plan, jobs: Sequence[Job], bin_dir: Path) -> tuple[list[str], Path | None]:
     """Run every check. Returns the problems found and opponentcheck's path.
 
     The order matters only for speed: file checks need nothing built; the
@@ -834,12 +834,12 @@ def preflight(plan: Plan, jobs: Sequence[Job], bin_dir: Path) -> tuple[list[str]
     fails there is no tool to check specs with, so that check is skipped.
     """
 
-    problems = setting_problems(plan, jobs) + file_problems(plan, jobs)
+    problems = check_required_settings(plan, jobs) + check_input_files(plan, jobs)
     try:
         tool = build_go_tools(bin_dir)
     except PlanError as error:
         return [*problems, str(error)], None
-    problems += canonical_problems(specs_of(jobs), tool)
+    problems += check_specs_canonical(unique_specs(jobs), tool)
     return problems, tool
 
 
@@ -851,7 +851,7 @@ def preflight(plan: Plan, jobs: Sequence[Job], bin_dir: Path) -> tuple[list[str]
 # ---------------------------------------------------------------------------
 
 
-def now() -> str:
+def utc_timestamp() -> str:
     """The current time in UTC, to the second, as text. Example:
     "2026-11-26T02:33:02+00:00". UTC keeps times comparable between a
     laptop and a cloud machine in another time zone."""
@@ -859,7 +859,7 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def write_json(path: Path, value: Any) -> None:
+def write_json_atomically(path: Path, value: Any) -> None:
     """Write JSON to a temporary file, then rename it into place, so a reader
     never sees half a file.
 
@@ -876,7 +876,7 @@ def write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
-def toml_text(values: Mapping[str, Any]) -> str:
+def format_toml(values: Mapping[str, Any]) -> str:
     """A flat TOML table for a training config: strings, numbers, booleans and
     lists of them. Strings are written as JSON strings, which TOML reads the
     same way.
@@ -924,7 +924,7 @@ class Runner:
         # The opponentcheck binary built by preflight.
         self.tool = tool
 
-    def command(self, arguments: Sequence[str], log: Path, *, cwd: Path, gomaxprocs: int) -> int:
+    def run_command(self, arguments: Sequence[str], log: Path, *, cwd: Path, gomaxprocs: int) -> int:
         """Run one command, appending its output to the job's log.
 
         Returns the command's exit code: 0 means it succeeded, anything else
@@ -974,34 +974,34 @@ class Runner:
         if (folder / "done.json").exists():
             return "done"
         if folder.exists():
-            set_aside(folder)
+            set_aside_unfinished_folder(folder)
         # Stage 2: a fresh folder, and job.json first, so even a job that
         # dies at once says what it was trying to run. monotonic() is a clock
         # that only moves forward, so the duration is right even if the
         # computer's clock is changed during the job.
         folder.mkdir(parents=True)
         started = time.monotonic()
-        record = {"job": job.id, "kind": job.kind, "settings": dict(job.settings), "started": now()}
-        write_json(folder / "job.json", record)
+        record = {"job": job.id, "kind": job.kind, "settings": dict(job.settings), "started": utc_timestamp()}
+        write_json_atomically(folder / "job.json", record)
         log = folder / "log.txt"
         # Stage 3: run the commands. Any error is caught and recorded, so one
         # broken job can't stop the jobs after it. KeyboardInterrupt (Ctrl-C)
         # is not an Exception in Python, so it isn't caught here: it passes
         # straight up to run_session, before anything below is written.
         try:
-            failed = self._run(job, folder, log)
+            failed = self._run_job_commands(job, folder, log)
         except Exception as error:  # recorded, so one broken job can't stop the session
             failed = f"{type(error).__name__}: {error}"
-        record.update(finished=now(), seconds=round(time.monotonic() - started, 1))
+        record.update(finished=utc_timestamp(), seconds=round(time.monotonic() - started, 1))
         # Stage 4: record the outcome. done.json is written last of all, so
         # its presence promises everything before it finished.
         if failed:
-            write_json(folder / "failed.json", {**record, "error": failed, "log": "log.txt"})
+            write_json_atomically(folder / "failed.json", {**record, "error": failed, "log": "log.txt"})
             return "failed"
-        write_json(folder / "done.json", record)
+        write_json_atomically(folder / "done.json", record)
         return "done"
 
-    def _run(self, job: Job, folder: Path, log: Path) -> str | None:
+    def _run_job_commands(self, job: Job, folder: Path, log: Path) -> str | None:
         """Run a job's commands; return why it failed, or None if it succeeded."""
 
         session = self.plan.session
@@ -1019,14 +1019,14 @@ class Runner:
             if job.settings["check_decode"]:
                 # Inserted before the last two items, "-out" and its folder.
                 arguments.insert(-2, "-check-decode")
-            code = self.command(arguments, log, cwd=REPOSITORY_ROOT, gomaxprocs=session.cpu_workers)
+            code = self.run_command(arguments, log, cwd=REPOSITORY_ROOT, gomaxprocs=session.cpu_workers)
             return None if code == 0 else f"opponentcheck exited with {code}"
 
         # A diagnose job: one checkpoint plays the session's maps against
         # one opponent.
         if job.kind == "diagnose":
-            run_dir = repository_path(job.settings["run_dir"])
-            return self._diagnose(run_dir, checkpoint_path(job.settings["run_dir"], job.settings["update"]),
+            run_dir = resolve_repository_path(job.settings["run_dir"])
+            return self._run_diagnosis(run_dir, full_checkpoint_path(job.settings["run_dir"], job.settings["update"]),
                                   job.settings["opponent"], folder / "diagnosis", maps, log)
 
         # A train job, part 1: diagnose the starting checkpoint against every
@@ -1034,9 +1034,9 @@ class Runner:
         # checkpoint with this, so both play the same maps, seats and
         # opponent with the same code. It runs before training, so the
         # baseline exists even if training then fails.
-        start = repository_path(start_run(job.settings["init_from"]))
+        start = resolve_repository_path(starting_run_dir(job.settings["init_from"]))
         for label, spec in job.settings["diagnose_against"].items():
-            failed = self._diagnose(start, repository_path(job.settings["init_from"]), spec,
+            failed = self._run_diagnosis(start, resolve_repository_path(job.settings["init_from"]), spec,
                                     folder / "diagnoses" / f"start__{label}", maps, log)
             if failed:
                 return failed
@@ -1044,13 +1044,13 @@ class Runner:
         # Part 2: write the job's own full config, train, then diagnose every
         # checkpoint the run saved against every diagnose_against opponent.
         config = folder / "config.toml"
-        config.write_text(toml_text(training_config(job, session)))
+        config.write_text(format_toml(build_training_config(job, session)))
         run_dir = folder / "run"
         # sys.executable is the Python running this script, so training uses
         # the same Python and installed packages.
-        code = self.command([
+        code = self.run_command([
             sys.executable, "-m", "orrery.train", "--config", str(config), "--run-dir", str(run_dir),
-            "--init-from", str(repository_path(job.settings["init_from"])),
+            "--init-from", str(resolve_repository_path(job.settings["init_from"])),
             "--max-updates", str(job.settings["max_updates"]),
         ], log, cwd=PYTHON_ROOT, gomaxprocs=session.gomaxprocs)
         if code != 0:
@@ -1063,13 +1063,13 @@ class Runner:
             return "training saved no checkpoint"
         for checkpoint in checkpoints:
             for label, spec in job.settings["diagnose_against"].items():
-                failed = self._diagnose(run_dir, checkpoint, spec,
+                failed = self._run_diagnosis(run_dir, checkpoint, spec,
                                         folder / "diagnoses" / f"{checkpoint.stem}__{label}", maps, log)
                 if failed:
                     return failed
         return None
 
-    def _diagnose(self, run_dir: Path, checkpoint: Path, opponent: str, out: Path,
+    def _run_diagnosis(self, run_dir: Path, checkpoint: Path, opponent: str, out: Path,
                   maps: list[str], log: Path) -> str | None:
         """Run diagnose.py on one checkpoint; return why it failed, or None.
 
@@ -1077,7 +1077,7 @@ class Runner:
         and the charts would need the optional plotting packages.
         """
 
-        code = self.command([
+        code = self.run_command([
             sys.executable, "-m", "scripts.diagnose", "--run-dir", str(run_dir), "--checkpoint", str(checkpoint),
             "--opponent", opponent, *maps, "--device", self.plan.session.device, "--no-charts",
             "--out", str(out),
@@ -1085,7 +1085,7 @@ class Runner:
         return None if code == 0 else f"diagnose of {checkpoint.name} against {opponent} exited with {code}"
 
 
-def set_aside(folder: Path) -> Path:
+def set_aside_unfinished_folder(folder: Path) -> Path:
     """Rename an unfinished job folder to ``<name>.partial-<n>``, the first
     unused n, so its files are kept for inspection but never mixed with the
     rerun's.
@@ -1107,7 +1107,7 @@ def set_aside(folder: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def job_state(out: Path, job: Job) -> str:
+def read_job_state(out: Path, job: Job) -> str:
     """done, failed, unfinished (a folder without a result: running now, or
     interrupted), or waiting (not started).
 
@@ -1123,7 +1123,7 @@ def job_state(out: Path, job: Job) -> str:
     return "unfinished" if folder.exists() else "waiting"
 
 
-def command_output(arguments: Sequence[str]) -> str | None:
+def read_command_output(arguments: Sequence[str]) -> str | None:
     """What a command prints, run from the repository root, or None if it
     can't run or fails (no git on the machine, say). Example:
     ["go", "version"] gives "go version go1.24.1 linux/amd64"."""
@@ -1135,7 +1135,7 @@ def command_output(arguments: Sequence[str]) -> str | None:
     return result.stdout.strip()
 
 
-def versions() -> dict[str, Any]:
+def record_versions() -> dict[str, Any]:
     """The code and tools a session ran with, for replay.
 
     git_dirty is True when tracked files have changes not yet committed:
@@ -1143,11 +1143,11 @@ def versions() -> dict[str, Any]:
     can't be found (no git, say) is recorded as None, never guessed.
     """
 
-    dirty = command_output(["git", "status", "--porcelain", "--untracked-files=no"])
+    dirty = read_command_output(["git", "status", "--porcelain", "--untracked-files=no"])
     return {
-        "git_commit": command_output(["git", "rev-parse", "HEAD"]),
+        "git_commit": read_command_output(["git", "rev-parse", "HEAD"]),
         "git_dirty": bool(dirty) if dirty is not None else None,
-        "go": command_output(["go", "version"]),
+        "go": read_command_output(["go", "version"]),
         "python": platform.python_version(),
     }
 
@@ -1175,7 +1175,7 @@ RELEASE_FILE = "cmd/env/release.go"
 GO_SKIPPED = {"runs", "python"}
 
 
-def file_sha256(path: Path) -> str | None:
+def hash_file(path: Path) -> str | None:
     """The SHA-256 hash of a file's bytes, or None when there is no file."""
 
     if not path.is_file():
@@ -1186,7 +1186,7 @@ def file_sha256(path: Path) -> str | None:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def source_files(root: Path = REPOSITORY_ROOT) -> list[Path]:
+def find_runtime_source_files(root: Path = REPOSITORY_ROOT) -> list[Path]:
     """The runtime source: every file whose content decides what a job does.
 
     That is the Go code without its tests, the Go module files, the Python
@@ -1213,7 +1213,7 @@ def source_files(root: Path = REPOSITORY_ROOT) -> list[Path]:
     return sorted(kept, key=lambda path: path.relative_to(root).as_posix())
 
 
-def package_version(name: str) -> str | None:
+def installed_package_version(name: str) -> str | None:
     """An installed Python package's version, without importing it. Example:
     "torch" gives "2.5.1+cu124"; None when it isn't installed."""
 
@@ -1223,7 +1223,7 @@ def package_version(name: str) -> str | None:
         return None
 
 
-def code_fingerprint(root: Path = REPOSITORY_ROOT) -> dict[str, str | None]:
+def fingerprint_code(root: Path = REPOSITORY_ROOT) -> dict[str, str | None]:
     """The code a session runs: one hash of the runtime source, plus the
     versions of the tools that run it.
 
@@ -1234,25 +1234,25 @@ def code_fingerprint(root: Path = REPOSITORY_ROOT) -> dict[str, str | None]:
     """
 
     digest = hashlib.sha256()
-    for path in source_files(root):
+    for path in find_runtime_source_files(root):
         # "\0" ends each file's name and "\n" ends its hash, so two
         # different lists of files can never give the same text to hash.
-        digest.update(f"{path.relative_to(root).as_posix()}\0{file_sha256(path)}\n".encode())
+        digest.update(f"{path.relative_to(root).as_posix()}\0{hash_file(path)}\n".encode())
     return {
         "source_sha256": digest.hexdigest(),
-        "go": command_output(["go", "version"]),
+        "go": read_command_output(["go", "version"]),
         "python": platform.python_version(),
-        "torch": package_version("torch"),
-        "numpy": package_version("numpy"),
+        "torch": installed_package_version("torch"),
+        "numpy": installed_package_version("numpy"),
     }
 
 
-def input_files(jobs: Sequence[Job]) -> list[str]:
+def list_input_files(jobs: Sequence[Job]) -> list[str]:
     """Every file the jobs read, as paths from the repository root, each
     once and sorted.
 
     A diagnose job reads the files that diagnosing its checkpoint needs
-    (see diagnosis_inputs, the same list preflight checks). A train job
+    (see files_read_by_diagnosis, the same list preflight checks). A train job
     reads the same files for its starting checkpoint, which it diagnoses
     first, plus its base config. Its own settings are in the experiment
     file's text, which a resume already compares. A bot job reads no files:
@@ -1263,15 +1263,15 @@ def input_files(jobs: Sequence[Job]) -> list[str]:
     for job in jobs:
         if job.kind == "diagnose":
             run_dir = job.settings["run_dir"]
-            found.update(diagnosis_inputs(run_dir, checkpoint_file(run_dir, job.settings["update"])))
+            found.update(files_read_by_diagnosis(run_dir, relative_checkpoint_path(run_dir, job.settings["update"])))
         elif job.kind == "train":
             start = job.settings["init_from"]
-            found.update(diagnosis_inputs(start_run(start), start))
+            found.update(files_read_by_diagnosis(starting_run_dir(start), start))
             found.add(job.settings["base_config"])
     return sorted(found)
 
 
-def session_fingerprint(plan: Plan) -> dict[str, Any]:
+def fingerprint_session(plan: Plan) -> dict[str, Any]:
     """The whole plan's fingerprint: its code and every input file.
 
     It covers every job in the file, not only the ones a run's --only picks:
@@ -1280,12 +1280,12 @@ def session_fingerprint(plan: Plan) -> dict[str, Any]:
     """
 
     return {
-        "code": code_fingerprint(),
-        "inputs": {name: file_sha256(repository_path(name)) for name in input_files(plan.jobs)},
+        "code": fingerprint_code(),
+        "inputs": {name: hash_file(resolve_repository_path(name)) for name in list_input_files(plan.jobs)},
     }
 
 
-def fingerprint_changes(saved: Mapping[str, Any] | None, current: Mapping[str, Any]) -> list[str]:
+def compare_fingerprints(saved: Mapping[str, Any] | None, current: Mapping[str, Any]) -> list[str]:
     """How the current fingerprint differs from the one a session saved; an
     empty list when they match.
 
@@ -1348,9 +1348,9 @@ def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
     # the finished jobs ran. This is checked before preflight, so a refused
     # resume changes nothing in the session folder (preflight rebuilds the
     # Go tools in it).
-    fingerprint = session_fingerprint(plan)
+    fingerprint = fingerprint_session(plan)
     if record:
-        changes = fingerprint_changes(record.get("fingerprint"), fingerprint)
+        changes = compare_fingerprints(record.get("fingerprint"), fingerprint)
         if changes:
             print(f"{out} holds a session made with different code or inputs; use a new --out:")
             for change in changes:
@@ -1358,8 +1358,8 @@ def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
             return 2
 
     # Stage 3: preflight, with the Go tools built into the session folder.
-    problems, tool = preflight(plan, jobs, out / "bin")
-    for line in describe(plan, jobs):
+    problems, tool = check_plan_and_build_tools(plan, jobs, out / "bin")
+    for line in summarize_plan(plan, jobs):
         print(line)
     if problems:
         print("preflight found problems; nothing was run:")
@@ -1376,17 +1376,17 @@ def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
     record.setdefault("experiment_file", str(experiment))
     record.setdefault("experiment_text", text)
     record.setdefault("fingerprint", fingerprint)
-    record.setdefault("runs", []).append({"started": now(), "only": only, **versions()})
+    record.setdefault("runs", []).append({"started": utc_timestamp(), "only": only, **record_versions()})
 
     def save(job: Job | None = None, state: str | None = None) -> None:
         """Set one job's state (if given) and write session.json."""
 
         if job is not None:
             record.setdefault("jobs", {})[job.id] = state
-        write_json(session_file, record)
+        write_json_atomically(session_file, record)
 
     for job in jobs:
-        record.setdefault("jobs", {})[job.id] = job_state(out, job)
+        record.setdefault("jobs", {})[job.id] = read_job_state(out, job)
     save()
 
     # Stage 5: run the jobs, one at a time, skipping any already done (from
@@ -1395,7 +1395,7 @@ def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
     runner = Runner(plan, out, tool)
     try:
         for number, job in enumerate(jobs, start=1):
-            if job_state(out, job) == "done":
+            if read_job_state(out, job) == "done":
                 continue
             print(f"[{number}/{len(jobs)}] start {job.id}", flush=True)
             save(job, "running")
@@ -1404,19 +1404,19 @@ def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
             print(f"[{number}/{len(jobs)}] {state} {job.id}", flush=True)
     except KeyboardInterrupt:
         # Ctrl-C: the running command has already been stopped (see
-        # Runner.command) and its job left without a result. Record every
+        # Runner.run_command) and its job left without a result. Record every
         # job's state and stop; the same command resumes later.
         print("interrupted: run the same command again to resume", flush=True)
         for job in jobs:
-            record["jobs"][job.id] = job_state(out, job)
-        record["runs"][-1]["finished"] = now()
+            record["jobs"][job.id] = read_job_state(out, job)
+        record["runs"][-1]["finished"] = utc_timestamp()
         save()
         return 1
 
     # Stage 6: every job's final state, read from its folder, and a summary.
     for job in jobs:
-        record["jobs"][job.id] = job_state(out, job)
-    record["runs"][-1]["finished"] = now()
+        record["jobs"][job.id] = read_job_state(out, job)
+    record["runs"][-1]["finished"] = utc_timestamp()
     save()
     failed = [job.id for job in jobs if record["jobs"][job.id] != "done"]
     print(f"session {plan.session.name}: {len(jobs) - len(failed)} of {len(jobs)} jobs done; results in {out}")
@@ -1440,7 +1440,7 @@ def print_status(out: Path) -> int:
     plan = parse_plan(json.loads(session_file.read_text())["experiment_text"])
     counts: dict[str, int] = {}
     for job in plan.jobs:
-        state = job_state(out, job)
+        state = read_job_state(out, job)
         counts[state] = counts.get(state, 0) + 1
         # {state:10} pads the state to 10 characters, so the ids line up.
         print(f"{state:10} {job.id}")
@@ -1458,8 +1458,8 @@ def run_preflight(experiment: Path, only: str | None = None) -> int:
     plan = load_plan(experiment)
     jobs = [job for job in plan.jobs if only is None or job.experiment == only]
     with tempfile.TemporaryDirectory() as scratch:
-        problems, _tool = preflight(plan, jobs, Path(scratch))
-    for line in describe(plan, jobs):
+        problems, _tool = check_plan_and_build_tools(plan, jobs, Path(scratch))
+    for line in summarize_plan(plan, jobs):
         print(line)
     for problem in problems:
         print(f"- {problem}")

@@ -11,11 +11,11 @@ from scripts import run_experiments
 from scripts.run_experiments import (
     PlanError,
     Runner,
-    canonical_problems,
-    file_problems,
+    check_input_files,
+    check_specs_canonical,
     parse_plan,
     run_order,
-    specs_of,
+    unique_specs,
 )
 
 V2 = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
@@ -87,7 +87,7 @@ def test_a_small_file_expands_into_one_job_per_combination() -> None:
     assert [job.kind for job in ordered] == ["botcheck"] * 2 + ["diagnose"] * 4 + ["train"] * 2
     assert [job.id for job in ordered][:2] == ["bots/weak", "bots/normal"]
     assert plan.jobs[1].settings == {"tester": WEAK, "opponent": V2, "check_decode": True}
-    assert specs_of(plan.jobs) == [V2, WEAK]
+    assert unique_specs(plan.jobs) == [V2, WEAK]
     with pytest.raises(PlanError, match="not a bot job"):
         parse_plan(SMALL.replace('candidate = "bots/weak"', 'candidate = "bots/missing"'))
     # A progress threshold of 0 would count a run that did no better than
@@ -103,7 +103,7 @@ def test_preflight_refuses_a_missing_checkpoint_and_a_non_canonical_spec() -> No
     answers -canonical as Go would: parameters in alphabetical order."""
 
     plan = parse_plan(SMALL)
-    missing = file_problems(plan, [job for job in plan.jobs if job.kind == "diagnose"])
+    missing = check_input_files(plan, [job for job in plan.jobs if job.kind == "diagnose"])
     assert len(missing) == 4
     # Every file diagnosing the checkpoint reads is checked, the two files
     # beside the checkpoint and its run's files included.
@@ -118,7 +118,7 @@ def test_preflight_refuses_a_missing_checkpoint_and_a_non_canonical_spec() -> No
         return SimpleNamespace(returncode=0, stdout="\n".join(forms) + "\n", stderr="")
 
     misspelled = "heuristic-v2:margin=0.1,candidates=4,enemy_bonus=1"
-    problems = canonical_problems([V2, misspelled], Path("opponentcheck"), runner=fake_opponentcheck)
+    problems = check_specs_canonical([V2, misspelled], Path("opponentcheck"), runner=fake_opponentcheck)
     assert problems == [f"spec is not canonical: {misspelled!r}\n    write it as: {V2!r}"]
 
 
@@ -131,7 +131,7 @@ def test_a_rerun_skips_finished_jobs_and_sets_aside_unfinished_folders(
     plan = parse_plan(SMALL)
     normal, weak = plan.jobs[0], plan.jobs[1]
     ran = []
-    monkeypatch.setattr(Runner, "_run", lambda self, job, folder, log: ran.append(job.id))
+    monkeypatch.setattr(Runner, "_run_job_commands", lambda self, job, folder, log: ran.append(job.id))
     runner = Runner(plan, tmp_path, Path("opponentcheck"))
 
     finished = tmp_path / "bots" / "normal"
@@ -147,7 +147,7 @@ def test_a_rerun_skips_finished_jobs_and_sets_aside_unfinished_folders(
     assert ran == ["bots/weak"]
     assert (tmp_path / "bots" / "weak.partial-1" / "log.txt").read_text() == "half a run"
     assert (tmp_path / "bots" / "weak" / "done.json").exists()
-    assert run_experiments.job_state(tmp_path, weak) == "done"
+    assert run_experiments.read_job_state(tmp_path, weak) == "done"
 
 
 def test_a_resume_refuses_a_checkpoint_changed_at_the_same_path(
@@ -187,9 +187,9 @@ v2 = "{V2}"
     out = tmp_path / "session"
     # Only the inputs change in this test, so the code part is held fixed,
     # and no job really runs: each one just succeeds.
-    monkeypatch.setattr(run_experiments, "code_fingerprint", lambda: {"source_sha256": "same"})
-    monkeypatch.setattr(run_experiments, "preflight", lambda plan, jobs, bin_dir: ([], Path("opponentcheck")))
-    monkeypatch.setattr(Runner, "_run", lambda self, job, folder, log: None)
+    monkeypatch.setattr(run_experiments, "fingerprint_code", lambda: {"source_sha256": "same"})
+    monkeypatch.setattr(run_experiments, "check_plan_and_build_tools", lambda plan, jobs, bin_dir: ([], Path("opponentcheck")))
+    monkeypatch.setattr(Runner, "_run_job_commands", lambda self, job, folder, log: None)
     assert run_experiments.run_session(experiment, out, only="probe") == 0
     session_before = (out / "session.json").read_text()
     done_before = (out / "probe" / "v2__b-s1__u000030" / "done.json").read_text()
@@ -199,7 +199,7 @@ v2 = "{V2}"
     def preflight_must_not_run(*_arguments):
         raise AssertionError("preflight ran on a refused resume")
 
-    monkeypatch.setattr(run_experiments, "preflight", preflight_must_not_run)
+    monkeypatch.setattr(run_experiments, "check_plan_and_build_tools", preflight_must_not_run)
     assert run_experiments.run_session(experiment, out, only="bots") == 2
     assert f"input {checkpoint.as_posix()} changed" in capsys.readouterr().out
     assert (out / "session.json").read_text() == session_before
