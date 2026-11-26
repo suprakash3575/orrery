@@ -223,6 +223,35 @@ played no part in choosing it, start further in with
 `DIAG_ARGS="--seed-start 1005000"`. The maps must stay inside the
 validation seeds, never training maps or the protected test pools.
 
+### Experiment sessions
+
+An experiment file in `experiments/` lists a whole session: bot-only games
+(`[[botcheck]]`), diagnoses of trained models (`[[diagnose]]`), and training
+runs whose checkpoints are then diagnosed (`[[train]]`). Each table of
+choices expands into one job per combination, each with its own folder.
+`experiments/stage1.toml` is stage 1's session. Two small copies check it
+works: `stage1-smoke.toml` on a laptop, and `stage1-smoke-gpu.toml`, which
+adds a training job, first on the GPU machine. A laptop CPU can't run the
+training smoke: every rl-v2 update is full size (512 games × 64 turns).
+
+```bash
+make exp-preflight EXP=experiments/stage1.toml              # check and count, run nothing
+make exp-smoke                                               # bots, probe, analysis; CPU, under a minute
+make exp-smoke-gpu                                           # every job type, training included; GPU
+make exp-run EXP=experiments/stage1.toml EXP_OUT=runs/stage1-<date>
+make exp-status EXP_OUT=runs/stage1-<date>                   # done, failed, unfinished, waiting
+make exp-analyze EXP_OUT=runs/stage1-<date>                  # analysis.md and analysis.json
+```
+
+Preflight refuses a missing checkpoint or an agent spec not written in
+canonical form, before anything runs. Jobs then run one at a time, bot
+jobs first (they take minutes, so their answers arrive early), then
+diagnose and train jobs. Each job writes `done.json` last. Running the same `exp-run` again
+skips finished jobs and renames any unfinished folder to
+`<name>.partial-<n>` before rerunning it; nothing is deleted. A failed job is
+recorded and the others carry on. `EXP_ONLY=<name>` runs one experiment, and
+`make botcheck BOT_ARGS="..."` runs `opponentcheck` by hand.
+
 The final held-out test of an archived checkpoint is a one-time step, because
 each pool of test maps may be used only once:
 

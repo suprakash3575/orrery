@@ -22,8 +22,17 @@ DIAG_ARGS ?=
 # unless DIAG_OUT names one.
 DIAG_RUN ?=
 DIAG_OUT ?= runs/diagnosis-$(shell date +%Y%m%d-%H%M%S)
+# Experiment sessions (run_experiments.py). EXP is the experiment file and
+# EXP_OUT the session folder; running the same exp-run again resumes it.
+# EXP_ONLY limits a run or preflight to one experiment by name.
+EXP ?=
+EXP_OUT ?=
+EXP_ONLY ?=
+EXP_SMOKE_OUT ?= runs/stage1-smoke-$(shell date +%Y%m%d-%H%M%S)
+EXP_SMOKE_GPU_OUT ?= runs/stage1-smoke-gpu-$(shell date +%Y%m%d-%H%M%S)
+BOT_ARGS ?=
 
-.PHONY: help sim arena arena-help arena-linux env smoke train train-4p random-baseline diagnose control-center python-test format-check build vet test race check
+.PHONY: help sim arena arena-help arena-linux env smoke train train-4p random-baseline diagnose control-center exp-preflight exp-smoke exp-smoke-gpu exp-run exp-status exp-analyze botcheck python-test format-check build vet test race check
 
 help:
 	@printf '%s\n' \
@@ -40,6 +49,15 @@ help:
 		'  random-baseline Run the 100-game random-controller acceptance baseline' \
 		'  diagnose      Chart an rl-v2 run and play its latest checkpoint (DIAG_RUN=run DIAG_ARGS="--seeds 25")' \
 		'  control-center Browse runs and reports; launch training and evaluations' \
+		'' \
+		'Run experiment sessions:' \
+		'  exp-preflight Check an experiment file and count its work; run nothing (EXP=file [EXP_ONLY=name])' \
+		'  exp-smoke     Run bot, probe and analysis jobs on 2 maps on the CPU (no training)' \
+		'  exp-smoke-gpu Run every job type, training included, on 2 maps and 2 updates (Vast.ai)' \
+		'  exp-run       Run or resume a session (EXP=file EXP_OUT=folder [EXP_ONLY=name])' \
+		'  exp-status    Show each job: done, failed, unfinished or waiting (EXP_OUT=folder)' \
+		'  exp-analyze   Write analysis.md and analysis.json into a session (EXP_OUT=folder)' \
+		'  botcheck      Run opponentcheck by hand with any flags (BOT_ARGS="...")' \
 		'' \
 		'Package Orrery:' \
 		'  arena-linux   Build a static linux/amd64 arena binary into .build/linux-amd64/' \
@@ -101,6 +119,38 @@ diagnose:
 
 control-center:
 	cd python && $(UV) run --group analysis python -m scripts.control_center
+
+# The experiment targets resolve EXP and EXP_OUT from the repository root with
+# abspath before moving into python/, as diagnose does. The runner sets each
+# job's own GOMAXPROCS, so none is passed here.
+exp-preflight:
+	@test -n "$(EXP)" || { printf '%s\n' 'exp-preflight needs EXP=<experiment file>' >&2; exit 2; }
+	cd python && $(UV) run python -m scripts.run_experiments preflight $(abspath $(EXP)) $(if $(EXP_ONLY),--only $(EXP_ONLY))
+
+# exp-smoke has no training job: an rl-v2 update is always full size, too
+# slow for a laptop CPU. exp-smoke-gpu adds it, for the first step on Vast.ai.
+exp-smoke:
+	cd python && $(UV) run python -m scripts.run_experiments run $(abspath experiments/stage1-smoke.toml) --out $(abspath $(EXP_SMOKE_OUT))
+	cd python && $(UV) run python -m scripts.analyze_experiments $(abspath $(EXP_SMOKE_OUT))
+
+exp-smoke-gpu:
+	cd python && $(UV) run python -m scripts.run_experiments run $(abspath experiments/stage1-smoke-gpu.toml) --out $(abspath $(EXP_SMOKE_GPU_OUT))
+	cd python && $(UV) run python -m scripts.analyze_experiments $(abspath $(EXP_SMOKE_GPU_OUT))
+
+exp-run:
+	@test -n "$(EXP)" -a -n "$(EXP_OUT)" || { printf '%s\n' 'exp-run needs EXP=<experiment file> EXP_OUT=<session folder>' >&2; exit 2; }
+	cd python && $(UV) run python -m scripts.run_experiments run $(abspath $(EXP)) --out $(abspath $(EXP_OUT)) $(if $(EXP_ONLY),--only $(EXP_ONLY))
+
+exp-status:
+	@test -n "$(EXP_OUT)" || { printf '%s\n' 'exp-status needs EXP_OUT=<session folder>' >&2; exit 2; }
+	cd python && $(UV) run python -m scripts.run_experiments status $(abspath $(EXP_OUT))
+
+exp-analyze:
+	@test -n "$(EXP_OUT)" || { printf '%s\n' 'exp-analyze needs EXP_OUT=<session folder>' >&2; exit 2; }
+	cd python && $(UV) run python -m scripts.analyze_experiments $(abspath $(EXP_OUT))
+
+botcheck:
+	$(GO) run ./cmd/opponentcheck $(BOT_ARGS)
 
 python-test:
 	cd python && $(UV) run pytest

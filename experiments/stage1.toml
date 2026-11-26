@@ -1,0 +1,153 @@
+# Stage 1: the whole Vast.ai session (docs/stage1-implementation-spec.md,
+# section 6). Run it with:
+#
+#   make exp-preflight EXP=experiments/stage1.toml
+#   make exp-run EXP=experiments/stage1.toml EXP_OUT=runs/stage1-<date>
+#
+# Every agent spec is written in Go's canonical form (print one with
+# `go run ./cmd/opponentcheck -canonical '<spec>'`); preflight refuses any
+# other spelling. Paths are written from the repository root. A label with a
+# dot is quoted ("eps-0.5"), because TOML reads a bare eps-0.5 as a nested
+# key.
+
+[session]
+name = "stage1"
+# Each map is played from all 4 seats: 400 games per job.
+maps = { start = 1000000, count = 100 }
+device = "cuda"
+# Bot games at once, and their Go threads. Leave the rest of the CPUs to the
+# training and diagnosis environment, which uses `gomaxprocs` threads.
+cpu_workers = 24
+gomaxprocs = 12
+
+# Experiment 1: is the learner losing because of the moves it's allowed to
+# make? Each tester plays three normal v2 bots. Only the tester changes.
+[[botcheck]]
+name = "restricted-bot"
+opponent = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+check_decode = ["all-three-full", "all-three-capture"]
+
+[botcheck.testers]
+normal = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+ships-full-cost = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1,whole_garrison=1"
+ships-capture-cost = "heuristic-v2:candidates=4,enemy_bonus=1,garrison_cost=needed,margin=0.1,whole_garrison=1"
+ships-no-defenders = "heuristic-v2:candidates=4,enemy_bonus=1,garrison_cost=needed,margin=0.1,reserve=ignore,whole_garrison=1"
+aim = "heuristic-v2:candidates=4,enemy_bonus=1,learner_aim=1,margin=0.1"
+ships-aim = "heuristic-v2:candidates=4,enemy_bonus=1,garrison_cost=needed,learner_aim=1,margin=0.1,whole_garrison=1"
+all-three-full = "heuristic-v2:candidates=4,enemy_bonus=1,learner_aim=1,margin=0.1,no_aim_check=1,whole_garrison=1"
+all-three-capture = "heuristic-v2:candidates=4,enemy_bonus=1,garrison_cost=needed,learner_aim=1,margin=0.1,no_aim_check=1,whole_garrison=1"
+
+# Experiment 2: does epsilon weaken v2 smoothly? Its baseline (epsilon 0) is
+# experiment 1's normal tester; see the dial below.
+[[botcheck]]
+name = "epsilon-scale"
+opponent = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+
+[botcheck.testers]
+"eps-0.25" = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.25,margin=0.1"
+"eps-0.5" = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.5,margin=0.1"
+"eps-0.75" = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.75,margin=0.1"
+"eps-0.5-always-launch" ="heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.5,epsilon_launch_probability=1,margin=0.1"
+
+# Experiment 3: is there an opponent B wins 10-40% against? B's three
+# update-153 models play each lineup. The answer looks for a lineup inside
+# `band` for at least `band_min_runs` of the three models.
+[[diagnose]]
+name = "probe"
+run_dirs = [
+    "runs/vast-experiment/exp-b-4p-s1501",
+    "runs/vast-experiment/exp-b-4p-s1502",
+    "runs/vast-experiment/exp-b-4p-s1503",
+]
+updates = [153]
+band = [0.10, 0.40]
+band_min_runs = 2
+
+[diagnose.opponents]
+"v2-eps0.5" = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.5,margin=0.1"
+"v2-eps0.75" = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.75,margin=0.1"
+"v2-eps0.25-rr" ="heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.25,margin=0.1|random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2|random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2"
+v2-whole-capture-rr = "heuristic-v2:candidates=4,enemy_bonus=1,garrison_cost=needed,margin=0.1,whole_garrison=1|random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2|random-v1:launch_probability=0.3,max_fraction=0.8,min_fraction=0.2"
+
+# Experiment 4: can training against a weakened v2 move the 0%? Each run
+# starts from one of B's update-153 models. The starting model is diagnosed
+# against full v2 first, then every saved checkpoint is. The answer is
+# "observed progress" when the final checkpoint wins at least
+# `progress_min_extra_wins` more games than its starting model, on the same
+# maps and seats, in at least `progress_min_runs` runs of one training
+# opponent.
+[[train]]
+name = "train-weakened"
+base_config = "configs/rl-v2-4p.toml"
+init_from = [
+    "runs/vast-experiment/exp-b-4p-s1501/checkpoints/update-000153.pt",
+    "runs/vast-experiment/exp-b-4p-s1502/checkpoints/update-000153.pt",
+    "runs/vast-experiment/exp-b-4p-s1503/checkpoints/update-000153.pt",
+]
+max_updates = 153
+checkpoint_every_updates = 30
+progress_min_runs = 2
+progress_min_extra_wins = 4
+# The diagnose_against label progress is measured against: full v2.
+progress_against = "v2"
+
+[train.training_opponents]
+"v2-eps0.75" = "heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.75,margin=0.1"
+"v2-eps0.5" ="heuristic-v2:candidates=4,enemy_bonus=1,epsilon=0.5,margin=0.1"
+
+[train.diagnose_against]
+v2 = "heuristic-v2:candidates=4,enemy_bonus=1,margin=0.1"
+
+# What the analysis subtracts for experiment 1 (candidate minus baseline,
+# map by map). `rule = "restricted-bot"` marks the main result.
+[[compare]]
+question = "What does sending every ship cost?"
+baseline = "restricted-bot/normal"
+candidate = "restricted-bot/ships-full-cost"
+
+[[compare]]
+question = "The same, without the scoring penalty"
+baseline = "restricted-bot/normal"
+candidate = "restricted-bot/ships-capture-cost"
+
+[[compare]]
+question = "Does holding back to defend help?"
+baseline = "restricted-bot/ships-capture-cost"
+candidate = "restricted-bot/ships-no-defenders"
+
+[[compare]]
+question = "What does the learner's aiming cost on its own?"
+baseline = "restricted-bot/normal"
+candidate = "restricted-bot/aim"
+
+[[compare]]
+question = "What does the aiming cost once ships are limited?"
+baseline = "restricted-bot/ships-capture-cost"
+candidate = "restricted-bot/ships-aim"
+
+[[compare]]
+question = "What does deciding before aiming cost?"
+baseline = "restricted-bot/ships-aim"
+candidate = "restricted-bot/all-three-capture"
+
+[[compare]]
+question = "How much does the scoring rule alone matter?"
+baseline = "restricted-bot/all-three-capture"
+candidate = "restricted-bot/all-three-full"
+
+[[compare]]
+question = "How much strength does the fully limited bot keep?"
+baseline = "restricted-bot/normal"
+candidate = "restricted-bot/all-three-capture"
+rule = "restricted-bot"
+
+# Experiment 2's answer: the dial is usable if the win rate falls at every
+# step of this order.
+[[dial]]
+name = "epsilon"
+order = [
+    "restricted-bot/normal",
+    "epsilon-scale/eps-0.25",
+    "epsilon-scale/eps-0.5",
+    "epsilon-scale/eps-0.75",
+]
