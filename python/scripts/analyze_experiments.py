@@ -2,10 +2,22 @@
 """Analyse a finished (or partly finished) experiment session.
 
 It reads a session folder written by run_experiments.py and writes
-``analysis.md`` and ``analysis.json`` into it: each experiment's tables and,
-where the experiment file asks for one, its answer, by the rules in
-docs/stage1-implementation-spec.md section 6. It never plays games, and it can
-be rerun at any time; it rewrites only those two files.
+``analysis.md`` (for people) and ``analysis.json`` (for programs) into it:
+each experiment's tables and, where the experiment file asks for one, its
+answer, by the rules written out next to each answer function below. It
+never plays games, and it can be rerun at any time; it rewrites only those
+two files.
+
+Words used throughout this file:
+
+- **Win rate**: wins ÷ games. A win means finishing strictly first, so in a
+  four-player game an equal player wins about 25% of the time.
+- **Points**: a difference between two win rates, in percentage points.
+  Example: 30% minus 25% is +5 points (not +20%).
+- **Map**: one generated board, named by its seed. Every job plays each map
+  from all 4 seats, so 100 maps give 400 games.
+- **95% range**: how far a difference might move if other maps had been
+  played. It comes from a bootstrap (see compare_jobs).
 
 What it reports, by section of the experiment file:
 
@@ -43,36 +55,60 @@ import numpy as np
 from scripts.compare_diagnoses import DEFAULT_RESAMPLES, bootstrap_range
 from scripts.run_experiments import Job, Plan, job_state, parse_plan
 
-# Experiment 1's thresholds, in win-rate points (0.05 = 5 points). See
-# docs/stage1-implementation-spec.md, experiment 1, "Comparing with the issue".
+# Experiment 1's thresholds, as win-rate differences (a difference of -0.03
+# would be -3 points):
+# the fully limited bot "keeps its strength" if its whole 95% range is above
+# KEPT_ABOVE, and "loses strength" if it is at most LOST_AT_MOST behind with
+# the whole range below 0. See restricted_bot_answer.
 KEPT_ABOVE = -0.05
 LOST_AT_MOST = -0.10
-# A fixed seed makes the 95% ranges the same on every rerun.
+# The bootstrap draws random samples. Starting its random numbers from a
+# fixed seed makes it draw the same samples every time, so rerunning the
+# analysis gives exactly the same 95% ranges.
 BOOTSTRAP_SEED = 0
 # Training's win rate is compared over this many updates at each end of a run
-# to decide whether it rose.
+# to decide whether it rose. Averaging several updates smooths out one lucky
+# or unlucky update.
 TREND_UPDATES = 10
 
 
 def percent(value: float | None) -> str:
+    """A share as a percentage with one decimal: 0.125 → "12.5%". None means
+    nothing was counted, written as "undefined" rather than a misleading 0%."""
+
     return "undefined" if value is None else f"{100 * value:.1f}%"
 
 
 def points(value: float | None) -> str:
+    """A win-rate difference in percentage points, always with its sign:
+    -0.125 → "-12.5 pts", 0.05 → "+5.0 pts"."""
+
     return "undefined" if value is None else f"{100 * value:+.1f} pts"
 
 
 def job_folder(out: Path, job: Job) -> Path:
+    """A job's folder in the session folder: <out>/<experiment>/<label>."""
+
     return out / job.experiment / job.label
 
 
 # ---------------------------------------------------------------------------
 # Reading each kind of job's results.
+#
+# Each job kind leaves its results in the files its command writes:
+#   bot job       <job>/opponentcheck/games.jsonl and summary.json
+#   diagnose job  <job>/diagnosis/report.json
+#   train job     <job>/run/metrics.csv and <job>/diagnoses/<checkpoint>__<label>/report.json
 # ---------------------------------------------------------------------------
 
 
 def bot_games(out: Path, job: Job) -> list[dict[str, Any]]:
-    """The completed games of a bot job, one row per (map seed, seat)."""
+    """The completed games of a bot job, one row per (map seed, seat).
+
+    games.jsonl holds one JSON object per line, one per game. ``result`` is
+    the tester's reward: 1 a win, 0 a tie for first, -1 a loss. Failed or
+    cancelled games are left out: they have no result to count.
+    """
 
     path = job_folder(out, job) / "opponentcheck" / "games.jsonl"
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
@@ -80,10 +116,19 @@ def bot_games(out: Path, job: Job) -> list[dict[str, Any]]:
 
 
 def bot_summary(out: Path, job: Job) -> dict[str, Any]:
-    """One bot job's row: results, counts and calibration."""
+    """One bot job's row: results, counts and calibration.
+
+    Most numbers come straight from opponentcheck's summary.json. The aim
+    counts are there only for a heuristic-v2 tester; .get() gives None for
+    any other, which the table shows as "undefined".
+    """
 
     summary = json.loads((job_folder(out, job) / "opponentcheck" / "summary.json").read_text())
     tester = summary["testers"][0]
+    # Calibration runs only when the tester is the opponent itself (the
+    # "normal" tester): all four seats then play one game, so moving the
+    # "tested" label between seats must not change it. Zero seeds checked
+    # means it didn't apply to this tester.
     calibration = summary["calibration"]
     if not calibration["seeds"]:
         calibration_text = "not run"
@@ -97,12 +142,15 @@ def bot_summary(out: Path, job: Job) -> dict[str, Any]:
     return {
         "tester": job.label,
         "spec": job.settings["tester"],
+        # False if any game failed or was cancelled: such a run gives no
+        # trustworthy answer.
         "complete": summary["run"]["status"] == "complete",
         "completed": tester["completed"],
         "planned": tester["planned"],
         "wins": tester["wins"],
         "win_rate": tester["win_rate"] if tester["completed"] else None,
         "eliminated": tester["eliminated"],
+        # The middle game length: half the games ended sooner, half later.
         "median_finish_turn": tester["length_p50"],
         "aim_failure_rate": tester.get("aim_failure_rate"),
         "fallback_rate": tester.get("fallback_rate"),
@@ -117,12 +165,19 @@ def bot_summary(out: Path, job: Job) -> dict[str, Any]:
 
 
 def diagnosis_win_rate(report_path: Path) -> float:
+    """A diagnosis's win rate, from its report.json: wins ÷ games."""
+
     games = json.loads(report_path.read_text())["games"]["measurements"]
     return games["wins"] / games["games"]
 
 
 def training_win_rates(metrics_path: Path) -> list[tuple[int, int, int]]:
-    """(update, wins, games) for every update in a run's metrics.csv."""
+    """(update, wins, games) for every update in a run's metrics.csv.
+
+    metrics.csv has one row per training update; its wins, losses and draws
+    count the training games that finished during that update. Example row:
+    update 5 with 3 wins, 9 losses and 0 draws gives (5, 3, 12).
+    """
 
     with metrics_path.open(newline="") as handle:
         return [
@@ -146,27 +201,47 @@ def compare_jobs(baseline: Sequence[Mapping[str, Any]], candidate: Sequence[Mapp
 
     Example: on one map the baseline wins 1 of 4 seats (0.25) and the
     candidate 0 of 4 (0.0), so that map's difference is -0.25.
+
+    How the 95% range works (a "bootstrap"): pretend the maps played are all
+    the maps there are, and draw a new set of the same size from them at
+    random, allowing repeats. With 3 maps whose differences are -0.25, 0 and
+    0, one draw might be (-0.25, -0.25, 0), mean -0.17, another (0, 0, 0),
+    mean 0. After many draws, the middle 95% of those means is the range. A
+    narrow range means the answer barely depends on which maps were played.
+
+    Returns the number of maps compared, both win rates, their difference,
+    the range (None with fewer than 2 maps), and "strength kept": the
+    candidate's win rate as a share of the baseline's (None if the baseline
+    never won, since dividing by 0 means nothing).
     """
 
+    # Each baseline game's outcome by (seed, seat): 1.0 for a win, 0.0 for
+    # anything else, so averaging gives a win rate.
     won = {(row["seed"], row["seat"]): float(row["result"] > 0) for row in baseline}
+    # Pair each candidate game with the baseline game at the same map and
+    # seat, grouped by map. A game only one side completed is left out, so
+    # both sides always describe the same games.
     by_map: dict[int, list[tuple[float, float]]] = {}
     for row in candidate:
         key = (row["seed"], row["seat"])
         if key in won:
             by_map.setdefault(row["seed"], []).append((won[key], float(row["result"] > 0)))
     seeds = sorted(by_map)
+    # Each map's win rate for each side: the average over its paired seats.
     base = np.array([np.mean([pair[0] for pair in by_map[seed]]) for seed in seeds])
     cand = np.array([np.mean([pair[1] for pair in by_map[seed]]) for seed in seeds])
     result: dict[str, Any] = {"maps": len(seeds), "baseline_rate": None, "candidate_rate": None,
                               "difference": None, "range": None, "strength_kept": None}
     if not seeds:
         return result
+    # One difference per map; their average is the overall difference.
     differences = cand - base
     result.update(
         baseline_rate=float(base.mean()),
         candidate_rate=float(cand.mean()),
         difference=float(differences.mean()),
     )
+    # A range needs at least two maps to resample from.
     if len(seeds) >= 2:
         result["range"] = list(bootstrap_range(differences, DEFAULT_RESAMPLES,
                                                np.random.default_rng(BOOTSTRAP_SEED)))
@@ -176,7 +251,26 @@ def compare_jobs(baseline: Sequence[Mapping[str, Any]], candidate: Sequence[Mapp
 
 
 def restricted_bot_answer(compare: Mapping[str, Any], valid: bool, why_invalid: str) -> str:
-    """Experiment 1's answer from the main comparison."""
+    """Experiment 1's answer from the main comparison: the fully limited bot
+    (candidate) minus normal v2 (baseline).
+
+    The question: is the learner losing because of the moves it's allowed to
+    make? The fully limited bot is v2 restricted to the learner's moves, so:
+
+    - Its whole 95% range is above KEPT_ABOVE (it loses at most a little):
+      the learner's moves aren't the obstacle.
+    - It is LOST_AT_MOST behind or worse, and the whole range is below 0
+      (it clearly loses a lot): the learner's moves are an obstacle.
+    - Anything else: unclear; check on fresh maps.
+
+    Example: if LOST_AT_MOST were -10 points, a difference of -12 points
+    with a range of -16 to -8 would be an obstacle: far enough behind, with
+    the whole range below 0.
+
+    The answer is "invalid" instead when the run can't be trusted: a game
+    failed (which includes a decode mismatch, since that fails its game), or
+    the normal tester failed calibration.
+    """
 
     if not valid:
         return f"Invalid: {why_invalid}. Fix the bot or runner first."
@@ -199,8 +293,16 @@ def restricted_bot_answer(compare: Mapping[str, Any], valid: bool, why_invalid: 
 
 
 def analyze(out: Path) -> dict[str, Any]:
-    """Every experiment's tables and answers, as one JSON-ready dict."""
+    """Every experiment's tables and answers, as one JSON-ready dict.
 
+    The stages are: rebuild the plan from session.json; read every finished
+    bot job; then build each section in turn: bot tables, comparisons, dials,
+    diagnose tables, training tables. Only jobs that are done are read; every
+    other job is reported as not done.
+    """
+
+    # Stage 1: the plan, rebuilt from the experiment file's text saved in
+    # session.json (the same text the session ran), and each job's state.
     session = json.loads((out / "session.json").read_text())
     plan: Plan = parse_plan(session["experiment_text"])
     states = {job.id: job_state(out, job) for job in plan.jobs}
@@ -209,6 +311,7 @@ def analyze(out: Path) -> dict[str, Any]:
 
     analysis: dict[str, Any] = {
         "session": plan.session.name,
+        # The maps played, as [first seed, one past the last].
         "maps": [plan.session.map_start, plan.session.map_start + plan.session.map_count],
         "runs": session.get("runs", []),
         "jobs": states,
@@ -219,10 +322,13 @@ def analyze(out: Path) -> dict[str, Any]:
         "train": {},
     }
 
+    # Stage 2: one row per finished bot job, then each [[botcheck]] section's
+    # table, which also lists its jobs that aren't done.
     bot_rows: dict[str, dict[str, Any]] = {}
     for job in plan.jobs:
         if job.kind == "botcheck" and job.id in done:
             bot_rows[job.id] = bot_summary(out, job)
+    # dict.fromkeys lists each experiment name once, in file order.
     for experiment in dict.fromkeys(job.experiment for job in plan.jobs if job.kind == "botcheck"):
         group = [job for job in plan.jobs if job.experiment == experiment]
         analysis["botcheck"][experiment] = {
@@ -230,6 +336,9 @@ def analyze(out: Path) -> dict[str, Any]:
             "not_done": [job.id for job in group if job.id not in bot_rows],
         }
 
+    # Stage 3: each [[compare]]. Both jobs must be done; with rule
+    # "restricted-bot", experiment 1's answer is added, or "invalid" if
+    # either job is incomplete or failed calibration.
     for compare in plan.compares:
         entry: dict[str, Any] = {**compare}
         missing = [job_id for job_id in (compare["baseline"], compare["candidate"]) if job_id not in done]
@@ -246,17 +355,23 @@ def analyze(out: Path) -> dict[str, Any]:
                 entry["answer"] = restricted_bot_answer(entry["result"], not problems, "; ".join(problems))
         analysis["compare"].append(entry)
 
+    # Stage 4: each [[dial]] (experiment 2). The dial is usable if the win
+    # rate falls at every step of its order. Example: 25%, 18%, 9%, 4% is
+    # usable; 25%, 18%, 19%, 4% isn't, because the third step rises.
     for dial in plan.dials:
         rates = [bot_rows[job_id]["win_rate"] if job_id in bot_rows else None for job_id in dial["order"]]
         if any(rate is None for rate in rates):
             answer = "Not ready: some testers aren't done."
         else:
+            # Every step whose rate is not strictly below the one before it.
             rises = [dial["order"][i + 1] for i in range(len(rates) - 1) if not rates[i + 1] < rates[i]]
             answer = ("Usable: the win rate falls at every step." if not rises
                       else f"Not usable as it stands: the win rate doesn't fall at {', '.join(rises)}. "
                            "The epsilon_* settings are the next thing to vary.")
         analysis["dial"].append({**dial, "win_rates": rates, "answer": answer})
 
+    # Stage 5: each [[diagnose]] section (experiment 3): one row per job, and
+    # the band answer when the section sets a band.
     for experiment in dict.fromkeys(job.experiment for job in plan.jobs if job.kind == "diagnose"):
         group = [job for job in plan.jobs if job.experiment == experiment]
         rows = []
@@ -271,6 +386,8 @@ def analyze(out: Path) -> dict[str, Any]:
             section["answer"] = band_answer(rows, options["band"], options["band_min_runs"])
         analysis["diagnose"][experiment] = section
 
+    # Stage 6: each [[train]] section (experiment 4): one entry per run, and
+    # the progress answer.
     for experiment in dict.fromkeys(job.experiment for job in plan.jobs if job.kind == "train"):
         group = [job for job in plan.jobs if job.experiment == experiment]
         runs = [train_run(out, job) if job.id in done else {"job": job.id, "done": False,
@@ -284,7 +401,17 @@ def analyze(out: Path) -> dict[str, Any]:
 
 def band_answer(rows: Sequence[Mapping[str, Any]], band: Sequence[float], min_runs: int) -> str:
     """Experiment 3: an opponent is found if at least min_runs models win
-    inside the band against it."""
+    inside the band against it.
+
+    Training needs an opponent it sometimes beats: never winning teaches
+    nothing about winning, and almost always winning leaves little to learn.
+    The band is that "sometimes".
+
+    Example, band 10%-40% and min_runs 2: three models win 12%, 35% and 50%
+    against one opponent. Two of them are inside the band, so it is found.
+    When none is found, each opponent is said to be "below" or "above" the
+    band (by its models' average), which shows which way to move next time.
+    """
 
     if any(row["win_rate"] is None for row in rows):
         return "Not ready: some diagnoses aren't done."
@@ -293,6 +420,7 @@ def band_answer(rows: Sequence[Mapping[str, Any]], band: Sequence[float], min_ru
     sides = []
     for opponent in dict.fromkeys(row["opponent"] for row in rows):
         rates = [row["win_rate"] for row in rows if row["opponent"] == opponent]
+        # True counts as 1 in a sum, so this counts the models inside the band.
         inside = sum(low <= rate <= high for rate in rates)
         if inside >= min_runs:
             found.append(f"{opponent} ({inside} of {len(rates)} models)")
@@ -306,13 +434,26 @@ def band_answer(rows: Sequence[Mapping[str, Any]], band: Sequence[float], min_ru
 
 def train_run(out: Path, job: Job) -> dict[str, Any]:
     """One train job's checkpoints: training win rate since the previous
-    checkpoint next to each diagnosis win rate, and the training trend."""
+    checkpoint next to each diagnosis win rate, and the training trend.
+
+    The two win rates measure different things, which is why both are shown:
+    the training one is against the (weakened) training opponent, with moves
+    sampled at random from the model's choices; the diagnosis one is against
+    the diagnose_against opponent (full v2), with the model's top move.
+
+    Example: checkpoints at updates 30 and 60. The training win rate at 60
+    counts the training games of updates 31 to 60 together: their total wins
+    ÷ their total games.
+    """
 
     folder = job_folder(out, job)
     history = training_win_rates(folder / "run" / "metrics.csv")
     checkpoints = []
     previous = 0
+    # Checkpoint names are zero-padded (update-000030.pt), so sorting them as
+    # text puts them in update order.
     for path in sorted((folder / "run" / "checkpoints").glob("update-*.pt")):
+        # "update-000030" → 30.
         update = int(path.stem.split("-")[1])
         window = [(wins, games) for u, wins, games in history if previous < u <= update]
         played = sum(games for _wins, games in window)
@@ -327,6 +468,8 @@ def train_run(out: Path, job: Job) -> dict[str, Any]:
         })
         previous = update
     # Rising: the last TREND_UPDATES updates win more often than the first.
+    # A short run uses half its updates at each end instead (so the two ends
+    # never overlap). max(1, ...) only guards against dividing by 0.
     span = min(TREND_UPDATES, len(history) // 2)
     first = sum(w for _u, w, _g in history[:span]) / max(1, sum(g for _u, _w, g in history[:span]))
     last = sum(w for _u, w, _g in history[-span:]) / max(1, sum(g for _u, _w, g in history[-span:]))
@@ -334,6 +477,7 @@ def train_run(out: Path, job: Job) -> dict[str, Any]:
         "job": job.id,
         "done": True,
         "opponent": job.settings["opponent_label"],
+        # The starting run's name, which carries its training seed.
         "start": Path(job.settings["init_from"]).parent.parent.name,
         "checkpoints": checkpoints,
         "first_training_win_rate": first if span else None,
@@ -344,12 +488,28 @@ def train_run(out: Path, job: Job) -> dict[str, Any]:
 
 def train_answer(runs: Sequence[Mapping[str, Any]], min_runs: int) -> str:
     """Experiment 4: progress if, for some training opponent, at least
-    min_runs runs beat the first diagnose_against opponent at any checkpoint."""
+    min_runs runs beat the first diagnose_against opponent at any checkpoint.
+
+    The three answers, checked in this order:
+
+    1. **First real progress**: for one training opponent, at least min_runs
+       runs won some games (above 0%) against the full opponent at some
+       checkpoint. Training on a weakened opponent is then a route forward.
+    2. **Partial**: no such progress, but the training win rate rose in at
+       least min_runs runs: the model improves against the weakened
+       opponent, yet the gap to the full one is still too large.
+    3. **Not working**: neither.
+
+    Example, min_runs 2: three runs against one training opponent reach 0%,
+    1% and 0.5% against full v2 at their best checkpoints. Two are above 0,
+    so the answer is first real progress.
+    """
 
     if not all(run["done"] for run in runs):
         return "Not ready: some runs aren't done."
     for opponent in dict.fromkeys(run["opponent"] for run in runs):
         group = [run for run in runs if run["opponent"] == opponent]
+        # next(iter(...)) takes the first diagnose_against opponent's rate.
         beat = sum(
             any(next(iter(c["diagnosis_win_rates"].values())) > 0 for c in run["checkpoints"]) for run in group
         )
@@ -367,10 +527,19 @@ def train_answer(runs: Sequence[Mapping[str, Any]], min_runs: int) -> str:
 
 # ---------------------------------------------------------------------------
 # Writing analysis.md.
+#
+# The Markdown file shows the same numbers as analysis.json, as tables, in
+# the order: bot tables, comparisons, dials, diagnose tables, training
+# tables. A Markdown table is written as lines like "| a | b |", with a
+# "|---|---|" line under the heading row.
 # ---------------------------------------------------------------------------
 
 
 def markdown(analysis: Mapping[str, Any]) -> str:
+    """analysis.md's text, built from analyze()'s result."""
+
+    # The heading: the maps played, how many jobs are in each state, and the
+    # code that ran.
     lines = [f"# Analysis: {analysis['session']}", ""]
     start, end = analysis["maps"]
     states = list(analysis["jobs"].values())
@@ -381,6 +550,8 @@ def markdown(analysis: Mapping[str, Any]) -> str:
         lines.append(f"Code: `{last.get('git_commit')}`{' (with uncommitted changes)' if last.get('git_dirty') else ''}.")
     lines.append("")
 
+    # One table per [[botcheck]] section, one row per tester. "off" in the
+    # decode column means the check wasn't asked for that tester.
     for experiment, section in analysis["botcheck"].items():
         lines += [f"## {experiment}", "",
                   "| Tester | Games | Wins | Win rate | Eliminated | Median finish | Aim failure rate | "
@@ -396,12 +567,14 @@ def markdown(analysis: Mapping[str, Any]) -> str:
                 f"| {percent(row['fallback_rate'])} | {random_text} | {checked} | {row['calibration']} |")
         for job_id in section["not_done"]:
             lines.append(f"| {job_id.split('/', 1)[1]} | not done | | | | | | | | | |")
+        # The wins of decode-checked testers, by map seed and seat.
         for row in section["testers"]:
             if row["win_games"]:
                 games = ", ".join(f"seed {g['seed']} seat {g['seat']}" for g in row["win_games"])
                 lines.append(f"\n{row['tester']} won: {games}.")
         lines.append("")
 
+    # All comparisons in one table, then each answer under it.
     if analysis["compare"]:
         lines += ["## Comparisons", "",
                   "Candidate minus baseline win rate, map by map; the range is the middle 95% over resampled maps.", "",
@@ -422,17 +595,23 @@ def markdown(analysis: Mapping[str, Any]) -> str:
                 lines += ["", f"**Answer ({entry['question']}):** {entry['answer']}"]
         lines.append("")
 
+    # Each dial: its steps in order with their win rates, then the answer.
     for dial in analysis["dial"]:
         lines += [f"## Dial: {dial['name']}", "", "| Step | Win rate |", "|---|---|"]
         lines += [f"| {job_id} | {percent(rate)} |" for job_id, rate in zip(dial["order"], dial["win_rates"])]
         lines += ["", f"**Answer:** {dial['answer']}", ""]
 
+    # Each [[diagnose]] section as a grid: one row per opponent, one column
+    # per (run, update), so each opponent's results across models sit on one
+    # line.
     for experiment, section in analysis["diagnose"].items():
         runs = list(dict.fromkeys((row["run"], row["update"]) for row in section["rows"]))
         lines += [f"## {experiment}", "",
                   "| Opponent | " + " | ".join(f"{run} u{update}" for run, update in runs) + " |",
                   "|---|" + "---|" * len(runs)]
         for opponent in dict.fromkeys(row["opponent"] for row in section["rows"]):
+            # For each column, the one row with this opponent and that
+            # (run, update).
             cells = [next(percent(r["win_rate"]) for r in section["rows"]
                           if r["opponent"] == opponent and (r["run"], r["update"]) == run) for run in runs]
             lines.append(f"| {opponent} | " + " | ".join(cells) + " |")
@@ -440,6 +619,8 @@ def markdown(analysis: Mapping[str, Any]) -> str:
             lines += ["", f"**Answer:** {section['answer']}"]
         lines.append("")
 
+    # Each [[train]] section: a short line and a checkpoint table per run,
+    # then the section's answer.
     for experiment, section in analysis["train"].items():
         lines += [f"## {experiment}", ""]
         for run in section["runs"]:
@@ -462,6 +643,13 @@ def markdown(analysis: Mapping[str, Any]) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """The command line: one argument, the session folder.
+
+    It can run while a session is still going: finished jobs are analysed
+    and the rest reported as not done. Rerunning it rewrites only
+    analysis.md and analysis.json.
+    """
+
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("out", type=Path, help="session folder written by run_experiments.py")
     arguments = parser.parse_args(argv)
