@@ -213,6 +213,47 @@ func TestVerdictAppliesOnlyToTheAgreedConfiguration(t *testing.T) {
 	})
 }
 
+// TestCalibrationPassesForRandomSelfPlay plays random-v1 against itself, so
+// every seat draws random numbers. Calibration must pass whether the
+// opponent plays itself as the heuristic tester or through -tester-spec: each
+// seat is seeded by its seat, so moving the "tested" label between seats
+// can't change the game.
+func TestCalibrationPassesForRandomSelfPlay(t *testing.T) {
+	tests := []struct {
+		name  string
+		flags []string
+	}{
+		{name: "heuristic tester", flags: []string{"-testers", "heuristic"}},
+		{name: "tester spec", flags: []string{"-tester-spec", defaultRandom}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "out")
+			args := append([]string{"-opponent", defaultRandom, "-seeds", "1", "-workers", "4", "-out", out}, test.flags...)
+			opts, err := parseOptions(args, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if complete, err := run(context.Background(), opts, io.Discard); err != nil || !complete {
+				t.Fatalf("complete = %v, err = %v; want a complete run", complete, err)
+			}
+			var summary struct {
+				Calibration calibration `json:"calibration"`
+			}
+			data, err := os.ReadFile(filepath.Join(out, "summary.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(data, &summary); err != nil {
+				t.Fatal(err)
+			}
+			if c := summary.Calibration; c.Seeds != 1 || !c.Passed {
+				t.Fatalf("calibration = %+v, want 1 seed checked and passed", c)
+			}
+		})
+	}
+}
+
 // TestParseOptionsRefusesConflictingFlags checks that flag combinations that
 // cannot both be honoured are refused before anything runs.
 func TestParseOptionsRefusesConflictingFlags(t *testing.T) {

@@ -46,9 +46,10 @@ type testerSummary struct {
 	GameSeconds float64 `json:"game_seconds"`
 }
 
-// calibration is the exact check on the heuristic tester. heuristic-v1 uses
-// no randomness, so with it in every seat the four seat runs of one seed are
-// the same game; only which seat counts as "tested" differs.
+// calibration is the exact check on the calibration tester: the opponent
+// playing itself. With the same agent in every seat, and each seat seeded by
+// its seat rather than by the "tested" label, the four seat runs of one seed
+// are the same game; only which seat counts as "tested" differs.
 type calibration struct {
 	// Seeds is how many seeds had all four seat runs completed.
 	Seeds int `json:"seeds"`

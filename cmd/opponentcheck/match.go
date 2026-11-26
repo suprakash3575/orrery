@@ -219,7 +219,7 @@ func buildAgents(ctx context.Context, config matchConfig, j job, live *game.Game
 			// finds a role here.
 			role, _ := frame.RoleOf(seat)
 			factory := config.opponents.ForRole(role)
-			contestant := fmt.Sprintf("opponent-seat-%d", seat)
+			contestant := seatContestant(seat)
 			a, err = factory.New(ctx, agent.AgentInit{
 				MatchID: matchID(j), ScenarioSeed: j.seed, ContestantID: contestant, PlayerID: seat,
 				AgentSeed: arena.DeriveAgentSeed(j.seed, contestant, factory.Spec()),
@@ -233,6 +233,13 @@ func buildAgents(ctx context.Context, config matchConfig, j job, live *game.Game
 	return agents, nil
 }
 
+// seatContestant is the contestant ID of the opponent in seat, as mlenv
+// names training opponents. arena.DeriveAgentSeed hashes it, so it fixes that
+// seat's random stream.
+func seatContestant(seat int) string {
+	return fmt.Sprintf("opponent-seat-%d", seat)
+}
+
 // buildTester creates the tested seat's agent for one of the five testers.
 func (config matchConfig) buildTester(ctx context.Context, j job, live *game.Game) (agent.Agent, error) {
 	init := agent.AgentInit{
@@ -244,8 +251,15 @@ func (config matchConfig) buildTester(ctx context.Context, j job, live *game.Gam
 		// heuristic-v1 by default, whatever -opponent names otherwise. run
 		// refuses this tester with a mixed lineup, so every role holds the
 		// same agent and any role's entry is it.
+		//
+		// It is seeded as the opponent in its seat would be, not as
+		// "tested". Calibration needs the four seat runs of a map to be one
+		// game, so each seat must draw the same random stream whichever
+		// seat carries the "tested" label. A seed tied to the label would
+		// give a random opponent (random-v1, or v2 with epsilon) a different
+		// stream in the tested seat, and calibration would fail falsely.
 		opponent := config.opponents.ForRole(mlenv.RoleCW)
-		init.AgentSeed = arena.DeriveAgentSeed(j.seed, init.ContestantID, opponent.Spec())
+		init.AgentSeed = arena.DeriveAgentSeed(j.seed, seatContestant(j.seat), opponent.Spec())
 		return opponent.New(ctx, init)
 	case "idle":
 		return agent.IdleFactory{}.New(ctx, init)
@@ -260,9 +274,14 @@ func (config matchConfig) buildTester(ctx context.Context, j job, live *game.Gam
 		if config.tester == nil {
 			return nil, errors.New("no -tester-spec agent configured")
 		}
-		// Seeded exactly as the heuristic tester is, so a tester spec equal
-		// to the opponent spec plays the same games as the calibration.
-		init.AgentSeed = arena.DeriveAgentSeed(j.seed, init.ContestantID, config.tester.Spec())
+		// A tester that is the opponent spec is the calibration, so it is
+		// seeded by its seat, exactly as the heuristic tester is. Any other
+		// tester spec isn't calibrated and keeps the "tested" seed.
+		contestant := init.ContestantID
+		if config.calibrationTester() == specTester {
+			contestant = seatContestant(j.seat)
+		}
+		init.AgentSeed = arena.DeriveAgentSeed(j.seed, contestant, config.tester.Spec())
 		return config.tester.New(ctx, init)
 	default:
 		return nil, fmt.Errorf("unknown tester %q", j.tester)
@@ -276,9 +295,9 @@ func (config matchConfig) buildTester(ctx context.Context, j job, live *game.Gam
 // counts too: its canonical form is the one spec. Any other tester spec has
 // no calibration: "".
 //
-// The check expects the four seat runs of a seed to be one identical game,
-// which holds only for an agent with no randomness in play, such as
-// heuristic-v1 or heuristic-v2 with epsilon=0.
+// The check expects the four seat runs of a seed to be one identical game.
+// That holds for random agents too, because the calibration tester is seeded
+// by its seat, exactly as the opponent there would be (see buildTester).
 func (config matchConfig) calibrationTester() string {
 	switch {
 	case config.tester == nil:
