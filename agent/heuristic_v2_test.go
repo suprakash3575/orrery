@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"math"
+	"math/rand"
 	"reflect"
 	"testing"
 
@@ -459,6 +460,72 @@ func TestHeuristicV2Epsilon(t *testing.T) {
 		}
 	})
 
+	// Which planets move randomly must follow the epsilon actually set, not
+	// just "some". On epsilonBoard, every planet would launch under plain v2,
+	// so a planet that holds proves its random move skipped v2's planning.
+	// Each seed below gives a mix of v2 moves, random launches and random
+	// holds, and a different mix from the other two settings, so a dial
+	// stuck at one value would fail.
+	t.Run("each planet follows the die at epsilon 0.25, 0.5 and 0.75", func(t *testing.T) {
+		g := epsilonBoard(t)
+		plain, err := NewHeuristicV2Factory(HeuristicV2Config{Margin: 0, EnemyBonus: 1, Candidates: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if launches := len(decideV2(t, plain, g, 0).Actions); launches != 6 {
+			t.Fatalf("plain v2 launched from %d planets, want all 6", launches)
+		}
+		kinds := func(moves []epsilonMove) []string {
+			var k []string
+			for _, m := range moves {
+				k = append(k, m.kind)
+			}
+			return k
+		}
+		settings := []struct {
+			epsilon float64
+			seed    int64
+		}{{0.25, 7}, {0.5, 1}, {0.75, 4}}
+		for _, s := range settings {
+			want := predictEpsilon(t, g, s.epsilon, s.seed)
+			// The seed still gives the intended mix and pattern.
+			seen := map[string]bool{}
+			for _, m := range want {
+				seen[m.kind] = true
+			}
+			if !seen["v2"] || !seen["random launch"] || !seen["random hold"] {
+				t.Fatalf("epsilon %v seed %d: kinds %v lack a v2 move, a random launch or a random hold", s.epsilon, s.seed, kinds(want))
+			}
+			for _, other := range settings {
+				if other.epsilon != s.epsilon && reflect.DeepEqual(kinds(predictEpsilon(t, g, other.epsilon, s.seed)), kinds(want)) {
+					t.Fatalf("epsilon %v seed %d: same pattern as epsilon %v, so it can't tell them apart", s.epsilon, s.seed, other.epsilon)
+				}
+			}
+
+			factory, err := NewHeuristicV2Factory(HeuristicV2Config{Margin: 0, EnemyBonus: 1, Candidates: 4, Epsilon: s.epsilon})
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := factory.New(context.Background(), AgentInit{AgentSeed: s.seed})
+			if err != nil {
+				t.Fatal(err)
+			}
+			decision, err := created.Decide(context.Background(), TurnRequest{PlayerID: 0, View: NewView(g)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wantActions []game.Action
+			for _, m := range want {
+				if m.kind != "random hold" {
+					wantActions = append(wantActions, m.action)
+				}
+			}
+			if !reflect.DeepEqual(decision.Actions, wantActions) {
+				t.Errorf("epsilon %v seed %d (%v):\n got %v\nwant %v", s.epsilon, s.seed, kinds(want), decision.Actions, wantActions)
+			}
+		}
+	})
+
 	t.Run("epsilon=0.5 replays from its seed", func(t *testing.T) {
 		half := v2(t, ",epsilon=0.5")
 		first := playSeatZero(t, half, 7, nil)
@@ -472,6 +539,67 @@ func TestHeuristicV2Epsilon(t *testing.T) {
 			t.Fatal("epsilon=0.5 never launched")
 		}
 	})
+}
+
+// epsilonBoard is six owned planets, each with 50 ships and its own neutral
+// target 10 units away, far from the others. Each planet's best target is its
+// own, so v2's choice for one planet never depends on another's, and the
+// planets can be checked one by one.
+func epsilonBoard(t *testing.T) *game.Game {
+	t.Helper()
+	pairs := [][4]float64{
+		{15, 15, 25, 15}, {85, 15, 75, 15}, {15, 85, 25, 85},
+		{85, 85, 75, 85}, {10, 50, 20, 50}, {90, 50, 80, 50},
+	}
+	var planets []game.Planet
+	for i, p := range pairs {
+		planets = append(planets,
+			game.Planet{ID: i + 1, OwnerID: 0, Ships: 50, Production: 1, Position: game.Vec2{X: p[0], Y: p[1]}},
+			game.Planet{ID: i + 11, OwnerID: game.NeutralPlayer, Ships: 10, Production: 3, Position: game.Vec2{X: p[2], Y: p[3]}})
+	}
+	return smallV2Board(t, planets, nil)
+}
+
+// epsilonMove is what one owned planet should do in one turn.
+type epsilonMove struct {
+	kind   string // "v2", "random launch" or "random hold"
+	action game.Action
+}
+
+// predictEpsilon works out, independently of the agent, what a v2 with this
+// epsilon and seed should do on g this turn. It replays the agent's random
+// source draw by draw: one die roll per owned planet with ships, in ID order,
+// and, after a roll below epsilon, random-v1's draws for that planet. A planet
+// whose roll says random makes random-v1's move, launch or hold; every other
+// planet makes the move a v2 without epsilon plans for it.
+func predictEpsilon(t *testing.T, g *game.Game, epsilon float64, seed int64) []epsilonMove {
+	t.Helper()
+	plain, err := NewHeuristicV2Factory(HeuristicV2Config{Margin: 0, EnemyBonus: 1, Candidates: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned := map[int]game.Action{}
+	for _, action := range decideV2(t, plain, g, 0).Actions {
+		planned[action.PlanetID] = action
+	}
+
+	rng := rand.New(rand.NewSource(seed))
+	var moves []epsilonMove
+	for _, source := range sortedBodies(NewView(g)) {
+		if source.ownerID != 0 || source.ships <= 0 {
+			continue
+		}
+		if rng.Float64() >= epsilon {
+			moves = append(moves, epsilonMove{kind: "v2", action: planned[source.id]})
+			continue
+		}
+		if action, ok := randomMove(rng, heuristicV2DefaultRandomMove, 0, source); ok {
+			moves = append(moves, epsilonMove{kind: "random launch", action: action})
+		} else {
+			moves = append(moves, epsilonMove{kind: "random hold"})
+		}
+	}
+	return moves
 }
 
 // playSeatZero plays the first 60 turns of a four-player game in which seat 0
