@@ -80,6 +80,9 @@ type matchConfig struct {
 	// fixed testers are played.
 	tester            agent.Factory
 	launchProbability float64
+	// checkDecode runs the decode check (see decodecheck.go) on every turn of
+	// the tested seat. run allows it only for a fully restricted tester.
+	checkDecode bool
 	// newTester overrides how a tester's agent is built; tests use it to
 	// inject a failing agent. Nil uses buildTester.
 	newTester func(ctx context.Context, j job, live *game.Game) (agent.Agent, error)
@@ -110,10 +113,26 @@ func playGame(ctx context.Context, config matchConfig, j job) (record gameRecord
 		return fail(0, nil, fmt.Errorf("generate map: %w", err))
 	}
 
-	agents, err := buildAgents(ctx, config, j, g)
+	// The tested seat's frame says which seat is clockwise, opposite and
+	// counter-clockwise of it, and is what the decode check observes the
+	// board through. NewSeatFrame needs the starting board, which g still
+	// is: no turn has been played yet.
+	frame, err := mlenv.NewSeatFrame(g, j.seat)
+	if err != nil {
+		return fail(0, nil, fmt.Errorf("seat frame: %w", err))
+	}
+
+	agents, err := buildAgents(ctx, config, j, g, frame)
 	defer closeAgents(agents)
 	if err != nil {
 		return fail(0, nil, err)
+	}
+	var reporter choiceReporter
+	if config.checkDecode {
+		var ok bool
+		if reporter, ok = agents[j.seat].(choiceReporter); !ok {
+			return fail(0, &j.seat, fmt.Errorf("decode check: tester %s does not report its choices", agents[j.seat].ID()))
+		}
 	}
 
 	for !g.Finished() {
@@ -137,6 +156,13 @@ func playGame(ctx context.Context, config matchConfig, j job) (record gameRecord
 			}
 			if seat == j.seat {
 				record.Launches += len(decision.Actions)
+				// g has not advanced yet, so it is still the board the
+				// tester decided on, as the decoder needs.
+				if reporter != nil {
+					if err := checkDecode(g, frame, reporter.LastChoices(), decision.Actions); err != nil {
+						return fail(g.Turn, &seat, fmt.Errorf("decode check: %w", err))
+					}
+				}
 			}
 			actions = append(actions, decision.Actions...)
 		}
@@ -175,16 +201,10 @@ func matchID(j job) string {
 // every other seat gets its opponent, chosen and built exactly as mlenv
 // builds training opponents: the lineup entry for the seat's board role as
 // seen from the tested seat, contestant ID "opponent-seat-<n>", and a seed
-// from arena.DeriveAgentSeed, so they behave as they do in training.
-func buildAgents(ctx context.Context, config matchConfig, j job, live *game.Game) ([]agent.Agent, error) {
+// from arena.DeriveAgentSeed, so they behave as they do in training. frame
+// is the tested seat's frame, which gives each other seat's role.
+func buildAgents(ctx context.Context, config matchConfig, j job, live *game.Game, frame mlenv.SeatFrame) ([]agent.Agent, error) {
 	agents := make([]agent.Agent, 0, players)
-	// The tested seat's frame says which seat is clockwise, opposite and
-	// counter-clockwise of it. NewSeatFrame needs the starting board, which
-	// live still is: no turn has been played yet.
-	frame, err := mlenv.NewSeatFrame(live, j.seat)
-	if err != nil {
-		return agents, err
-	}
 	for seat := range players {
 		var a agent.Agent
 		var err error

@@ -7,7 +7,8 @@
 // With -tester-spec, any agent spec plays the tested seat instead of the
 // fixed testers. Such a run only measures; it gives no verdict. -opponent
 // also takes a lineup of three specs joined by "|", seated by board role
-// from the tested seat, as mlenv seats training opponents.
+// from the tested seat, as mlenv seats training opponents. -check-decode
+// proves a restricted heuristic-v2 tester made only the learner's moves.
 //
 // Each game is appended to games.jsonl as soon as it finishes, so an
 // interrupted run keeps its completed work. At the end it writes the sorted
@@ -71,7 +72,9 @@ type options struct {
 	testers []string
 	// testerSpec is the agent spec for the tested seat, as typed; empty means
 	// the fixed testers are played.
-	testerSpec        string
+	testerSpec string
+	// checkDecode turns on the decode check (see decodecheck.go).
+	checkDecode       bool
 	seedStart         int64
 	seeds             int
 	launchProbability float64
@@ -90,7 +93,10 @@ type runMeta struct {
 	Testers   []string `json:"testers"`
 	// TesterSpec is the -tester-spec agent, left out of the JSON when the
 	// fixed testers were played, so those runs' summaries are unchanged.
-	TesterSpec        string  `json:"tester_spec,omitempty"`
+	TesterSpec string `json:"tester_spec,omitempty"`
+	// CheckDecode records that the decode check ran on every tested turn;
+	// left out when it didn't, so other runs' summaries are unchanged.
+	CheckDecode       bool    `json:"check_decode,omitempty"`
 	SeedStart         int64   `json:"seed_start"`
 	Seeds             int     `json:"seeds"`
 	Opponent          string  `json:"opponent"`
@@ -129,6 +135,8 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	testers := flags.String("testers", strings.Join(testerOrder, ","), "comma-separated testers: "+strings.Join(testerOrder, ", ")+
 		" (heuristic is the -opponent agent playing itself, the calibration)")
 	testerSpec := flags.String("tester-spec", "", "agent spec for the tested seat instead of the fixed testers; cannot be combined with -testers")
+	checkDecode := flags.Bool("check-decode", false, "fail any game in which the tester makes a launch the learner's decoder would not make the same way; "+
+		"needs a -tester-spec of heuristic-v2 with whole_garrison=1, learner_aim=1, no_aim_check=1 and no epsilon")
 	seedStart := flags.Int64("seed-start", 1_000_000, "first scenario seed (the reusable validation range starts at 1000000)")
 	seeds := flags.Int("seeds", 25, "number of consecutive seeds; each is played from every seat")
 	probability := flags.Float64("launch-probability", defaultLaunchProbability, "diagnostic agents' chance to launch from each source each turn")
@@ -143,8 +151,8 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 		return options{}, fmt.Errorf("unexpected arguments: %v", flags.Args())
 	}
 	opts := options{
-		testerSpec: strings.TrimSpace(*testerSpec),
-		seedStart:  *seedStart, seeds: *seeds, launchProbability: *probability,
+		testerSpec: strings.TrimSpace(*testerSpec), checkDecode: *checkDecode,
+		seedStart: *seedStart, seeds: *seeds, launchProbability: *probability,
 		workers: *workers, opponent: *opponent, random: *random, out: *out,
 	}
 	// -testers has a default, so only flags.Visit (which sees just the flags
@@ -206,10 +214,17 @@ func run(ctx context.Context, opts options, console io.Writer) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("-random: %w", err)
 	}
-	config := matchConfig{opponents: opponents, random: random, launchProbability: opts.launchProbability}
+	config := matchConfig{opponents: opponents, random: random, launchProbability: opts.launchProbability, checkDecode: opts.checkDecode}
 	if opts.testerSpec != "" {
 		if config.tester, err = agent.ParseFactory(opts.testerSpec); err != nil {
 			return false, fmt.Errorf("-tester-spec: %w", err)
+		}
+	}
+	// Checked here, not in parseOptions, because only the parsed tester's
+	// canonical spec says which settings are on.
+	if opts.checkDecode {
+		if err := checkDecodeAllowed(config.tester); err != nil {
+			return false, err
 		}
 	}
 	return runWith(ctx, opts, config, console)
@@ -268,7 +283,7 @@ func runWith(ctx context.Context, opts options, config matchConfig, console io.W
 	complete := completed == len(jobs)
 	meta := runMeta{
 		Command: os.Args, Commit: buildCommit(), GoVersion: runtime.Version(),
-		Status: "complete", Testers: opts.testers, TesterSpec: opts.testerSpec, SeedStart: opts.seedStart, Seeds: opts.seeds,
+		Status: "complete", Testers: opts.testers, TesterSpec: opts.testerSpec, CheckDecode: opts.checkDecode, SeedStart: opts.seedStart, Seeds: opts.seeds,
 		Opponent: opts.opponent, Random: opts.random, LaunchProbability: opts.launchProbability,
 		Workers: opts.workers, Planned: len(jobs), Completed: completed,
 		ElapsedSeconds: time.Since(started).Seconds(),

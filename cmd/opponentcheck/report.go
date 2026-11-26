@@ -260,6 +260,9 @@ func markdownSummary(meta runMeta, summaries []testerSummary, c calibration, dec
 	if meta.TesterSpec != "" {
 		fmt.Fprintf(&b, "Tester `%s` is `%s`. ", specTester, meta.TesterSpec)
 	}
+	if meta.CheckDecode {
+		b.WriteString("Every tester launch was checked against the learner's decoder; a mismatch fails its game. ")
+	}
 	against := fmt.Sprintf("three `%s` opponents", meta.Opponent)
 	if strings.Contains(meta.Opponent, "|") {
 		against = fmt.Sprintf("the lineup `%s` (clockwise | opposite | counter-clockwise of the tester)", meta.Opponent)
