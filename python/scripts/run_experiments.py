@@ -45,7 +45,8 @@ A run has four stages:
    without ``done.json`` (interrupted or failed) is renamed
    ``<name>.partial-<n>``, never deleted, and the job runs again. A train
    job whose training finished is the exception: its folder is kept, and
-   the retry redoes only the diagnoses that didn't finish. A resume
+   the retry redoes only the diagnoses that didn't finish, each earlier
+   attempt moved to ``diagnoses/.partial/<name>/attempt-<n>``. A resume
    refuses to run if the code or any input file changed since the first
    run, so after changing either, start a new session with a new ``--out``.
 
@@ -1151,11 +1152,14 @@ class Runner:
         """Run diagnose.py on one checkpoint; return why it failed, or None.
 
         --no-charts skips the pictures: the analysis reads only report.json,
-        and the charts would need the optional plotting packages. On success
-        it writes done.json in ``out``, last, so a retry of a train job can
-        tell a finished diagnosis from a half-written one.
+        and the charts would need the optional plotting packages. An earlier,
+        unfinished attempt left in ``out`` is archived first (see
+        archive_attempt). On success it writes done.json in ``out``, last,
+        so a retry of a train job can tell a finished diagnosis from a
+        half-written one.
         """
 
+        archive_attempt(out)
         code = self.run_command([
             sys.executable, "-m", "scripts.diagnose", "--run-dir", str(run_dir), "--checkpoint", str(checkpoint),
             "--opponent", opponent, *maps, "--device", self.plan.session.device, "--no-charts",
@@ -1189,18 +1193,15 @@ def keep_finished_training(folder: Path) -> None:
     training.
 
     The folder stays where it is, with its run/ (the trained model and
-    checkpoints) and every diagnosis that finished (one with done.json).
-    Only what an unfinished try left is moved out of the way, never deleted:
-    - failed.json becomes failed.previous-<n>.json, so the job no longer
-      reads as failed while it retries, and the earlier error stays
-      readable;
-    - a diagnosis folder without done.json (it failed or was interrupted)
-      is renamed <name>.partial-<n>, so its retry starts from an empty
-      folder. Folders already set aside by an earlier retry are left alone.
+    checkpoints) and every diagnosis, finished or not. Only failed.json is
+    moved, never deleted: it becomes failed.previous-<n>.json, so the job
+    no longer reads as failed while it retries, and the earlier error stays
+    readable. An unfinished diagnosis is archived later, just before it
+    runs again (see archive_attempt).
 
     Example: diagnoses/update-000153__v2 failed after training finished.
-    The retry keeps run/ and the five finished diagnoses, renames that
-    folder update-000153__v2.partial-1, and runs only that diagnosis again.
+    The retry keeps run/ and the five finished diagnoses, and runs only that
+    diagnosis again, after archiving its failed attempt.
     """
 
     failed = folder / "failed.json"
@@ -1209,13 +1210,35 @@ def keep_finished_training(folder: Path) -> None:
         while (target := folder / f"failed.previous-{n}.json").exists():
             n += 1
         failed.rename(target)
-    diagnoses = folder / "diagnoses"
-    if diagnoses.is_dir():
-        # sorted() lists the folders before any is renamed, so renaming
-        # can't disturb the loop.
-        for diagnosis in sorted(diagnoses.iterdir()):
-            if diagnosis.is_dir() and ".partial-" not in diagnosis.name and not (diagnosis / "done.json").exists():
-                set_aside_unfinished_folder(diagnosis)
+
+
+def archive_attempt(out: Path) -> Path | None:
+    """Move an earlier, unfinished attempt at one diagnosis out of the way,
+    just before that diagnosis runs again. Returns where it went, or None
+    when there was nothing to move.
+
+    diagnose.py needs an empty output folder, so a failed or interrupted
+    attempt (a folder without done.json) must go first. It is moved into a
+    hidden .partial folder beside it, one subfolder per diagnosis, so
+    archived attempts never share a name with a real diagnosis folder,
+    whatever the labels: a label must start with a letter or digit, so no
+    diagnosis is ever named ".partial". Only the diagnosis about to run is
+    touched; nothing is deleted. Use ``ls -a`` to see the archive.
+
+    Example: a failed diagnoses/update-000153__v2 becomes
+    diagnoses/.partial/update-000153__v2/attempt-1, and a second failure
+    later becomes attempt-2.
+    """
+
+    if not out.exists():
+        return None
+    archive = out.parent / ".partial" / out.name
+    archive.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while (target := archive / f"attempt-{n}").exists():
+        n += 1
+    out.rename(target)
+    return target
 
 
 # ---------------------------------------------------------------------------
