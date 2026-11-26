@@ -135,3 +135,60 @@ def test_a_rerun_skips_finished_jobs_and_sets_aside_unfinished_folders(
     assert (tmp_path / "bots" / "weak.partial-1" / "log.txt").read_text() == "half a run"
     assert (tmp_path / "bots" / "weak" / "done.json").exists()
     assert run_experiments.job_state(tmp_path, weak) == "done"
+
+
+def test_a_resume_refuses_a_checkpoint_changed_at_the_same_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A finished diagnose job's checkpoint is replaced by different bytes at
+    the same path. Resuming only the bot experiment must still refuse, before
+    preflight, and leave every saved record as it was."""
+
+    run_dir = tmp_path / "b-s1"
+    checkpoint = run_dir / "checkpoints" / "update-000030.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"first model")
+    for name in ("run-config.json", "manifest.json", "metrics.csv"):
+        (run_dir / name).write_text(name)
+    experiment = tmp_path / "small.toml"
+    experiment.write_text(f"""
+[session]
+name = "small"
+maps = {{ start = 1000000, count = 2 }}
+device = "cpu"
+cpu_workers = 2
+
+[[botcheck]]
+name = "bots"
+opponent = "{V2}"
+[botcheck.testers]
+normal = "{V2}"
+
+[[diagnose]]
+name = "probe"
+run_dirs = ["{run_dir}"]
+updates = [30]
+[diagnose.opponents]
+v2 = "{V2}"
+""")
+    out = tmp_path / "session"
+    # Only the inputs change in this test, so the code part is held fixed,
+    # and no job really runs: each one just succeeds.
+    monkeypatch.setattr(run_experiments, "code_fingerprint", lambda: {"source_sha256": "same"})
+    monkeypatch.setattr(run_experiments, "preflight", lambda plan, jobs, bin_dir: ([], Path("opponentcheck")))
+    monkeypatch.setattr(Runner, "_run", lambda self, job, folder, log: None)
+    assert run_experiments.run_session(experiment, out, only="probe") == 0
+    session_before = (out / "session.json").read_text()
+    done_before = (out / "probe" / "v2__b-s1__u000030" / "done.json").read_text()
+
+    checkpoint.write_bytes(b"other model")
+
+    def preflight_must_not_run(*_arguments):
+        raise AssertionError("preflight ran on a refused resume")
+
+    monkeypatch.setattr(run_experiments, "preflight", preflight_must_not_run)
+    assert run_experiments.run_session(experiment, out, only="bots") == 2
+    assert f"input {checkpoint.as_posix()} changed" in capsys.readouterr().out
+    assert (out / "session.json").read_text() == session_before
+    assert (out / "probe" / "v2__b-s1__u000030" / "done.json").read_text() == done_before
+    assert not (out / "bots").exists()

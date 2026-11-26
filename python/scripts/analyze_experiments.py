@@ -314,6 +314,10 @@ def analyze(out: Path) -> dict[str, Any]:
         # The maps played, as [first seed, one past the last].
         "maps": [plan.session.map_start, plan.session.map_start + plan.session.map_count],
         "runs": session.get("runs", []),
+        # The code and inputs every job ran with, saved by the session's
+        # first run; a resume refuses to run if they changed. None for a
+        # session made before fingerprints were recorded.
+        "fingerprint": session.get("fingerprint"),
         "jobs": states,
         "botcheck": {},
         "compare": [],
@@ -539,15 +543,23 @@ def markdown(analysis: Mapping[str, Any]) -> str:
     """analysis.md's text, built from analyze()'s result."""
 
     # The heading: the maps played, how many jobs are in each state, and the
-    # code that ran.
+    # code that ran. The code comes from the session's fingerprint, saved
+    # once by its first run, so a later resume can't relabel the results.
     lines = [f"# Analysis: {analysis['session']}", ""]
     start, end = analysis["maps"]
     states = list(analysis["jobs"].values())
     lines.append(f"Maps {start:,} to {end - 1:,}, every seat. Jobs: "
                  + ", ".join(f"{states.count(s)} {s}" for s in sorted(set(states))) + ".")
-    if analysis["runs"]:
-        last = analysis["runs"][-1]
-        lines.append(f"Code: `{last.get('git_commit')}`{' (with uncommitted changes)' if last.get('git_dirty') else ''}.")
+    fingerprint = analysis["fingerprint"]
+    if fingerprint is None:
+        lines.append("Code: provenance unknown (this session was made before fingerprints were recorded).")
+    else:
+        code = fingerprint["code"]
+        # The first 12 characters of the hash are enough to tell sessions
+        # apart by eye; session.json keeps the whole hash.
+        lines.append(f"Code: source `{code['source_sha256'][:12]}`, {code.get('go')}, Python {code.get('python')}, "
+                     f"Torch {code.get('torch')}, NumPy {code.get('numpy')}; "
+                     f"{len(fingerprint['inputs'])} input files hashed.")
     lines.append("")
 
     # One table per [[botcheck]] section, one row per tester. "off" in the

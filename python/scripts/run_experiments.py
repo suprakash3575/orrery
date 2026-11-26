@@ -41,7 +41,9 @@ A run has four stages:
    file, the code version and every job's state.
 4. **Resume.** Running the same command again skips finished jobs. A folder
    without ``done.json`` (interrupted or failed) is renamed
-   ``<name>.partial-<n>``, never deleted, and the job runs again.
+   ``<name>.partial-<n>``, never deleted, and the job runs again. A resume
+   refuses to run if the code or any input file changed since the first
+   run, so after changing either, start a new session with a new ``--out``.
 
 A session folder looks like this (one experiment shown)::
 
@@ -69,6 +71,8 @@ import argparse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -598,11 +602,17 @@ def repository_path(path: str) -> Path:
     return candidate if candidate.is_absolute() else REPOSITORY_ROOT / candidate
 
 
-def checkpoint_path(run_dir: str, update: int) -> Path:
-    """Where training saves the checkpoint for one update. Example: update
-    153 of runs/x is runs/x/checkpoints/update-000153.pt."""
+def checkpoint_file(run_dir: str, update: int) -> str:
+    """The checkpoint for one update, written as the experiment file writes
+    paths. Example: update 153 of runs/x is runs/x/checkpoints/update-000153.pt."""
 
-    return repository_path(run_dir) / "checkpoints" / f"update-{update:06d}.pt"
+    return (Path(run_dir) / "checkpoints" / f"update-{update:06d}.pt").as_posix()
+
+
+def checkpoint_path(run_dir: str, update: int) -> Path:
+    """Where training saved the checkpoint for one update, as a full path."""
+
+    return repository_path(checkpoint_file(run_dir, update))
 
 
 def training_config(job: Job, session: Session) -> dict[str, Any]:
@@ -1014,6 +1024,18 @@ def job_state(out: Path, job: Job) -> str:
     return "unfinished" if folder.exists() else "waiting"
 
 
+def command_output(arguments: Sequence[str]) -> str | None:
+    """What a command prints, run from the repository root, or None if it
+    can't run or fails (no git on the machine, say). Example:
+    ["go", "version"] gives "go version go1.24.1 linux/amd64"."""
+
+    try:
+        result = subprocess.run(arguments, cwd=REPOSITORY_ROOT, capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip()
+
+
 def versions() -> dict[str, Any]:
     """The code and tools a session ran with, for replay.
 
@@ -1022,20 +1044,174 @@ def versions() -> dict[str, Any]:
     can't be found (no git, say) is recorded as None, never guessed.
     """
 
-    def output(arguments: Sequence[str]) -> str | None:
-        try:
-            result = subprocess.run(arguments, cwd=REPOSITORY_ROOT, capture_output=True, text=True, check=True)
-        except (OSError, subprocess.CalledProcessError):
-            return None
-        return result.stdout.strip()
-
-    dirty = output(["git", "status", "--porcelain", "--untracked-files=no"])
+    dirty = command_output(["git", "status", "--porcelain", "--untracked-files=no"])
     return {
-        "git_commit": output(["git", "rev-parse", "HEAD"]),
+        "git_commit": command_output(["git", "rev-parse", "HEAD"]),
         "git_dirty": bool(dirty) if dirty is not None else None,
-        "go": output(["go", "version"]),
+        "go": command_output(["go", "version"]),
         "python": platform.python_version(),
     }
+
+
+# ---------------------------------------------------------------------------
+# The session fingerprint: the code and input files a session's results came
+# from.
+#
+# Results from different jobs are only comparable if every job ran the same
+# code on the same input files. The first run saves a fingerprint of both in
+# session.json, and every resume computes it again and refuses to run if
+# anything differs. A fingerprint is made of SHA-256 hashes: a hash is a
+# short text computed from a file's bytes, which changes if even one byte of
+# the file changes.
+# ---------------------------------------------------------------------------
+
+# The file git archive writes the commit into (see its own comments). It is
+# left out of the code hash: a Vast.ai bundle and a laptop checkout of the
+# same commit differ only in this file.
+RELEASE_FILE = "cmd/env/release.go"
+
+# Top-level folders the search for Go code skips: run output, which can hold
+# many large files, and the Python side, whose files are listed separately.
+# Hidden folders (.git, .build) are skipped too.
+GO_SKIPPED = {"runs", "python"}
+
+
+def file_sha256(path: Path) -> str | None:
+    """The SHA-256 hash of a file's bytes, or None when there is no file."""
+
+    if not path.is_file():
+        return None
+    with path.open("rb") as handle:
+        # file_digest reads the file in pieces, so a large checkpoint is
+        # never held in memory all at once.
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def source_files(root: Path = REPOSITORY_ROOT) -> list[Path]:
+    """The runtime source: every file whose content decides what a job does.
+
+    That is the Go code without its tests, the Go module files, the Python
+    packages the jobs run (orrery and scripts), and the Python dependency
+    files. The files are found by searching the folder, not by asking Git,
+    because the bundle copied to Vast.ai has no .git folder. They are sorted
+    by name, so every machine lists them in the same order.
+    """
+
+    files: list[Path] = []
+    for folder, subfolders, names in os.walk(root):
+        # Changing subfolders in place tells os.walk which ones to enter.
+        top_level = Path(folder) == root
+        subfolders[:] = [
+            name for name in subfolders
+            if not name.startswith(".") and not (top_level and name in GO_SKIPPED)
+        ]
+        files += [Path(folder) / name for name in names if name.endswith(".go") and not name.endswith("_test.go")]
+    files += [root / name for name in ("go.mod", "go.sum")]
+    for package in ("python/orrery", "python/scripts"):
+        files += (root / package).rglob("*.py")
+    files += [root / "python" / name for name in ("pyproject.toml", "uv.lock")]
+    kept = [path for path in files if path.is_file() and path != root / RELEASE_FILE]
+    return sorted(kept, key=lambda path: path.relative_to(root).as_posix())
+
+
+def package_version(name: str) -> str | None:
+    """An installed Python package's version, without importing it. Example:
+    "torch" gives "2.5.1+cu124"; None when it isn't installed."""
+
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def code_fingerprint(root: Path = REPOSITORY_ROOT) -> dict[str, str | None]:
+    """The code a session runs: one hash of the runtime source, plus the
+    versions of the tools that run it.
+
+    The source hash covers every file's name and bytes, so editing, adding,
+    removing or renaming a runtime file changes it. The tool versions are
+    recorded too, because the same code can play differently with another
+    Go, Python, Torch or NumPy.
+    """
+
+    digest = hashlib.sha256()
+    for path in source_files(root):
+        # The "\0" and "\n" separate one file's name and hash from the next,
+        # so two different lists of files can't run together into the same
+        # text.
+        digest.update(f"{path.relative_to(root).as_posix()}\0{file_sha256(path)}\n".encode())
+    return {
+        "source_sha256": digest.hexdigest(),
+        "go": command_output(["go", "version"]),
+        "python": platform.python_version(),
+        "torch": package_version("torch"),
+        "numpy": package_version("numpy"),
+    }
+
+
+def input_files(jobs: Sequence[Job]) -> list[str]:
+    """Every file the jobs read, as the experiment file writes paths, each
+    once and sorted.
+
+    A diagnose job reads its checkpoint, and from the checkpoint's run the
+    run-config.json and manifest.json (diagnose checks the checkpoint against
+    both) and metrics.csv (its training history). A train job reads its
+    starting checkpoint and its base config; its own settings are in the
+    experiment file's text, which a resume already compares. A bot job reads
+    no files: its specs are in that text too.
+    """
+
+    found: set[str] = set()
+    for job in jobs:
+        if job.kind == "diagnose":
+            run_dir = job.settings["run_dir"]
+            found.add(checkpoint_file(run_dir, job.settings["update"]))
+            found.update((Path(run_dir) / name).as_posix() for name in ("run-config.json", "manifest.json", "metrics.csv"))
+        elif job.kind == "train":
+            found.update((job.settings["init_from"], job.settings["base_config"]))
+    return sorted(found)
+
+
+def session_fingerprint(plan: Plan) -> dict[str, Any]:
+    """The code and every input file of the whole plan.
+
+    It covers every job in the file, not only the ones a run's --only picks:
+    the analysis reads all finished jobs together, so all of them must come
+    from the same code and inputs. A missing input is recorded as None.
+    """
+
+    return {
+        "code": code_fingerprint(),
+        "inputs": {name: file_sha256(repository_path(name)) for name in input_files(plan.jobs)},
+    }
+
+
+def fingerprint_changes(saved: Mapping[str, Any] | None, current: Mapping[str, Any]) -> list[str]:
+    """How the current fingerprint differs from the one a session saved; an
+    empty list when they match.
+
+    A session saved without a fingerprint (by a runner older than this
+    check) can't be matched, so that counts as a difference too. Example
+    result: ["input runs/x/checkpoints/update-000153.pt changed"].
+    """
+
+    if saved is None:
+        return ["session.json has no fingerprint (an older runner made it), so its code and inputs are unknown"]
+    changes = []
+    for part in ("code", "inputs"):
+        old, new = saved.get(part) or {}, current[part]
+        # Every key in either one, so a key only one of them has counts too.
+        for key in sorted(set(old) | set(new)):
+            before, after = old.get(key), new.get(key)
+            if before == after:
+                continue
+            if part == "inputs":
+                changes.append(f"input {key} {'is missing now' if after is None else 'changed'}")
+            elif key == "source_sha256":
+                changes.append("the runtime source code changed")
+            else:
+                changes.append(f"{key} was {before!r}, now {after!r}")
+    return changes
 
 
 def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
@@ -1043,11 +1219,11 @@ def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
 
     Returns 0 when every selected job is done, 1 when any failed or the run
     was interrupted, and 2 when preflight found problems or the session
-    folder holds a different experiment file.
+    folder holds a different experiment file, code or inputs.
 
     The stages are: read the plan and choose the jobs; check the session
-    folder belongs to this file; preflight; record the run in session.json;
-    run the jobs in order; record every job's final state.
+    folder belongs to this file, code and inputs; preflight; record the run
+    in session.json; run the jobs in order; record every job's final state.
     """
 
     # Stage 1: the plan, and the jobs this run covers (--only picks one
@@ -1068,6 +1244,18 @@ def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
     if record and record["experiment_text"] != text:
         print(f"{out} holds a session of a different experiment file; use a new --out")
         return 2
+    # The same goes for the code and the input files: a resume must run what
+    # the finished jobs ran. This is checked before preflight, so a refused
+    # resume changes nothing in the session folder (preflight rebuilds the
+    # Go tools in it).
+    fingerprint = session_fingerprint(plan)
+    if record:
+        changes = fingerprint_changes(record.get("fingerprint"), fingerprint)
+        if changes:
+            print(f"{out} holds a session made with different code or inputs; use a new --out:")
+            for change in changes:
+                print(f"- {change}")
+            return 2
 
     # Stage 3: preflight, with the Go tools built into the session folder.
     problems, tool = preflight(plan, jobs, out / "bin")
@@ -1082,9 +1270,12 @@ def run_session(experiment: Path, out: Path, only: str | None = None) -> int:
 
     # Stage 4: record this run. setdefault keeps what an earlier run already
     # saved; "runs" gets one entry per run, so a resumed session shows each
-    # attempt with its own code version and times.
+    # attempt with its own code version and times. The fingerprint is saved
+    # once, by the first run, before any job starts; a resume has just
+    # matched it.
     record.setdefault("experiment_file", str(experiment))
     record.setdefault("experiment_text", text)
+    record.setdefault("fingerprint", fingerprint)
     record.setdefault("runs", []).append({"started": now(), "only": only, **versions()})
 
     def save(job: Job | None = None, state: str | None = None) -> None:
